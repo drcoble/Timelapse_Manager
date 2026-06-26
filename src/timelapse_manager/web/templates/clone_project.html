@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Clone project — {{ source_project.name }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}Clone Project{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <a href="/projects/{{ source_project.id }}" style="color:var(--color-text-muted);text-decoration:none;">{{ source_project.name }}</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">Clone</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Clone project</h1>
+    <div class="subtitle">
+      Cloning from &ldquo;{{ source_project.name }}&rdquo; &mdash;
+      camera and capture interval will be copied; frames and renders are not.
+    </div>
+  </div>
+</div>
+
+<div class="card" style="max-width:560px;">
+  <div class="card-body" style="padding:var(--sp-6);">
+
+    <form method="post" action="/projects/{{ source_project.id }}/clone" novalidate>
+      {# CSRF token — required on every mutating form #}
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="form-stack">
+
+        <div class="form-group">
+          <label class="form-label" for="name">
+            New project name<span class="required" aria-hidden="true">*</span>
+          </label>
+          <input
+            id="name"
+            type="text"
+            name="name"
+            class="form-control"
+            value="{{ suggested_name }}"
+            required
+            aria-required="true"
+            autofocus
+            aria-describedby="name-hint"
+          >
+          <span class="form-hint" id="name-hint">Name for the new project.</span>
+        </div>
+
+        <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-2);">
+          <button type="submit" class="btn btn-primary">Create clone</button>
+          <a href="/projects/{{ source_project.id }}" class="btn btn-ghost">Cancel</a>
+        </div>
+
+      </div>
+    </form>
+
+  </div>{# /card-body #}
+</div>{# /card #}
+
+{% endblock %}

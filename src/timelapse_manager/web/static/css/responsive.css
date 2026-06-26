@@ -1,0 +1,81 @@
+
+/* --------------------------------------------------------------------------
+   Responsive
+   -------------------------------------------------------------------------- */
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: var(--nav-width-icon) 1fr;
+  }
+
+  .nav-section-label,
+  .nav-item span:not(.nav-icon) { display: none; }
+
+  .nav-item { justify-content: center; padding: var(--sp-3); }
+
+  .detail-layout { grid-template-columns: 1fr; }
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-sidenav { position: static; flex-direction: row; flex-wrap: wrap; }
+}
+
+@media (max-width: 600px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "header"
+      "main";
+  }
+
+  /* The left rail doesn't fit a phone, so the nav becomes a fixed bottom bar
+     (a standard mobile pattern) rather than disappearing entirely. Icon-only
+     items share the width evenly; the active indicator moves from the left
+     edge to the top edge. Sits below the drawer/modal layer (z 200) so an open
+     overlay still covers it. `.app-main` gets bottom padding so content is
+     never hidden behind the bar. */
+  .app-nav {
+    display: flex;
+    flex-direction: row;
+    position: fixed;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    height: auto;
+    padding: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: none;
+    border-top: 1px solid var(--color-border);
+    z-index: 90;
+  }
+  .app-nav .nav-item {
+    flex: 1 0 auto;
+    justify-content: center;
+    padding: var(--sp-3) var(--sp-2);
+    border-left: none;
+    border-top: 3px solid transparent;
+  }
+  .app-nav .nav-item.active {
+    border-left-color: transparent;
+    border-top-color: var(--color-accent);
+  }
+  .nav-divider { display: none; }
+
+  .app-main { padding: var(--sp-4); padding-bottom: calc(var(--sp-4) + 56px); }
+  .project-grid { grid-template-columns: 1fr; }
+  .frame-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+
+  /* Narrow viewports: the header is a single flex row of nowrap items (logo
+     wordmark, breadcrumb, role badge, user menu) whose combined intrinsic width
+     overflows a phone screen. Let the header track shrink and shed the
+     non-essential items so the row fits without horizontal scroll. The page H1
+     already names the current view, and the role is shown in the user menu, so
+     dropping the breadcrumb, wordmark, and role badge here loses no information. */
+  .app-header { min-width: 0; gap: var(--sp-3); }
+  .header-ctx { display: none; }
+  .header-logo-text { display: none; }
+  .role-badge { display: none; }
+
+  .page-header { flex-direction: column; }
+  .page-actions { width: 100%; }
+}

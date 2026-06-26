@@ -1,0 +1,6 @@
+{# Drawer-body fragment for creating a user. The root carries the drawer title,
+   which drawer.js copies into the drawer header on open. #}
+<div data-drawer-title="New User">
+  {% set in_drawer = true %}
+  {% include '_partials/new_user_form.html' %}
+</div>

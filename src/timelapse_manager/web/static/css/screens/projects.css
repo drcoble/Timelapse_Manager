@@ -1,0 +1,183 @@
+
+/* --------------------------------------------------------------------------
+   Project Cards / Dashboard Grid
+   -------------------------------------------------------------------------- */
+.project-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: var(--sp-5);
+}
+
+.project-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  transition: border-color var(--transition-mid);
+}
+.project-card:hover { border-color: var(--color-border-2); }
+.project-card.status-running { border-left: 3px solid var(--color-running); }
+.project-card.status-paused  { border-left: 3px solid var(--color-paused); }
+.project-card.status-stopped { border-left: 3px solid var(--color-stopped); }
+.project-card.status-error   { border-left: 3px solid var(--color-error); }
+.project-card.status-lowdisk { border-left: 3px solid var(--color-lowdisk); }
+/* Archived projects: muted, purple lifecycle accent */
+.project-card.archived {
+  border-left: 3px solid var(--color-admin-only);
+  opacity: 0.8;
+}
+.project-card.archived:hover { opacity: 1; }
+
+.project-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.project-card-thumb { flex-shrink: 0; }
+
+.project-card-meta { flex: 1; min-width: 0; }
+
+.project-card-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 2px;
+}
+
+.project-card-camera {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-card-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+  gap: var(--sp-3);
+}
+
+.stat-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.stat-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-dim);
+  font-weight: 700;
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  color: var(--color-text);
+}
+.stat-value.dim { color: var(--color-text-muted); font-size: 0.8rem; }
+
+.project-card-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  flex-wrap: wrap;
+}
+
+/* --------------------------------------------------------------------------
+   Detail / Panel Layout
+   -------------------------------------------------------------------------- */
+.detail-layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: var(--sp-5);
+  align-items: start;
+}
+
+.detail-main { min-width: 0; }
+
+.detail-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--sp-3) var(--sp-4);
+}
+
+.info-cell .info-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-dim);
+  margin-bottom: 2px;
+}
+.info-cell .info-value {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  color: var(--color-text);
+}
+
+/* Narrow viewports: keep the project settings form from overflowing
+   horizontally. The capture-interval value+unit pair wraps to a second line
+   instead of forcing a horizontal scrollbar, and the form card fills the width. */
+@media (max-width: 480px) {
+  .form-stack .input-group {
+    flex-wrap: wrap;
+  }
+  .form-stack .input-group > .form-control {
+    min-width: 0;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Compact projects management table
+   -------------------------------------------------------------------------- */
+.projects-table .project-cell-name a {
+  color: var(--color-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+.projects-table .project-cell-name a:hover { text-decoration: underline; }
+.projects-table .project-cell-camera { color: var(--color-text-muted); }
+.projects-table .project-cell-empty {
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+/* Archived projects collapse into a muted disclosure below the active table. */
+.projects-archived {
+  margin-top: var(--sp-5);
+  opacity: 0.7;
+}
+.projects-archived:hover,
+.projects-archived[open] { opacity: 1; }
+.projects-archived > summary {
+  cursor: pointer;
+  padding: var(--sp-2) 0;
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}
+
+/* Hide the lower-priority columns on narrow screens so the essentials
+   (Name · Camera · Status · Actions) stay readable without horizontal scroll. */
+@media (max-width: 600px) {
+  .projects-table .col-hide-mobile {
+    display: none;
+  }
+}

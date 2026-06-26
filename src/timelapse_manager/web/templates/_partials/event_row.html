@@ -1,0 +1,18 @@
+{#
+  Partial: event_row.html
+  Context: event — _EventView {id, level, scope, scope_id, event_type, message, timestamp}
+
+  One table row in the event log. The message is already redacted at write time
+  and re-scrubbed in the view model; Jinja autoescaping handles any HTML in it.
+#}
+<tr class="event-row event-level-{{ event.level }}">
+  <td class="event-time mono">{{ event.timestamp_raw | localdt if event.timestamp_raw else (event.timestamp or '—') }}</td>
+  <td>
+    <span class="level-badge level-{{ event.level }}">{{ event.level | upper }}</span>
+  </td>
+  <td class="mono">{{ event.event_type or '—' }}</td>
+  <td>
+    {{ event.scope }}{% if event.scope_id is not none %} #{{ event.scope_id }}{% endif %}
+  </td>
+  <td class="event-message">{{ event.message }}</td>
+</tr>

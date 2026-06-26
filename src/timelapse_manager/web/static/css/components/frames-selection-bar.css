@@ -1,0 +1,162 @@
+/* --------------------------------------------------------------------------
+   Frame selection — per-tile select control, selected-tile styling, and the
+   sticky selection bar that appears on first selection.
+
+   The select control is a real (visually-hidden) checkbox inside a label
+   overlaid on the thumbnail; only the indicator box is painted. The checkbox
+   stays focusable and Space-operable, so the focus ring rides the sibling
+   indicator (the input itself is clipped off-screen).
+   -------------------------------------------------------------------------- */
+
+/* Overlay the select control in the top-left of the thumbnail. The wrapper is
+   positioned in screens/frames.css (.frame-tile-thumb-wrap { position: relative }). */
+.frame-tile-select {
+  position: absolute;
+  top: var(--sp-2);
+  left: var(--sp-2);
+  z-index: 1;
+  display: inline-flex;
+  margin: 0;
+  cursor: pointer;
+  line-height: 0;
+}
+
+/* A checkbox-like box: faint at rest, full on hover / focus / when checked. */
+.frame-select-indicator {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--color-border-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  opacity: 0.3;
+  transition:
+    opacity var(--transition-fast),
+    border-color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.frame-tile-select:hover .frame-select-indicator,
+.frame-tile-thumb-wrap:hover .frame-select-indicator,
+.frame-tile-select:focus-within .frame-select-indicator {
+  opacity: 1;
+}
+
+/* Checked: filled accent box with a check glyph. */
+.frame-select-cb:checked + .frame-select-indicator {
+  opacity: 1;
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+}
+.frame-select-cb:checked + .frame-select-indicator::after {
+  content: "";
+  display: block;
+  width: 5px;
+  height: 9px;
+  margin: 1px auto 0;
+  border: solid var(--color-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+/* Focus ring rides the painted indicator (the input is clipped off-screen). */
+.frame-select-cb:focus-visible + .frame-select-indicator {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+/* Selected tile: inset accent ring + raised surface so the whole card reads
+   as part of the selection at a glance. */
+.frame-tile[data-selected="true"] {
+  background: var(--color-surface-2);
+  box-shadow: inset 0 0 0 2px var(--color-accent);
+}
+
+/* --------------------------------------------------------------------------
+   Sticky selection bar — appears on the first selection (0→N), collapses on
+   the last deselect (N→0). One element per the sticky-stack budget: z-index 60
+   at top:0, above the new-frames pill (z-50) and the scrubber panel (z-55).
+   -------------------------------------------------------------------------- */
+.frames-action-bar {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  /* Collapse transition; height is content-driven, so animate the visual
+     weight rather than a fixed height. */
+  transition:
+    opacity var(--transition-mid),
+    transform var(--transition-mid);
+}
+.frames-action-bar[hidden] {
+  display: none;
+}
+
+.selection-bar-count {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+/* Reserved slot for the bulk-action buttons added in a later phase. */
+.frames-action-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* Push the Clear button to the trailing edge. */
+.frames-action-bar [data-selection-clear] {
+  margin-left: auto;
+}
+
+/* --------------------------------------------------------------------------
+   Result state — the same #frames-action-bar element after a bulk operation,
+   recoloured by outcome. Success rides the running accent, a partial failure
+   the warning tone; both reuse existing tokens (no net-new custom properties).
+   -------------------------------------------------------------------------- */
+.frames-action-bar--result.frames-action-bar--success {
+  border-color: var(--color-running);
+}
+.frames-action-bar--result.frames-action-bar--partial {
+  border-color: var(--color-warning);
+}
+.frames-action-bar--result.frames-action-bar--error {
+  border-color: var(--color-error);
+}
+
+/* The armed (second-click) state of the destructive bulk Delete button: it
+   reads as danger so the confirm step is unmistakable. */
+.frames-action-bar-actions [data-bulk-action="delete"].is-armed {
+  background: var(--color-error);
+  border-color: var(--color-error);
+  color: var(--color-on-accent);
+}
+
+/* "View failures" disclosure within the result bar. */
+.bulk-failures {
+  display: inline-block;
+}
+.bulk-failures__list {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-4);
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
+/* House the focus ring on every interactive control in the bar (the four bulk
+   actions, Undo, Retry, the failures disclosure). */
+.frames-action-bar-actions button:focus-visible,
+.frames-action-bar [data-bulk-undo]:focus-visible,
+.frames-action-bar [data-bulk-retry]:focus-visible,
+.bulk-failures > summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}

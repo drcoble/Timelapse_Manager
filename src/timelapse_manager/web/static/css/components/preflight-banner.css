@@ -1,0 +1,29 @@
+/* --------------------------------------------------------------------------
+   Storage pre-flight banner — surfaces a computed capacity estimate before a
+   capture campaign starts. Three states by headroom: ok / caution / danger.
+   -------------------------------------------------------------------------- */
+.preflight-banner {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  border: 1px solid;
+  margin-top: var(--sp-3);
+}
+.preflight-banner.ok {
+  background: var(--color-running-bg);
+  border-color: var(--color-running);
+  color: var(--color-running);
+}
+.preflight-banner.caution {
+  background: var(--color-paused-bg);
+  border-color: var(--color-paused);
+  color: var(--color-paused);
+}
+.preflight-banner.danger {
+  background: var(--color-error-bg);
+  border-color: var(--color-error);
+  color: var(--color-error);
+}

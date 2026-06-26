@@ -1,0 +1,48 @@
+{#
+  Partial: frame_timestamp_row.html
+  The capture-timestamp row inside the frame drawer. Rendered in display mode
+  by default; an inline "Edit" reveals a datetime-local input + Save/Cancel.
+  Save does an hx-patch back to the frame and the server returns this same
+  partial (in display mode), swapped via outerHTML on #frame-timestamp-row, so
+  the row settles back to display after a save. Cancel is a pure DOM toggle.
+
+  Context:
+    project_id    — int
+    frame         — _FrameView {id, capture_timestamp_raw, capture_timestamp_input}
+    can_operate   — bool (only operators see the Edit affordance)
+    csrf_token    — str
+#}
+<div id="frame-timestamp-row" class="frame-drawer-row">
+  <div class="frame-drawer-row-main">
+    <span class="frame-drawer-label">Captured</span>
+    <span class="frame-drawer-value" data-ts-display>
+      {% if frame.capture_timestamp_raw %}
+        {{ frame.capture_timestamp_raw | localdt }}
+      {% else %}
+        &mdash;
+      {% endif %}
+    </span>
+    {% if can_operate %}
+      <button type="button" class="btn btn-xs btn-ghost"
+              data-ts-edit
+              onclick="var r=this.closest('#frame-timestamp-row');r.querySelector('[data-ts-form]').hidden=false;this.hidden=true;"
+              aria-label="Edit capture timestamp">Edit</button>
+    {% endif %}
+  </div>
+
+  {% if can_operate %}
+  <form class="frame-drawer-ts-form" data-ts-form hidden
+        hx-patch="/projects/{{ project_id }}/frames/{{ frame.id }}?drawer=1"
+        hx-target="#frame-timestamp-row"
+        hx-swap="outerHTML">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="datetime-local" name="capture_timestamp"
+           value="{{ frame.capture_timestamp_input }}"
+           aria-label="Capture timestamp">
+    <button type="submit" class="btn btn-xs btn-primary">Save</button>
+    <button type="button" class="btn btn-xs btn-ghost"
+            onclick="var r=this.closest('#frame-timestamp-row');this.closest('[data-ts-form]').hidden=true;r.querySelector('[data-ts-edit]').hidden=false;"
+            >Cancel</button>
+  </form>
+  {% endif %}
+</div>

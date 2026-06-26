@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block title %}Edit project — {{ project.name }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}Edit Project{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <a href="/projects/{{ project.id }}" style="color:var(--color-text-muted);text-decoration:none;">{{ project.name }}</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">Edit Settings</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Edit project — {{ project.name }}</h1>
+    <div class="subtitle">Update capture settings for this project.</div>
+  </div>
+</div>
+
+<div class="card" style="max-width:min(560px,100%);">
+  <div class="card-body" style="padding:var(--sp-6);">
+    {% include '_partials/project_settings_form.html' %}
+  </div>{# /card-body #}
+</div>{# /card #}
+
+{% endblock %}

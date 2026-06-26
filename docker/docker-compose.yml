@@ -1,0 +1,57 @@
+# Published single-service example for running Timelapse Manager in a container.
+#
+# Build context is the repository root (one level up from this file) so the
+# Dockerfile can read pyproject.toml / uv.lock / src / ffmpeg-pin.json:
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# The image serves the web UI over plain HTTP on 8080. For a real deployment,
+# terminate TLS at a reverse proxy in front of this service and have the proxy
+# forward `X-Forwarded-Proto: https` (the app honors it for secure-cookie and
+# redirect decisions).
+#
+# For local development with live source mounting + mock cameras, layer the dev
+# override:
+#
+#   docker compose -f docker/docker-compose.yml -f docker/compose.dev.yml up
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      platforms:
+        - linux/amd64
+    image: timelapse-manager:latest
+    # Map the container HTTP port to the host. Change the host side to relocate.
+    ports:
+      - "8080:8080"
+    environment:
+      # All state is relocatable; these mirror the image defaults and are shown
+      # so they are easy to repoint. The DB and frames live under DATA_DIR.
+      TLM_PATHS__DATA_DIR: "/data"
+      TLM_DATABASE__URL: "sqlite:////data/timelapse.db"
+      # Disabled because TLS is terminated at a proxy in front of the container;
+      # set to "true" (and expose 8443) only behind a proxy that sets
+      # X-Forwarded-Proto, otherwise browsers are bounced to an unserved port.
+      TLM_SERVER__REDIRECT_HTTP_TO_HTTPS: "false"
+    volumes:
+      # Persistent state: SQLite database + captured frames + the generated
+      # self-signed cert and local API token all live under /data by default.
+      - tlm-data:/data
+      # Optional config directory. Drop a config file here and point the app at
+      # it with TLM_CONFIG=/config/<file>.yml. A runtime key file (never baked
+      # into the image) is also mounted from here, read-only.
+      - tlm-config:/config
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Survive crashes and host reboots, but stay down after an explicit stop.
+    restart: unless-stopped
+
+volumes:
+  tlm-data:
+  tlm-config:

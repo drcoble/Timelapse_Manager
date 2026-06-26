@@ -1,0 +1,179 @@
+{#
+  Drawer-body fragment for a single frame's detail. The root element carries the
+  drawer title, which drawer.js copies into the drawer header on open. Navigating
+  prev/next re-swaps this body in place; the soft-delete/restore controls return
+  this same fragment for the SAME frame in its new state, plus an out-of-band
+  re-render of the underlying grid tile (rendered as a sibling below the root so
+  HTMX extracts it before the innerHTML body swap).
+
+  Context:
+    project_id    — int
+    frame         — _FrameView (rich: dimensions, file size, origin, ts prefill)
+    newer_id      — int | None  (next-higher sequence index, or None at the end)
+    older_id      — int | None  (next-lower sequence index, or None at the start)
+    scene_groups  — list of {title, rows: [{label, value}]}
+    schema_version— int | None
+    can_operate   — bool
+    csrf_token    — str
+    oob_tile      — bool (re-render the grid tile out-of-band; mutation responses)
+#}
+<div data-drawer-title="Frame #{{ frame.sequence_index }}"
+     data-frame-id="{{ frame.id }}">
+
+  <img class="frame-drawer-image"
+       src="/projects/{{ project_id }}/frames/{{ frame.id }}/image"
+       alt="Frame {{ frame.sequence_index }}"
+       style="width:100%;aspect-ratio:16/9;object-fit:contain;background:var(--color-surface-sunken,#000);">
+
+  {# Prev/Next: each is a drawer opener that re-swaps the drawer body. The grid
+     is newest-first, so the newer neighbour is the next-higher sequence index. #}
+  <nav class="frame-drawer-nav" aria-label="Frame navigation">
+    {% if newer_id is not none %}
+      <a class="btn btn-sm btn-ghost"
+         href="/projects/{{ project_id }}/frames/{{ newer_id }}"
+         data-drawer-open="#drawer-main"
+         hx-get="/projects/{{ project_id }}/frames/{{ newer_id }}/drawer"
+         hx-target="#drawer-main .drawer-body"
+         hx-swap="innerHTML"
+         hx-push-url="false"
+         rel="prev">&larr; Newer</a>
+    {% else %}
+      <span class="btn btn-sm btn-ghost" aria-disabled="true"
+            style="opacity:0.4;pointer-events:none;">&larr; Newer</span>
+    {% endif %}
+    {% if older_id is not none %}
+      <a class="btn btn-sm btn-ghost"
+         href="/projects/{{ project_id }}/frames/{{ older_id }}"
+         data-drawer-open="#drawer-main"
+         hx-get="/projects/{{ project_id }}/frames/{{ older_id }}/drawer"
+         hx-target="#drawer-main .drawer-body"
+         hx-swap="innerHTML"
+         hx-push-url="false"
+         rel="next">Older &rarr;</a>
+    {% else %}
+      <span class="btn btn-sm btn-ghost" aria-disabled="true"
+            style="opacity:0.4;pointer-events:none;">Older &rarr;</span>
+    {% endif %}
+  </nav>
+
+  {% include '_partials/frame_timestamp_row.html' %}
+
+  <dl class="info-grid frame-drawer-meta" style="grid-template-columns:1fr;">
+    <div class="info-cell">
+      <dt class="info-label">Sequence</dt>
+      <dd class="info-value">#{{ frame.sequence_index }}</dd>
+    </div>
+    <div class="info-cell">
+      <dt class="info-label">Dimensions</dt>
+      <dd class="info-value">
+        {% if frame.width and frame.height %}
+          {{ frame.width }} &times; {{ frame.height }}
+        {% else %}&mdash;{% endif %}
+      </dd>
+    </div>
+    <div class="info-cell">
+      <dt class="info-label">File size</dt>
+      <dd class="info-value">{{ frame.file_size_display or '—' }}</dd>
+    </div>
+    <div class="info-cell">
+      <dt class="info-label">Status</dt>
+      <dd class="info-value">
+        {% if frame.lifecycle_state == 'soft_deleted' %}Deleted{% else %}Active{% endif %}
+      </dd>
+    </div>
+    <div class="info-cell">
+      <dt class="info-label">Render</dt>
+      <dd class="info-value">
+        {% if frame.excluded_at %}
+          <span class="badge-excluded">Excluded from render</span>
+        {% else %}Included{% endif %}
+      </dd>
+    </div>
+    <div class="info-cell">
+      <dt class="info-label">Origin</dt>
+      <dd class="info-value">{{ frame.origin or '—' }}</dd>
+    </div>
+  </dl>
+
+  <details class="frame-drawer-scene">
+    <summary>&#9656; Scene metadata{% if not scene_groups %} (none){% endif %}</summary>
+    {% if scene_groups %}
+      {% for group in scene_groups %}
+        <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--color-text-dim);margin:var(--sp-3) 0 var(--sp-2);">
+          {{ group.title }}
+        </div>
+        <dl class="info-grid" style="grid-template-columns:1fr;">
+          {% for row in group.rows %}
+            <div class="info-cell">
+              <dt class="info-label">{{ row.label }}</dt>
+              <dd class="info-value">{{ row.value }}</dd>
+            </div>
+          {% endfor %}
+        </dl>
+      {% endfor %}
+      {% if schema_version is not none %}
+        <div style="margin-top:var(--sp-3);font-size:0.7rem;color:var(--color-text-dim);">
+          schema v{{ schema_version }}
+        </div>
+      {% endif %}
+    {% endif %}
+  </details>
+
+  <footer class="frame-drawer-actions">
+    <a class="btn btn-sm btn-ghost"
+       href="/projects/{{ project_id }}/frames/{{ frame.id }}/image"
+       download>Download</a>
+
+    {% if can_operate %}
+      {% if frame.lifecycle_state == 'soft_deleted' %}
+        <form method="post" style="margin:0;display:inline;"
+              action="/projects/{{ project_id }}/frames/{{ frame.id }}/restore?drawer=1"
+              hx-post="/projects/{{ project_id }}/frames/{{ frame.id }}/restore?drawer=1"
+              hx-target="#drawer-main .drawer-body"
+              hx-swap="innerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-sm btn-ghost">&#8617; Restore</button>
+        </form>
+      {% else %}
+        <form method="post" style="margin:0;display:inline;"
+              action="/projects/{{ project_id }}/frames/{{ frame.id }}/soft-delete?drawer=1"
+              hx-post="/projects/{{ project_id }}/frames/{{ frame.id }}/soft-delete?drawer=1"
+              hx-target="#drawer-main .drawer-body"
+              hx-swap="innerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-sm btn-ghost">&#128465; Remove</button>
+        </form>
+      {% endif %}
+
+      {# Render inclusion is independent of the deleted state above: an excluded
+         frame stays visible but is left out of the rendered video. #}
+      {% if frame.excluded_at %}
+        <form method="post" style="margin:0;display:inline;"
+              action="/projects/{{ project_id }}/frames/{{ frame.id }}/include?drawer=1"
+              hx-post="/projects/{{ project_id }}/frames/{{ frame.id }}/include?drawer=1"
+              hx-target="#drawer-main .drawer-body"
+              hx-swap="innerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-sm btn-ghost">&#10003; Include in render</button>
+        </form>
+      {% else %}
+        <form method="post" style="margin:0;display:inline;"
+              action="/projects/{{ project_id }}/frames/{{ frame.id }}/exclude?drawer=1"
+              hx-post="/projects/{{ project_id }}/frames/{{ frame.id }}/exclude?drawer=1"
+              hx-target="#drawer-main .drawer-body"
+              hx-swap="innerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn btn-sm btn-ghost">&#8856; Exclude from render</button>
+        </form>
+      {% endif %}
+    {% endif %}
+  </footer>
+</div>
+{# Out-of-band grid-tile update — a top-level sibling of the drawer root so HTMX
+   extracts it before the innerHTML body swap and the drawer title still reads
+   from the root's firstElementChild. Only emitted by mutation responses. #}
+{% if oob_tile | default(false) %}
+  {% with oob_tile = true %}
+    {% include '_partials/frame_tile.html' %}
+  {% endwith %}
+{% endif %}

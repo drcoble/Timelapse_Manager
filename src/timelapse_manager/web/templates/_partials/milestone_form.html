@@ -1,0 +1,182 @@
+{#
+  Partial: milestone_form.html — inline add/edit form for a milestone.
+
+  Context:
+    milestone    — None for add; a view object (.id, .label, .position_frame_index,
+                   .position_timestamp as naive-UTC datetime|None) for edit.
+    project      — project view with .id.
+    can_operate  — bool.
+    csrf_token   — str.
+    flash_messages — list of {type, message} shown on validation error; may be None.
+
+  Root element id="milestone-table" matches milestone_table.html so the
+  same hx-target (#milestone-table, outerHTML) works for both:
+    - error  → server returns this form fragment (replaces the table element)
+    - success → server returns milestone_table.html (the full refreshed table)
+
+  Field name contract (exact — backend parses these):
+    milestone_label          text, required
+    milestone_position_type  radio: "frame" | "time"
+    milestone_frame_index    number ≥ 0   (always present; shown when type=frame)
+    milestone_timestamp      datetime-local (always present; shown when type=time)
+    csrf_token               hidden
+
+  Both position inputs are always in the DOM so the no-JS plain POST works.
+  The backend reads milestone_position_type to decide which sibling to use.
+  Neither input carries required="" (novalidate; hidden fields must not trigger
+  browser validation).
+#}
+{% set editing = milestone is not none %}
+{% set uid = ('ms-' ~ milestone.id) if editing else 'ms-new' %}
+
+{# Server-render the correct initial visibility for each sub-panel. When JS is
+   off both sub-panels are visible and the backend decides by position_type. #}
+{% if editing %}
+  {% set _pos_type = 'frame' if milestone.position_frame_index is not none else 'time' %}
+{% else %}
+  {% set _pos_type = 'frame' %}
+{% endif %}
+
+<div id="milestone-table">
+  <div class="card mb-6" id="{{ uid }}-card">
+    <div class="card-header">
+      <div class="card-title">
+        {{ 'Edit Milestone' if editing else 'Add Milestone' }}
+      </div>
+    </div>
+    <div class="card-body">
+
+      {# ── Flash messages (inline validation errors) ─────────────────────── #}
+      {% if flash_messages %}
+        {% for flash in flash_messages %}
+        <div class="alert error" role="alert" style="margin-bottom:var(--sp-3);">
+          {{ flash.message }}
+        </div>
+        {% endfor %}
+      {% endif %}
+
+      <form novalidate
+            method="post"
+            action="{% if editing %}/projects/{{ project.id }}/milestones/{{ milestone.id }}/edit{% else %}/projects/{{ project.id }}/milestones{% endif %}"
+            hx-post="{% if editing %}/projects/{{ project.id }}/milestones/{{ milestone.id }}/edit{% else %}/projects/{{ project.id }}/milestones{% endif %}"
+            hx-target="#milestone-table"
+            hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <div class="form-stack">
+
+          {# ── Label ──────────────────────────────────────────────────────── #}
+          <div class="form-group">
+            <label class="form-label" for="{{ uid }}-label">
+              Label<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input type="text"
+                   id="{{ uid }}-label"
+                   name="milestone_label"
+                   class="form-control"
+                   value="{{ milestone.label if editing else '' }}"
+                   autocomplete="off"
+                   placeholder="e.g. Foundation poured">
+            <span class="form-hint">A short name for this position in the timeline.</span>
+          </div>
+
+          {# ── Position type selector ─────────────────────────────────────── #}
+          <div class="form-group">
+            <span class="form-label" id="{{ uid }}-pos-label">Position by</span>
+            <div role="radiogroup" aria-labelledby="{{ uid }}-pos-label"
+                 style="display:flex;gap:var(--sp-4);margin-top:var(--sp-1);">
+
+              <label style="display:flex;align-items:center;gap:var(--sp-2);cursor:pointer;">
+                <input type="radio"
+                       name="milestone_position_type"
+                       value="frame"
+                       id="{{ uid }}-type-frame"
+                       {% if _pos_type == 'frame' %}checked{% endif %}
+                       onchange="tlmMsReveal('{{ uid }}', 'frame');"
+                       style="accent-color:var(--color-accent);">
+                <span style="font-weight:500;">Frame index</span>
+              </label>
+
+              <label style="display:flex;align-items:center;gap:var(--sp-2);cursor:pointer;">
+                <input type="radio"
+                       name="milestone_position_type"
+                       value="time"
+                       id="{{ uid }}-type-time"
+                       {% if _pos_type == 'time' %}checked{% endif %}
+                       onchange="tlmMsReveal('{{ uid }}', 'time');"
+                       style="accent-color:var(--color-accent);">
+                <span style="font-weight:500;">Date &amp; time</span>
+              </label>
+
+            </div>
+          </div>
+
+          {# ── Frame index sub-panel ──────────────────────────────────────── #}
+          <div id="{{ uid }}-frame-panel"
+               {% if _pos_type != 'frame' %}hidden{% endif %}>
+            <div class="form-group">
+              <label class="form-label" for="{{ uid }}-frame-index">Frame index</label>
+              <input type="number"
+                     id="{{ uid }}-frame-index"
+                     name="milestone_frame_index"
+                     class="form-control mono"
+                     min="0"
+                     step="1"
+                     value="{{ milestone.position_frame_index if editing and milestone.position_frame_index is not none else '' }}"
+                     placeholder="0"
+                     style="max-width:12rem;">
+              <span class="form-hint">Zero-based index of the frame in this project&rsquo;s capture sequence.</span>
+            </div>
+          </div>
+
+          {# ── Timestamp sub-panel ────────────────────────────────────────── #}
+          {#
+            datetime-local value must be YYYY-MM-DDTHH:MM.
+            position_timestamp is a naive-UTC datetime; isoformat() gives the
+            correct format and the backend parses incoming values as UTC as well
+            (both ends agree on UTC, no conversion mismatch).
+          #}
+          <div id="{{ uid }}-time-panel"
+               {% if _pos_type != 'time' %}hidden{% endif %}>
+            <div class="form-group">
+              <label class="form-label" for="{{ uid }}-timestamp">Date &amp; time (UTC)</label>
+              <input type="datetime-local"
+                     id="{{ uid }}-timestamp"
+                     name="milestone_timestamp"
+                     class="form-control mono"
+                     value="{{ milestone.position_timestamp.strftime('%Y-%m-%dT%H:%M') if editing and milestone.position_timestamp is not none else '' }}"
+                     style="max-width:20rem;">
+              <span class="form-hint">Enter the capture date and time in UTC.</span>
+            </div>
+          </div>
+
+          {# ── Save / Cancel ──────────────────────────────────────────────── #}
+          <div style="display:flex;gap:var(--sp-3);margin-top:var(--sp-2);">
+            <button type="submit" class="btn btn-primary">
+              {{ 'Save Changes' if editing else 'Add Milestone' }}
+            </button>
+            {# Cancel: navigate back to the project page (clears the form; both
+               the no-JS path and the HTMX path see the full refreshed table). #}
+            <a href="/projects/{{ project.id }}" class="btn btn-ghost">Cancel</a>
+          </div>
+
+        </div>{# /form-stack #}
+      </form>
+
+    </div>{# /card-body #}
+  </div>{# /card #}
+</div>{# /milestone-table (shared root id) #}
+
+{# ── Inline controller: reveals frame or time sub-panel on radio change ─── #}
+<script>
+(function () {
+  function tlmMsReveal(uid, posType) {
+    var framePanel = document.getElementById(uid + '-frame-panel');
+    var timePanel  = document.getElementById(uid + '-time-panel');
+    if (framePanel) framePanel.hidden = (posType !== 'frame');
+    if (timePanel)  timePanel.hidden  = (posType !== 'time');
+  }
+  /* Expose globally so inline onchange= attributes can reach it. */
+  window.tlmMsReveal = tlmMsReveal;
+}());
+</script>

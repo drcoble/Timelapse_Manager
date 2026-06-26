@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  {# CSRF token in meta — used by the form's hidden field below #}
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Sign In — Timelapse Manager</title>
+  {# No-flash theme: apply the localStorage preference before the stylesheet so
+     the toggle below persists across reloads of this pre-auth page. #}
+  <script>
+    (function () {
+      try {
+        var pref = localStorage.getItem('theme');
+        if (pref === 'light' || pref === 'dark') {
+          document.documentElement.setAttribute('data-theme', pref);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+{# Login page has no app shell — it is pre-authentication #}
+<body>
+
+<main class="login-page">
+  <div class="login-card">
+
+    <div class="login-header">
+      {# Meridian mark: vertical + horizontal cross with a centre dot — the
+         meridian crossing (place × time). Inlined because the pre-auth page
+         carries no app shell / icon sprite. Accent-coloured via currentColor. #}
+      <div class="login-logo" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round">
+          <line x1="8" y1="1.5" x2="8" y2="14.5"></line>
+          <line x1="1.5" y1="8" x2="14.5" y2="8"></line>
+          <circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"></circle>
+        </svg>
+      </div>
+      <h1>Timelapse Manager</h1>
+      <p>Sign in to your account</p>
+      {% if app_version %}
+      <p class="login-version">Version {{ app_version }}</p>
+      {% endif %}
+    </div>
+
+    <div class="login-body">
+
+      {# Generic error slot — never reveals whether the username or password was wrong #}
+      {% if error %}
+      <div class="login-error" role="alert">
+        Invalid credentials. Please check your username and password.
+      </div>
+      {% endif %}
+
+      {# Flash messages for login page (e.g. session expired). Guard against
+         Undefined if Engineer B omits flash_messages from the context. #}
+      {% if flash_messages %}
+      {% for msg in flash_messages %}
+      <div class="login-error {% if msg.type == 'success' %}{% endif %}"
+           role="alert"
+           style="{% if msg.type == 'success' %}background:var(--color-running-bg);border-color:var(--color-running);color:var(--color-running);{% endif %}">
+        {{ msg.message }}
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      <form method="post" action="/login" novalidate>
+        {# CSRF token — required on every mutating form #}
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {# Return-to: preserved across the login round-trip so the user lands back
+           where they were headed. Sanitized server-side to a same-origin path. #}
+        <input type="hidden" name="next" value="{{ next | default('/', true) }}">
+
+        <div class="form-stack">
+
+          <div class="form-group">
+            <label class="form-label" for="username">
+              Username<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="username"
+              type="text"
+              name="username"
+              class="form-control"
+              placeholder="Enter your username"
+              autocomplete="username"
+              required
+              aria-required="true"
+              autofocus
+            >
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="password">
+              Password<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="password"
+              type="password"
+              name="password"
+              class="form-control"
+              placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;"
+              autocomplete="current-password"
+              required
+              aria-required="true"
+            >
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);">
+            <label class="checkbox-label">
+              <input type="checkbox" name="remember_me" value="1">
+              Remember me
+            </label>
+          </div>
+
+          <button type="submit" class="btn btn-primary w-full" style="margin-top:var(--sp-2);">
+            Sign In
+          </button>
+
+        </div>
+      </form>
+
+    </div>{# /login-body #}
+
+    <div class="login-footer">
+      <span>Timelapse Manager &nbsp;&middot;&nbsp; Self-hosted</span>
+      {# Pre-auth theme toggle: cycles light → dark → system, persisted to
+         localStorage only (no server round-trip before sign-in). #}
+      <button type="button" id="login-theme-toggle" class="login-theme-btn"
+              aria-label="Toggle colour theme" title="Toggle colour theme">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+             aria-hidden="true" width="16" height="16">
+          <circle cx="8" cy="8" r="3.25"></circle>
+          <line x1="8" y1="1" x2="8" y2="2.5"></line>
+          <line x1="8" y1="13.5" x2="8" y2="15"></line>
+          <line x1="1" y1="8" x2="2.5" y2="8"></line>
+          <line x1="13.5" y1="8" x2="15" y2="8"></line>
+        </svg>
+      </button>
+    </div>
+
+  </div>{# /login-card #}
+</main>
+
+<script>
+  (function () {
+    var CYCLE = ['light', 'dark', 'system'];
+    var btn = document.getElementById('login-theme-toggle');
+    if (!btn) return;
+    function current() {
+      return document.documentElement.getAttribute('data-theme') || 'system';
+    }
+    function apply(t) {
+      if (t === 'system') {
+        document.documentElement.removeAttribute('data-theme');
+      } else {
+        document.documentElement.setAttribute('data-theme', t);
+      }
+      try { localStorage.setItem('theme', t); } catch (e) {}
+    }
+    btn.addEventListener('click', function () {
+      var i = CYCLE.indexOf(current());
+      apply(CYCLE[(i + 1) % CYCLE.length]);
+    });
+  })();
+</script>
+
+</body>
+</html>

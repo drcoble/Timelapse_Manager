@@ -1,0 +1,78 @@
+{#
+  Result state of the frame selection / action bar (#frames-action-bar),
+  swapped in by outerHTML after a bulk lifecycle operation. It replaces the
+  selection bar with a summary of what happened and the follow-up affordances:
+
+    - Undo: replays the materialised inverse operation over the exact id-set
+      that was affected (embedded here, never re-derived client-side).
+    - Retry + View failures: present only on a partial failure; the failed ids
+      stay selected client-side so Retry re-runs the same operation over them.
+
+  Affected tiles are re-rendered out-of-band (oob_frames) so the grid updates in
+  place; for a large operation the server flags reload_window instead and the
+  client reloads the current grid window rather than taking a wall of tiles.
+
+  Context:
+    summary — {operation, succeeded, failed, failed_ids[], affected_ids[],
+               undo{operation, frame_ids[]} | None, reload_window, error?}
+    oob_frames — list[_FrameView] (empty when reload_window or error)
+    csrf_token, can_operate
+#}
+{% set verbed = {
+     'delete': 'deleted', 'restore': 'restored',
+     'exclude': 'excluded', 'include': 'included'
+   }.get(summary.operation, summary.operation ~ 'd') %}
+{% set state = 'error' if summary.error else ('partial' if summary.failed else 'success') %}
+<div id="frames-action-bar"
+     class="frames-action-bar frames-action-bar--result frames-action-bar--{{ state }}"
+     role="status" aria-live="polite" aria-label="Bulk action result"
+     data-bulk-reload-window="{{ '1' if summary.reload_window else '0' }}">
+  {% if summary.error %}
+    <span class="selection-bar-count">{{ summary.error }}</span>
+  {% else %}
+    <span class="selection-bar-count">
+      {{ summary.succeeded }} {{ verbed }}{% if summary.failed %} &middot;
+      {{ summary.failed }} failed{% endif %}
+    </span>
+  {% endif %}
+
+  <span class="frames-action-bar-actions">
+    {% if summary.undo and summary.succeeded %}
+      <button type="button" class="btn btn-sm btn-secondary"
+              data-bulk-undo
+              data-bulk-operation="{{ summary.undo.operation }}"
+              data-frame-ids="{{ summary.undo.frame_ids | join(',') }}">
+        Undo
+      </button>
+    {% endif %}
+    {% if summary.failed %}
+      <button type="button" class="btn btn-sm btn-secondary"
+              data-bulk-retry
+              data-bulk-operation="{{ summary.operation }}"
+              data-frame-ids="{{ summary.failed_ids | join(',') }}">
+        Retry {{ summary.failed }}
+      </button>
+      <details class="bulk-failures">
+        <summary class="btn btn-sm btn-ghost">View failures</summary>
+        <ul class="bulk-failures__list">
+          {% for fid in summary.failed_ids %}
+            <li>Frame {{ fid }}</li>
+          {% endfor %}
+        </ul>
+      </details>
+    {% endif %}
+  </span>
+
+  <button type="button" class="btn btn-sm btn-ghost" data-selection-clear>
+    Dismiss
+  </button>
+</div>
+
+{# Out-of-band re-render of each affected tile so the grid updates in place.
+   HTMX drops an OOB swap whose target id is not in the DOM, so emitting every
+   affected id is safe even when only some are on screen. #}
+{% for frame in oob_frames %}
+  {% with oob_tile = true, project = {'id': frame.project_id} %}
+    {% include '_partials/frame_tile.html' %}
+  {% endwith %}
+{% endfor %}

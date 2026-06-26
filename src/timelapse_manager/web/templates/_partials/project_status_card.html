@@ -1,0 +1,207 @@
+{#
+  Partial: project_status_card.html
+  Context: project — {id, name, operational_status, lifecycle_state,
+                       frame_count, last_capture_at, next_capture_at, latest_frame_url}
+           current_user — {username, role}
+           csrf_token — str
+
+  Returned standalone by GET /partials/projects/{id}/status
+  for HTMX polling. The parent dashboard.html polls GET /partials/projects
+  which returns all cards.
+
+  operational_status values: running | paused | stopped | error | lowdisk
+  lifecycle_state values: active | archived
+#}
+<article class="project-card status-{{ project.operational_status }}{% if project.lifecycle_state == 'archived' %} archived{% endif %}"
+         id="project-card-{{ project.id }}">
+
+  <div class="project-card-header">
+    <div class="project-card-thumb">
+      {% if project.latest_frame_url %}
+      <a href="/projects/{{ project.id }}" tabindex="-1">
+        <div class="frame-thumb thumb-project">
+          <img src="{{ project.latest_frame_url }}"
+               alt="Latest frame for {{ project.name }}"
+               loading="lazy">
+        </div>
+      </a>
+      {% else %}
+      <div class="frame-thumb thumb-project">
+        <div class="frame-thumb-label">
+          <span class="frame-thumb-icon" aria-hidden="true">&#127760;</span>
+          <span>no frames</span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="project-card-meta">
+      <div class="project-card-name">
+        <a href="/projects/{{ project.id }}" style="color:inherit;">{{ project.name }}</a>
+      </div>
+
+      <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        {% if project.lifecycle_state == 'archived' %}
+          <span class="lifecycle-badge archived">&#128190; Archived</span>
+        {% else %}
+          {% if project.operational_status == 'running' %}
+            <span class="status-badge running">
+              <span class="status-dot running" aria-hidden="true"></span>Running
+            </span>
+          {% elif project.operational_status == 'paused' %}
+            <span class="status-badge paused">
+              <span class="status-dot paused" aria-hidden="true"></span>Paused
+            </span>
+          {% elif project.operational_status == 'lowdisk' %}
+            <span class="status-badge lowdisk">
+              <span class="status-dot lowdisk" aria-hidden="true"></span>Paused &mdash; Low Disk
+            </span>
+          {% elif project.operational_status == 'error' %}
+            <span class="status-badge error">
+              <span class="status-dot error" aria-hidden="true"></span>Error
+            </span>
+          {% elif project.operational_status == 'stopped' %}
+            <span class="status-badge stopped">
+              <span class="status-dot stopped" aria-hidden="true"></span>Stopped
+            </span>
+          {% endif %}
+          {% if project.is_overdue %}
+            {# Running but no capture within ~2x the interval — likely stalled. #}
+            <span class="status-badge lowdisk"
+                  title="No capture within about twice the configured interval">
+              <span class="status-dot lowdisk" aria-hidden="true"></span>Overdue
+            </span>
+          {% endif %}
+        {% endif %}
+      </div>
+    </div>
+  </div>{# /project-card-header #}
+
+  {# Time ribbon — lazy-loaded so its DB work stays off the card/poll path. #}
+  <div class="time-ribbon-slot" style="margin:var(--sp-2) 0;"
+       hx-get="/partials/projects/{{ project.id }}/ribbon?h=20"
+       hx-trigger="load"
+       hx-swap="innerHTML"></div>
+
+  <div class="project-card-stats">
+    <div class="stat-cell">
+      <div class="stat-label">Frames</div>
+      <div class="stat-value">{{ project.frame_count | default(0) }}</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Last Capture</div>
+      <div class="stat-value dim">
+        {% if project.last_capture_at_raw %}
+          {{ project.last_capture_at_raw | localdt }}
+        {% elif project.last_capture_at %}
+          {{ project.last_capture_at }}
+        {% else %}
+          &mdash;
+        {% endif %}
+      </div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">
+        {% if project.operational_status == 'error' %}Next Retry
+        {% elif project.operational_status in ['paused', 'lowdisk', 'stopped'] %}Next Capture
+        {% else %}Next Capture
+        {% endif %}
+      </div>
+      <div class="stat-value dim">
+        {% if project.next_capture_at_raw and project.operational_status == 'running' %}
+          {{ project.next_capture_at_raw | localdt }}
+        {% elif project.next_capture_at and project.operational_status == 'running' %}
+          {{ project.next_capture_at }}
+        {% elif project.operational_status == 'stopped' %}
+          &mdash; stopped &mdash;
+        {% elif project.operational_status in ['paused', 'lowdisk'] %}
+          &mdash; paused &mdash;
+        {% else %}
+          &mdash;
+        {% endif %}
+      </div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Disk Used</div>
+      <div class="stat-value dim">{{ project.disk_used_display | default('0 B', true) }}</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Growth Rate</div>
+      <div class="stat-value dim">
+        {% if project.frame_count and project.growth_rate_display %}
+          ~{{ project.growth_rate_display }}
+        {% else %}
+          &mdash;
+        {% endif %}
+      </div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-label">Projection</div>
+      {% if project.operational_status == 'lowdisk' %}
+        {# Disk is full; a projection is meaningless until space is reclaimed. #}
+        <div class="stat-value" style="color:var(--color-lowdisk);font-size:0.8rem;">
+          Low disk
+        </div>
+      {% elif project.frame_count and not project.projected_open_ended
+              and project.projected_total_display %}
+        {# Projected total storage at campaign end — mirrors the detail page. #}
+        <div class="stat-value dim">&approx; {{ project.projected_total_display }}</div>
+      {% else %}
+        <div class="stat-value dim">&mdash;</div>
+      {% endif %}
+    </div>
+  </div>{# /project-card-stats #}
+
+  <div class="project-card-footer">
+    <a href="/projects/{{ project.id }}" class="btn btn-ghost btn-sm">View</a>
+
+    {% if project.lifecycle_state != 'archived' %}
+      {% if can_operate %}
+        {% if project.operational_status == 'running' %}
+          <form method="post" action="/projects/{{ project.id }}/pause" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">&#9646;&#9646; Pause</button>
+          </form>
+          <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">&#9632; Stop</button>
+          </form>
+
+        {% elif project.operational_status == 'paused' %}
+          <form method="post" action="/projects/{{ project.id }}/resume" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-success btn-sm">&#9654; Resume</button>
+          </form>
+          <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">&#9632; Stop</button>
+          </form>
+
+        {% elif project.operational_status == 'lowdisk' %}
+          <form method="post" action="/projects/{{ project.id }}/resume" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-success btn-sm">&#9654; Resume</button>
+          </form>
+          <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-secondary btn-sm">&#9632; Stop</button>
+          </form>
+
+        {% elif project.operational_status == 'error' %}
+          <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-danger btn-sm">&#9632; Stop</button>
+          </form>
+
+        {% elif project.operational_status == 'stopped' %}
+          <form method="post" action="/projects/{{ project.id }}/start" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-success btn-sm">&#9654; Start</button>
+          </form>
+        {% endif %}
+      {% endif %}{# /can_operate #}
+    {% endif %}{# /not archived #}
+
+  </div>{# /project-card-footer #}
+
+</article>

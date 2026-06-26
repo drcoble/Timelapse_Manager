@@ -1,0 +1,42 @@
+<!-- ===== HEADER ===== -->
+<header class="app-header">
+  <a href="/" class="header-logo">
+    <div class="header-logo-icon" aria-hidden="true"><svg class="icon"><use href="#icon-logo"></use></svg></div>
+    <span class="header-logo-text">Timelapse Manager</span>
+  </a>
+  <div class="header-divider" role="separator"></div>
+  <div class="header-ctx">
+    {{ header_breadcrumb }}
+  </div>
+  <div class="header-spacer"></div>
+  <div class="header-actions">
+    {# Theme toggle: cycles light → dark → system #}
+    <button type="button"
+            class="btn btn-ghost btn-sm theme-toggle"
+            id="theme-toggle-btn"
+            aria-label="Toggle colour theme"
+            title="Toggle theme">
+      <span class="theme-icon" aria-hidden="true">&#9680;</span>
+    </button>
+    {#
+      Active-alerts indicator + panel. The container owns the polling
+      trigger and swaps the fragment into its innerHTML, so the badge count
+      and the accessible label stay current and the trigger survives each
+      swap. Open/closed is CSS-driven (:focus-within / :hover) on the
+      static container, so a poll never snaps an open panel shut.
+    #}
+    <div id="alerts-area"
+         class="alerts-area"
+         hx-get="/alerts/summary"
+         hx-trigger="load, every 30s"
+         hx-swap="innerHTML"></div>
+    {# Operator is the default working role — its badge is suppressed so the
+       badge only signals a departure from normal (admin or read-only viewer). #}
+    {% if current_user.role != 'operator' %}
+    <span class="role-badge {{ current_user.role }}" title="Your role: {{ current_user.role | capitalize }}">
+      {{ current_user.role | capitalize }}
+    </span>
+    {% endif %}
+    {% include '_partials/shell/user_menu.html' %}
+  </div>
+</header>

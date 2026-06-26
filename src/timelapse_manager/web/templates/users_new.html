@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}New User — Timelapse Manager{% endblock %}
+{% block page_title_short %}New User{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/users" style="color:var(--color-text-muted);text-decoration:none;">Users</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">New User</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>New User</h1>
+    <div class="subtitle">Create a local account.</div>
+  </div>
+</div>
+
+<div class="card" style="max-width:560px;">
+  <div class="card-body" style="padding:var(--sp-6);">
+    {% include '_partials/new_user_form.html' %}
+  </div>
+</div>
+
+{% endblock %}

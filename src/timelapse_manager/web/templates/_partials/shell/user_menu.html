@@ -1,0 +1,19 @@
+{# User menu — logout is a POST form to protect against CSRF #}
+<div class="user-menu" tabindex="0" role="button" aria-haspopup="true" aria-label="User menu">
+  <div class="user-avatar" aria-hidden="true">
+    {{ current_user.username[:2] | upper }}
+  </div>
+  <span class="truncate" style="max-width:120px;">{{ current_user.username }}</span>
+  <span aria-hidden="true" style="color:var(--color-text-dim);font-size:0.7em;">&#9660;</span>
+  <div class="user-dropdown" role="menu">
+    <a href="/account/preferences" class="user-dropdown-item" role="menuitem">
+      Preferences
+    </a>
+    <form method="post" action="/logout" style="margin:0;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="user-dropdown-item danger" role="menuitem">
+        Sign out
+      </button>
+    </form>
+  </div>
+</div>

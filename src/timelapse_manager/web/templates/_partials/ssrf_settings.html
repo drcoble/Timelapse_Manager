@@ -1,0 +1,82 @@
+{#
+  Partial: ssrf_settings.html
+  Renders the "Network access (camera reachability)" settings section for
+  inclusion in settings.html.
+
+  Context:
+    ssrf                 — SsrfSettingsView (.allowed_private_subnets: list[str])
+    ssrf_config_subnets  — list[str], the read-only config/env baseline
+    ssrf_error           — str | None, inline validation error
+    csrf_token           — str
+#}
+
+<section id="network" class="form-section">
+  <div class="form-section-title">Network access (camera reachability)</div>
+
+  <p class="form-hint" style="margin-bottom:var(--sp-4);">
+    Cameras live on private networks, so for safety the server refuses to contact
+    a private address unless that network has been explicitly allowed here. If
+    adding a camera fails with <em>"address is not within any admin-allowed
+    subnet"</em>, add its network below (for example
+    <span class="mono">10.1.16.0/24</span>). Loopback, link-local, and
+    cloud-metadata addresses are always blocked and cannot be allowed.
+    Changes take effect immediately — no restart needed.
+  </p>
+
+  {% if ssrf_error %}
+    <div class="alert error" role="alert" style="margin-bottom:var(--sp-4);">
+      <div class="alert-body">{{ ssrf_error }}</div>
+    </div>
+  {% endif %}
+
+  {% if ssrf_config_subnets %}
+    <div class="form-group" style="margin-bottom:var(--sp-4);">
+      <label class="form-label">
+        From configuration / environment
+        <span class="badge badge-env" title="Controlled by an environment variable">env</span>
+      </label>
+      <div class="form-hint" style="margin-bottom:var(--sp-2);">
+        These networks are set by the server's configuration or environment and
+        are always allowed. They are shown here for reference and cannot be edited
+        from this page.
+      </div>
+      <ul class="mono" style="margin:0;padding-left:var(--sp-5);">
+        {% for subnet in ssrf_config_subnets %}
+          <li>{{ subnet }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  <form id="ssrf-form" method="post" action="/settings/ssrf" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="form-stack">
+      <div class="form-group">
+        <label class="form-label" for="ssrf_allowed_private_subnets">
+          Allowed private networks
+        </label>
+        <textarea id="ssrf_allowed_private_subnets"
+                  name="ssrf_allowed_private_subnets"
+                  class="form-control mono"
+                  rows="5"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="10.1.16.0/24&#10;192.168.1.0/24">{{ ssrf.allowed_private_subnets | join("\n") }}</textarea>
+        <span class="form-hint">
+          One network per line, in CIDR notation
+          (<span class="mono">10.1.16.0/24</span>). A single address is also
+          accepted and treated as a <span class="mono">/32</span>. Leave empty to
+          allow no extra private networks.
+        </span>
+      </div>
+
+      <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);
+                  border-top:1px solid var(--color-border);flex-wrap:wrap;
+                  align-items:center;">
+        <button type="submit" class="btn btn-primary">Save Network Access</button>
+        <a href="/settings" class="btn btn-ghost">Cancel</a>
+      </div>
+    </div>{# /form-stack #}
+  </form>
+</section>

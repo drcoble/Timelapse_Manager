@@ -1,0 +1,44 @@
+{#
+  Partial: stream_profile_select.html — the per-project stream/profile picker.
+
+  Swapped into the project form's #stream-profile-container when the camera
+  selection changes (hx-get="/cameras/stream-profiles"), and server-rendered on
+  the edit form's initial load so the saved selection shows preselected.
+
+  Context:
+    profiles — list of StreamProfile {id, label}; empty when the camera exposes
+               no selectable streams or could not be reached.
+    profiles_ok — True when the camera was reached and its streams were read.
+    selected_stream_id — the project's saved stream id to preselect, or None
+               (only meaningful on the edit form's initial render).
+
+  When the camera cannot be reached, or reports a failure, or exposes no
+  streams, an inline notice is shown instead and capture falls back to the
+  camera's default stream. This partial never causes the page to fail.
+
+  No credentials are ever rendered here.
+#}
+{% if profiles_ok and profiles %}
+  <div class="form-group">
+    <label class="form-label" for="stream_profile">Stream profile</label>
+    <select id="stream_profile" name="stream_profile" class="form-control">
+      <option value=""{% if not selected_stream_id %} selected{% endif %}>
+        Use camera default
+      </option>
+      {% for p in profiles %}
+      <option value="{{ p.id }}"{% if p.id == selected_stream_id %} selected{% endif %}>
+        {{- p.label -}}
+      </option>
+      {% endfor %}
+    </select>
+    <span class="form-hint">
+      Which of the camera's streams to capture from. Leave on
+      <em>Use camera default</em> to let the camera decide.
+    </span>
+  </div>
+{% else %}
+  <div class="alert error" role="alert" style="margin-top:var(--sp-3);">
+    Could not load stream profiles for this camera. You can continue without
+    selecting one.
+  </div>
+{% endif %}

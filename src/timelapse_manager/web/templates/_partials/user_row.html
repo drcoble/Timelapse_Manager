@@ -1,0 +1,136 @@
+{#
+  Partial: user_row.html
+  Context: user — {id, username, role, enabled, auth_source}
+           current_user — {username, role}
+           csrf_token — str
+
+  role values: admin | operator | viewer
+  auth_source values: local | ldap
+  enabled: bool
+#}
+<tr id="user-row-{{ user.id }}">
+  <td class="mono">{{ user.username }}</td>
+  <td>
+    <span class="role-badge {{ user.role }}">{{ user.role | capitalize }}</span>
+  </td>
+  <td>
+    <span class="auth-badge {{ user.auth_source }}">{{ user.auth_source | upper }}</span>
+  </td>
+  <td>
+    {% if user.enabled %}
+      <span class="status-badge active" style="font-size:0.65rem;">Active</span>
+    {% else %}
+      <span class="status-badge disabled" style="font-size:0.65rem;">Disabled</span>
+    {% endif %}
+  </td>
+  <td style="text-align:right;">
+    {# Inline error surfaced after a refused per-row mutation (e.g. trying to
+       disable the last administrator). Rendered here so the row swap shows it. #}
+    {% if flash_messages %}
+      {% for msg in flash_messages %}
+      <div class="form-hint" role="alert" style="color:var(--color-error);">{{ msg.message }}</div>
+      {% endfor %}
+    {% endif %}
+
+    {% if current_user.username != user.username %}
+    <div class="row-actions-menu">
+      <button type="button" class="btn btn-ghost btn-sm row-actions-trigger"
+              aria-haspopup="menu" aria-label="Actions for {{ user.username }}">&#8943;</button>
+      <div class="row-actions-popover" role="menu">
+        <button type="button" role="menuitem"
+                hx-get="/users/{{ user.id }}/edit-form"
+                hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">Edit role</button>
+
+        {% if user.auth_source == 'local' %}
+        {#
+          Set-password mini-form. Lives inside the popover; :focus-within keeps
+          the popover open while the admin types. Sends password + password_confirm
+          to POST /users/{id}/reset-password and swaps the refreshed row fragment.
+          Note: the backend must validate password_confirm and return 200 with an
+          error fragment (not 4xx) for HTMX to swap the result visible.
+        #}
+        <form method="post" action="/users/{{ user.id }}/reset-password"
+              style="margin:0;padding:var(--sp-3) var(--sp-3) var(--sp-2);"
+              hx-post="/users/{{ user.id }}/reset-password"
+              hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div style="display:flex;flex-direction:column;gap:var(--sp-2);">
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" for="reset-pw-{{ user.id }}"
+                     style="font-size:var(--text-xs);">New password</label>
+              <input type="password"
+                     id="reset-pw-{{ user.id }}"
+                     name="password"
+                     class="form-control"
+                     required
+                     autocomplete="new-password"
+                     style="font-size:var(--text-sm);">
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label class="form-label" for="reset-pw-confirm-{{ user.id }}"
+                     style="font-size:var(--text-xs);">Confirm password</label>
+              <input type="password"
+                     id="reset-pw-confirm-{{ user.id }}"
+                     name="password_confirm"
+                     class="form-control"
+                     required
+                     autocomplete="new-password"
+                     style="font-size:var(--text-sm);">
+            </div>
+            <button type="submit" role="menuitem" class="btn btn-secondary btn-sm"
+                    style="align-self:flex-start;">Set password</button>
+          </div>
+        </form>
+        {% else %}
+        {#
+          LDAP accounts: password is directory-managed; show a read-only indicator
+          so admins understand why no set-password form is available.
+        #}
+        <div role="menuitem" aria-disabled="true"
+             style="padding:var(--sp-2) var(--sp-3);
+                    color:var(--color-text-dim);
+                    font-size:var(--text-xs);
+                    cursor:default;">
+          <span class="auth-badge ldap" style="margin-right:var(--sp-1);">LDAP</span>
+          Directory-managed
+        </div>
+        {% endif %}
+
+        <form method="post" action="/users/{{ user.id }}/revoke-sessions" style="margin:0;"
+              hx-post="/users/{{ user.id }}/revoke-sessions"
+              hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML"
+              hx-confirm="Revoke all active sessions for {{ user.username }}?">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem">Revoke sessions</button>
+        </form>
+
+        {% if user.enabled %}
+        <form method="post" action="/users/{{ user.id }}/disable" style="margin:0;"
+              hx-post="/users/{{ user.id }}/disable"
+              hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML"
+              hx-confirm="Disable {{ user.username }}? They will be signed out and unable to log in.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem">Disable</button>
+        </form>
+        {% else %}
+        <form method="post" action="/users/{{ user.id }}/enable" style="margin:0;"
+              hx-post="/users/{{ user.id }}/enable"
+              hx-target="#user-row-{{ user.id }}" hx-swap="outerHTML"
+              hx-confirm="Re-enable {{ user.username }}?">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem">Enable</button>
+        </form>
+        {% endif %}
+
+        <form method="post" action="/users/{{ user.id }}/delete" style="margin:0;"
+              onsubmit="return confirm('Permanently remove this user? This cannot be undone.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem" class="danger">Delete</button>
+        </form>
+      </div>
+    </div>
+    {% else %}
+    <span class="text-dim" style="font-size:0.75rem;">(you)</span>
+    {% endif %}
+  </td>
+</tr>

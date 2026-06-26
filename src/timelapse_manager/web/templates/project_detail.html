@@ -1,0 +1,476 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}{{ project.name }}{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">{{ project.name }}</span>
+{% endblock %}
+
+{% block content %}
+
+{# Archived project banner #}
+{% if project.lifecycle_state == 'archived' %}
+<div class="alert info mb-6">
+  <span class="alert-icon" aria-hidden="true">&#128190;</span>
+  <div class="alert-body">
+    <div class="alert-title">Archived project</div>
+    <div class="alert-desc">
+      This project is archived. Capture has stopped, but frames and renders remain accessible.
+      {% if can_operate %}
+        You can reactivate it to resume capture.
+      {% endif %}
+    </div>
+  </div>
+  {% if can_operate %}
+  <form method="post" action="/projects/{{ project.id }}/reactivate" style="margin:0;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn btn-sm btn-secondary">&#9654; Reactivate</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>{{ project.name }}</h1>
+    <div class="subtitle" style="display:flex;align-items:center;gap:var(--sp-3);">
+      {% if project.lifecycle_state == 'archived' %}
+        <span class="lifecycle-badge archived">&#128190; Archived</span>
+      {% else %}
+        {% if project.operational_status == 'running' %}
+          <span class="status-badge running">
+            <span class="status-dot running" aria-hidden="true"></span>Running
+          </span>
+        {% elif project.operational_status == 'paused' %}
+          <span class="status-badge paused">
+            <span class="status-dot paused" aria-hidden="true"></span>Paused
+          </span>
+        {% elif project.operational_status == 'lowdisk' %}
+          <span class="status-badge lowdisk">
+            <span class="status-dot lowdisk" aria-hidden="true"></span>Paused &mdash; Low Disk
+          </span>
+        {% elif project.operational_status == 'error' %}
+          <span class="status-badge error">
+            <span class="status-dot error" aria-hidden="true"></span>Error
+          </span>
+        {% elif project.operational_status == 'stopped' %}
+          <span class="status-badge stopped">
+            <span class="status-dot stopped" aria-hidden="true"></span>Stopped
+          </span>
+        {% endif %}
+      {% endif %}
+      <span>{{ project.frame_count | default(0) }} frames</span>
+    </div>
+  </div>
+
+  {% if can_operate and project.lifecycle_state != 'archived' %}
+  <div class="page-actions">
+    {% if project.operational_status == 'stopped' %}
+      <form method="post" action="/projects/{{ project.id }}/start" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-success">&#9654; Start</button>
+      </form>
+    {% elif project.operational_status == 'running' %}
+      <form method="post" action="/projects/{{ project.id }}/pause" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary">&#9646;&#9646; Pause</button>
+      </form>
+      <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary">&#9632; Stop</button>
+      </form>
+    {% elif project.operational_status in ['paused', 'lowdisk'] %}
+      <form method="post" action="/projects/{{ project.id }}/resume" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-success">&#9654; Resume</button>
+      </form>
+      <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-secondary">&#9632; Stop</button>
+      </form>
+    {% elif project.operational_status == 'error' %}
+      <form method="post" action="/projects/{{ project.id }}/stop" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-danger">&#9632; Stop</button>
+      </form>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# Signature time-ribbon — the full capture timeline (interactive scrubber) #}
+<div class="time-ribbon-slot" style="margin:var(--sp-3) 0;"
+     hx-get="/partials/projects/{{ project.id }}/ribbon?h=36"
+     hx-trigger="load"
+     hx-swap="innerHTML"></div>
+
+<div class="detail-layout">
+
+  <!-- ===== LEFT COLUMN ===== -->
+  <div class="detail-main">
+
+    {# Main-column tabs: Status / Settings / Frames / Renders.
+       The render-schedule settings live inside the Settings form's "automatic
+       renders" section, so there is no separate Schedule tab (it stays one
+       saved form). Settings is operator-only (its fragment route is gated). #}
+    <div class="tabs" role="tablist" aria-label="Project sections">
+      <button type="button" class="tab-item active" role="tab"
+              aria-selected="true" data-tab-target="#tab-status">Status</button>
+      {% if can_operate %}
+      <button type="button" class="tab-item" role="tab"
+              aria-selected="false" data-tab-target="#tab-settings">Settings</button>
+      {% endif %}
+      <button type="button" class="tab-item" role="tab"
+              aria-selected="false" data-tab-target="#tab-frames">Frames</button>
+      <button type="button" class="tab-item" role="tab"
+              aria-selected="false" data-tab-target="#tab-renders">Renders</button>
+      <button type="button" class="tab-item" role="tab"
+              aria-selected="false" data-tab-target="#tab-milestones">Milestones</button>
+    </div>
+
+    <div id="tab-status" class="tab-panel" role="tabpanel">
+
+    {# Capture-health banner: a hard error (with its last message) takes priority;
+       otherwise a silent-stall "overdue" warning. Both link out to the events. #}
+    {% if project.operational_status == 'error' %}
+    <div class="alert error mb-6" role="status"
+         style="display:flex;align-items:center;gap:var(--sp-3);">
+      <span class="alert-icon" aria-hidden="true">&#9888;</span>
+      <div class="alert-body" style="flex:1;">
+        <div class="alert-title">Capture error</div>
+        <div class="alert-desc">
+          {% if project.last_error_message %}{{ project.last_error_message }}{% else %}The most recent capture attempt failed.{% endif %}
+          {% if project.last_error_at_raw %}<span style="color:var(--color-text-dim);"> &middot; {{ project.last_error_at_raw | reltime }}</span>{% endif %}
+        </div>
+      </div>
+      <a href="/events?level=error" class="btn btn-sm btn-secondary">View events &rarr;</a>
+    </div>
+    {% elif project.is_overdue %}
+    <div class="alert info mb-6" role="status"
+         style="display:flex;align-items:center;gap:var(--sp-3);border-color:var(--color-lowdisk);">
+      <span class="alert-icon" aria-hidden="true">&#9888;</span>
+      <div class="alert-body" style="flex:1;">
+        <div class="alert-title">Capture overdue</div>
+        <div class="alert-desc">
+          No frame has been captured within about twice the configured interval.
+          {% if project.last_capture_at_raw %}Last capture {{ project.last_capture_at_raw | reltime }}.{% endif %}
+        </div>
+      </div>
+      <a href="/events" class="btn btn-sm btn-secondary">View events &rarr;</a>
+    </div>
+    {% endif %}
+
+    <!-- Latest frame — polled every 60s while running -->
+    <div class="card mb-6">
+      <div class="card-header">
+        <div class="card-title">Latest Frame</div>
+        {% if project.operational_status == 'running' %}
+          <span style="font-size:0.75rem;color:var(--color-running);">
+            <span class="status-dot running" aria-hidden="true"></span>&nbsp;Live
+          </span>
+        {% endif %}
+      </div>
+      {#
+        Latest frame: polled every 60s when running.
+        The status-card partial (GET /partials/projects/{id}/status) returns the
+        full project card fragment, not a standalone frame element. We therefore
+        poll that endpoint, swap the entire card in #project-status-widget, and
+        pull the thumbnail from it — keeping one polling source of truth.
+        Engineer B: if you add a dedicated frame-only endpoint later, wire
+        hx-get to it here and set hx-swap="innerHTML" without hx-select.
+      #}
+      <div id="latest-frame-container">
+        {% include '_partials/latest_frame.html' %}
+      </div>
+    </div>
+
+    {# Recent activity — the latest operational events for this project. #}
+    <div class="card mb-6">
+      <div class="card-header"><div class="card-title">Recent Activity</div></div>
+      <div class="card-body" style="padding:var(--sp-4);">
+        {% if recent_events %}
+        <ul style="list-style:none;margin:0;padding:0;">
+          {% for ev in recent_events %}
+          <li style="display:flex;gap:var(--sp-3);align-items:baseline;padding:var(--sp-2) 0;border-bottom:1px solid var(--color-border);">
+            <span style="font-size:0.7rem;text-transform:uppercase;min-width:4.5rem;color:var(--color-text-muted);">{{ ev.level }}</span>
+            <span style="flex:1;">{{ ev.message }}</span>
+            <span style="color:var(--color-text-dim);font-size:0.75rem;white-space:nowrap;">{{ ev.timestamp | reltime }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+        <div style="margin-top:var(--sp-3);">
+          <a href="/events" class="btn btn-ghost btn-sm">View all events &rarr;</a>
+        </div>
+        {% else %}
+        <p class="form-hint" style="margin:0;">No activity recorded yet.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    </div>{# /tab-status #}
+    <div id="tab-renders" class="tab-panel" role="tabpanel" hidden>
+
+    <!-- Recent renders -->
+    <div class="card mb-6">
+      <div class="card-header">
+        <div class="card-title">Renders</div>
+      </div>
+      <div class="card-body" style="padding:var(--sp-4);">
+        {% if can_operate %}
+        <details class="render-trigger-details" style="margin-bottom:var(--sp-4);">
+          <summary class="btn btn-primary btn-sm"
+                   style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+            <svg class="icon" aria-hidden="true"><use href="#icon-render"></use></svg>
+            Render now
+          </summary>
+          <form method="post" action="/projects/{{ project.id }}/renders"
+                class="render-trigger-panel" style="margin-top:var(--sp-3);">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field-row">
+              <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Encoder
+                <select name="render_encoder" id="render_encoder" class="form-control"
+                        hx-get="/renders/combo-check" hx-trigger="change"
+                        hx-target="#render-combo-warning"
+                        hx-include="#render_encoder,#render_container">
+                  {% for value, label in render_encoder_options %}
+                  <option value="{{ value }}" {{ 'selected' if value == render_view.encoder else '' }}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Container
+                <select name="render_container" id="render_container" class="form-control"
+                        hx-get="/renders/combo-check" hx-trigger="change"
+                        hx-target="#render-combo-warning"
+                        hx-include="#render_encoder,#render_container">
+                  {% for value, label in render_container_options %}
+                  <option value="{{ value }}" {{ 'selected' if value == render_view.container else '' }}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Resolution
+                <select name="render_resolution" id="render_resolution" class="form-control">
+                  {% for value, label in render_resolution_options %}
+                  <option value="{{ value }}" {{ 'selected' if value == render_view.resolution else '' }}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">FPS
+                <input type="number" name="render_fps" id="render_fps" class="form-control"
+                       min="1" max="240" value="{{ render_view.fps }}" style="width:6rem;">
+              </label>
+            </div>
+            <div class="chip-group" data-chip-target="#render_fps" style="margin-top:var(--sp-2);">
+              {% for f in render_fps_suggestions %}
+              <button type="button" class="chip" data-value="{{ f }}">{{ f }} fps</button>
+              {% endfor %}
+            </div>
+            {% if fps_hint %}
+            <p class="form-hint" style="margin-top:var(--sp-2);">{{ fps_hint }}</p>
+            {% endif %}
+            <div id="render-combo-warning"></div>
+            <div style="margin-top:var(--sp-3);">
+              <button type="submit" class="btn btn-primary btn-sm">Start render</button>
+            </div>
+          </form>
+        </details>
+        {% endif %}
+        {% if renders %}
+          <div class="job-list" role="list">
+            {% for render in renders %}
+              {% include '_partials/render_row.html' %}
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state" style="padding:var(--sp-8) 0;">
+            <div class="empty-state-icon" aria-hidden="true">&#9881;</div>
+            <div class="empty-state-title">No renders yet</div>
+            <div class="empty-state-desc">
+              {% if can_operate %}
+                Trigger a render to generate a timelapse video from the captured frames.
+              {% else %}
+                No renders have been created for this project.
+              {% endif %}
+            </div>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    </div>{# /tab-renders #}
+
+    {% if can_operate %}
+    <div id="tab-settings" class="tab-panel" role="tabpanel" hidden>
+      {# Settings form is lazy-loaded so its camera/stream/PTZ lookups only run
+         when the tab is opened; the standalone /projects/{id}/settings page
+         shares the same form partial. #}
+      <div hx-get="/projects/{{ project.id }}/settings/form"
+           hx-trigger="load" hx-swap="innerHTML">
+        <p class="form-hint">Loading settings&hellip;</p>
+      </div>
+    </div>{# /tab-settings #}
+    {% endif %}
+
+    <div id="tab-frames" class="tab-panel" role="tabpanel" hidden>
+      {# Embedded project-scoped grid (first batch, lazy). The full browser —
+         with the time-ribbon, date-jump and filters — is one click away. #}
+      <div style="margin-bottom:var(--sp-3);">
+        <a href="/frames?project_id={{ project.id }}" class="btn btn-ghost btn-sm">
+          &#128196; Open full frame browser
+        </a>
+      </div>
+      <div class="frame-grid"
+           hx-get="/frames/batch?project_id={{ project.id }}"
+           hx-trigger="load" hx-swap="innerHTML">
+        <p class="form-hint">Loading frames&hellip;</p>
+      </div>
+    </div>{# /tab-frames #}
+
+    <div id="tab-milestones" class="tab-panel" role="tabpanel" hidden>
+      {# Milestone manager: named chapter-marker positions in the timeline.
+         Operator affordances (add / edit / delete) are gated inside the partial
+         by can_operate; the tab itself is visible to all roles. #}
+      {% include '_partials/milestone_table.html' %}
+    </div>{# /tab-milestones #}
+
+  </div>{# /detail-main #}
+
+  <!-- ===== RIGHT SIDEBAR ===== -->
+  <div class="detail-sidebar">
+
+    <!-- Project info card -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Project Info</div>
+      </div>
+      <div class="card-body">
+        <dl class="info-grid">
+          <div class="info-cell">
+            <dt class="info-label">Status</dt>
+            <dd class="info-value normal">{{ project.operational_status | capitalize }}</dd>
+          </div>
+          <div class="info-cell">
+            <dt class="info-label">Frames</dt>
+            <dd class="info-value">{{ project.frame_count | default(0) }}</dd>
+          </div>
+          <div class="info-cell">
+            <dt class="info-label">Last Capture</dt>
+            <dd class="info-value">
+              {% if project.last_capture_at_raw %}
+                {{ project.last_capture_at_raw | localdt }}
+              {% elif project.last_capture_at %}
+                {{ project.last_capture_at }}
+              {% else %}
+                &mdash;
+              {% endif %}
+            </dd>
+          </div>
+          <div class="info-cell">
+            <dt class="info-label">Next Capture</dt>
+            <dd class="info-value">
+              {% if project.next_capture_at_raw and project.operational_status == 'running' %}
+                {{ project.next_capture_at_raw | localdt }}
+              {% elif project.next_capture_at and project.operational_status == 'running' %}
+                {{ project.next_capture_at }}
+              {% else %}
+                &mdash;
+              {% endif %}
+            </dd>
+          </div>
+        </dl>
+      </div>
+    </div>
+
+    <!-- Storage card -->
+    <div class="card" data-testid="projected-storage">
+      <div class="card-header">
+        <div class="card-title">Storage</div>
+      </div>
+      <div class="card-body">
+        <dl class="info-grid" style="grid-template-columns:1fr;">
+
+          {# Row 1: currently used — always shown #}
+          <div class="info-cell">
+            <dt class="info-label">Currently Used</dt>
+            <dd class="info-value">{{ project.disk_used_display | default('0 B', true) }}</dd>
+          </div>
+
+          {# Row 2: growth rate — always shown #}
+          <div class="info-cell">
+            <dt class="info-label">Growth Rate</dt>
+            {% if project.growth_rate_display %}
+              <dd class="info-value">&approx; {{ project.growth_rate_display }}</dd>
+              <div style="font-size:0.7rem;color:var(--color-text-dim);margin-top:2px;">based on average frame size</div>
+            {% else %}
+              <dd class="info-value normal" style="color:var(--color-text-dim);">Not enough data yet</dd>
+            {% endif %}
+          </div>
+
+          {# Row 3: projected at completion — only when NOT open-ended #}
+          {% if not project.projected_open_ended %}
+            <div class="info-cell">
+              <dt class="info-label">Projected at Completion</dt>
+              <dd class="info-value">&approx; {{ project.projected_total_display }}</dd>
+              {% if project.projected_span_days is not none %}
+                <div style="font-size:0.7rem;color:var(--color-text-dim);margin-top:2px;">over {{ project.projected_span_days }} day{{ '' if project.projected_span_days == 1 else 's' }}</div>
+              {% endif %}
+            </div>
+          {% else %}
+            <div style="font-size:0.75rem;color:var(--color-text-dim);margin-top:var(--sp-2);">
+              Set an end date to see a projected total.
+            </div>
+          {% endif %}
+
+        </dl>
+      </div>
+    </div>
+
+    {# Operational: edit / clone / delete / archive / reactivate actions #}
+    {% if can_operate %}
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Project Actions</div>
+      </div>
+      <div class="card-body" style="display:flex;flex-direction:column;gap:var(--sp-3);">
+        <a href="/projects/{{ project.id }}/settings" class="btn btn-ghost w-full" style="justify-content:flex-start;">
+          &#9998; Edit Settings
+        </a>
+        <a href="/projects/{{ project.id }}/clone" class="btn btn-ghost w-full" style="justify-content:flex-start;">
+          &#10064; Clone Project
+        </a>
+        <button type="button"
+                class="btn btn-danger w-full"
+                style="justify-content:flex-start;"
+                hx-get="/projects/{{ project.id }}/delete-confirm"
+                hx-target="#confirm-slot" hx-swap="innerHTML">
+          &#128465; Delete Project
+        </button>
+        {% if project.lifecycle_state == 'active' %}
+          <button type="button"
+                  class="btn btn-ghost w-full"
+                  style="justify-content:flex-start;color:var(--color-text-dim);"
+                  hx-get="/projects/{{ project.id }}/archive-confirm"
+                  hx-target="#confirm-slot" hx-swap="innerHTML">
+            &#128190; Archive Project
+          </button>
+        {% else %}
+          <form method="post" action="/projects/{{ project.id }}/reactivate" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-ghost w-full" style="justify-content:flex-start;">
+              &#9654; Reactivate Project
+            </button>
+          </form>
+        {% endif %}
+        {# Inline-confirm target for the destructive actions above. #}
+        <div id="confirm-slot"></div>
+      </div>
+    </div>
+    {% endif %}
+
+  </div>{# /detail-sidebar #}
+
+</div>{# /detail-layout #}
+
+{% endblock %}

@@ -1,0 +1,76 @@
+{#
+  Partial: active_alerts.html
+  Context: alert_count   — int   total active alerts (the full count, not the page)
+           alerts        — list[_AlertView {id, level, level_class, message,
+                            scope, scope_id, timestamp, timestamp_raw}]
+           can_operate   — bool  whether the viewer may dismiss / clear-all
+
+  Inner content of the persistent #alerts-area container in base.html. The
+  container owns the polling trigger and swaps THIS fragment's markup into its
+  innerHTML, so the fragment must NOT re-declare a polling trigger of its own.
+
+  The clear controls (per-alert Dismiss, Clear all) render only when
+  can_operate is true; a viewer sees the same list with no clear affordances,
+  matching the operator/admin-only clear routes.
+#}
+<button type="button"
+        class="alerts-toggle"
+        aria-haspopup="true"
+        aria-expanded="false"
+        aria-controls="alerts-panel"
+        aria-label="Active alerts: {{ alert_count }}">
+  <span class="alerts-icon" aria-hidden="true"><svg class="icon"><use href="#icon-alert"></use></svg></span>
+  {% if alert_count and alert_count > 0 %}
+  <span class="alerts-badge" aria-hidden="true">{{ alert_count }}</span>
+  {% endif %}
+</button>
+
+<div id="alerts-panel" class="alerts-panel" role="region" aria-label="Active alerts">
+  <div class="alerts-panel-head">
+    <span class="alerts-panel-title">
+      {{ alert_count }} active alert{% if alert_count != 1 %}s{% endif %}
+    </span>
+    {% if can_operate and alert_count and alert_count > 0 %}
+    <button type="button"
+            class="btn btn-ghost btn-xs"
+            hx-post="/alerts/clear-all"
+            hx-target="#alerts-area"
+            hx-swap="innerHTML">
+      Clear all
+    </button>
+    {% endif %}
+  </div>
+
+  {% if alerts %}
+  <ul class="alerts-list">
+    {% for alert in alerts %}
+    <li class="alert {{ alert.level_class }} alerts-item">
+      <span class="alert-icon" aria-hidden="true">&#9650;</span>
+      <div class="alert-body">
+        <div class="alert-title">
+          <span class="alerts-level">{{ alert.level | upper }}</span>
+          {{ alert.message }}
+        </div>
+        <div class="alert-desc">
+          {{ alert.scope }}{% if alert.scope_id is not none %} #{{ alert.scope_id }}{% endif %}
+          &middot;
+          <span class="mono">{{ alert.timestamp_raw | localdt if alert.timestamp_raw else (alert.timestamp or '—') }}</span>
+        </div>
+      </div>
+      {% if can_operate %}
+      <button type="button"
+              class="btn btn-ghost btn-xs alerts-dismiss"
+              hx-post="/alerts/{{ alert.id }}/clear"
+              hx-target="#alerts-area"
+              hx-swap="innerHTML"
+              aria-label="Dismiss alert: {{ alert.message }}">
+        Dismiss
+      </button>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="alerts-empty">No active alerts.</p>
+  {% endif %}
+</div>

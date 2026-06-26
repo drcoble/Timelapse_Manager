@@ -1,0 +1,149 @@
+# Scheduled FFmpeg pin refresh — runs on the 1st of each month at 06:00 UTC,
+# and can be triggered manually via workflow_dispatch.
+#
+# What it does:
+#   1. Run --check: query the BtbN GitHub release for the latest stable build.
+#      Exit 0 → up to date, stop.  Exit 10 → update available, continue.
+#      Any other exit code → fail visibly (resolver error).
+#   2. If an update is available, run --apply: download the new tarball,
+#      verify sha256, upload to the Gitea package registry, rewrite
+#      ffmpeg-pin.json.
+#   3. Open a pull request against the default branch so the owner reviews
+#      and merges the pin update.
+#
+# Owner to-do before this workflow can run successfully:
+#   • Create a Gitea Actions secret named FFMPEG_MIRROR_TOKEN containing a
+#     personal access token for drew.coble with scopes:
+#       - package:write   (to upload to the generic package registry)
+#       - repo:read/write (to push the update branch and open the PR)
+#     The auto-generated job token (GITEA_TOKEN) may not have package:write
+#     in all Gitea configurations, so a dedicated PAT is safer.
+#   • The secret can be scoped to this repository in:
+#       Settings → Secrets → Actions → New Secret
+#
+# Runner note:
+#   This workflow runs on the existing act_runner (maxParallel=1).  The
+#   --check path is fast (one GitHub API call, no download).  --apply
+#   downloads ~120 MB once and uploads it; this is bounded and rare (monthly).
+#   A timeout-minutes cap is set on each step to prevent the runner from
+#   wedging.
+
+name: FFmpeg pin refresh
+
+on:
+  schedule:
+    # 1st of each month at 06:00 UTC
+    - cron: "0 6 1 * *"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Fetch the full history so we can push a branch and open a PR.
+          fetch-depth: 0
+
+      - name: Check for FFmpeg update
+        id: check
+        timeout-minutes: 5
+        # No GITHUB_TOKEN: in Gitea Actions secrets.GITHUB_TOKEN is a *Gitea*
+        # token, which api.github.com rejects with 401. The resolver only uses
+        # GITHUB_TOKEN to raise the GitHub rate limit; anonymous is fine for one
+        # call a month. To use an authenticated GitHub call, add a real github.com
+        # PAT as a separate secret and map it to GITHUB_TOKEN here.
+        run: |
+          set +e
+          python3 packaging/refresh-ffmpeg-pin.py --check
+          exit_code=$?
+          set -e
+          if [ "$exit_code" -eq 0 ]; then
+            echo "status=up-to-date" >> "$GITEA_OUTPUT"
+            echo "FFmpeg pin is up to date."
+          elif [ "$exit_code" -eq 10 ]; then
+            echo "status=update-available" >> "$GITEA_OUTPUT"
+            echo "FFmpeg update available."
+          else
+            echo "ERROR: --check exited with unexpected code $exit_code" >&2
+            exit "$exit_code"
+          fi
+
+      - name: Apply FFmpeg update
+        if: steps.check.outputs.status == 'update-available'
+        timeout-minutes: 20
+        env:
+          GITEA_BASE_URL: https://git.2cbn.com
+          GITEA_OWNER: drew.coble
+          GITEA_TOKEN: ${{ secrets.FFMPEG_MIRROR_TOKEN }}
+        run: |
+          python3 packaging/refresh-ffmpeg-pin.py --apply
+
+      - name: Open pull request with updated pin
+        if: steps.check.outputs.status == 'update-available'
+        timeout-minutes: 5
+        env:
+          GITEA_BASE_URL: https://git.2cbn.com
+          GITEA_OWNER: drew.coble
+          GITEA_TOKEN: ${{ secrets.FFMPEG_MIRROR_TOKEN }}
+        run: |
+          # Read new pin values for the PR title/body.
+          NEW_VERSION=$(python3 -c "import json; p=json.load(open('ffmpeg-pin.json')); print(p['version'])")
+          NEW_SHA=$(python3 -c "import json; p=json.load(open('ffmpeg-pin.json')); print(p['sha256'][:16])")
+
+          # Create and push an update branch.
+          BRANCH="ffmpeg-pin-update/${NEW_VERSION}-$(date -u +%Y%m%d)"
+          git config user.email "ci@git.2cbn.com"
+          git config user.name "FFmpeg Refresh CI"
+          git checkout -b "$BRANCH"
+          git add ffmpeg-pin.json
+          git commit -m "build: update FFmpeg pin to ${NEW_VERSION}
+
+          Automated monthly refresh of the pinned static FFmpeg build.
+          Mirror uploaded to the Gitea generic package registry."
+
+          # Push via the token-authenticated remote.
+          git remote set-url origin "https://drew.coble:${GITEA_TOKEN}@git.2cbn.com/drew.coble/timelapse-manager.git"
+          git push origin "$BRANCH"
+
+          # Open a PR via the Gitea API.
+          PR_BODY="Automated FFmpeg pin update.
+
+          | Field  | Value |
+          |--------|-------|
+          | Version | \`${NEW_VERSION}\` |
+          | sha256 (first 16) | \`${NEW_SHA}...\` |
+          | Mirror | Gitea generic package registry |
+
+          Review \`ffmpeg-pin.json\` and merge if the sha256 looks correct."
+
+          curl -s -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$(NEW_VERSION="$NEW_VERSION" BRANCH="$BRANCH" PR_BODY="$PR_BODY" python3 -c "
+          import json, os
+          body = os.environ['PR_BODY']
+          branch = os.environ['BRANCH']
+          new_version = os.environ['NEW_VERSION']
+          print(json.dumps({
+            'title': f'build: update FFmpeg pin to {new_version}',
+            'body': body,
+            'head': branch,
+            'base': 'main',
+          }))
+          ")" \
+            "${GITEA_BASE_URL}/api/v1/repos/${GITEA_OWNER}/timelapse-manager/pulls" \
+          | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          if 'html_url' in d:
+              print('PR created:', d['html_url'])
+          elif 'number' in d:
+              print('PR created: #', d['number'])
+          else:
+              print('PR response:', json.dumps(d, indent=2))
+              sys.exit(1)
+          "

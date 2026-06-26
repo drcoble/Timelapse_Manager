@@ -1,0 +1,27 @@
+{#
+  Partial: events_tabs.html — the shared Operations / Audit tab bar shown at the
+  top of both the operational events page and the audit page. These are real
+  route links (full-page navigation), not client-side panels.
+
+  The Audit tab is rendered only for admins (absent from the DOM for everyone
+  else, not merely hidden); the audit data route stays server-authorized
+  regardless. Active state: Operations is active on an exact ``/events`` match
+  (``/events/audit`` also starts with ``/events``, so a startswith check would
+  light both); Audit is active on any ``/events/audit`` path.
+#}
+{% set on_audit = request.url.path.startswith('/events/audit') %}
+{% set on_operations = (request.url.path == '/events') %}
+<nav class="tabs" role="tablist" aria-label="Event log sections">
+  <a href="/events"
+     class="tab-item{% if on_operations %} active{% endif %}"
+     role="tab"
+     aria-selected="{{ 'true' if on_operations else 'false' }}"
+     {% if on_operations %}aria-current="page"{% endif %}>Operations</a>
+  {% if current_user.role == 'admin' %}
+  <a href="/events/audit"
+     class="tab-item{% if on_audit %} active{% endif %}"
+     role="tab"
+     aria-selected="{{ 'true' if on_audit else 'false' }}"
+     {% if on_audit %}aria-current="page"{% endif %}>Audit</a>
+  {% endif %}
+</nav>

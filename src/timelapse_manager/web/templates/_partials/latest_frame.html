@@ -1,0 +1,17 @@
+{#
+  Partial: latest_frame.html
+  Context: project — {id, name, latest_frame_url}
+  Returned standalone by HTMX polling on project detail page.
+#}
+<div class="frame-thumb thumb-preview" id="latest-frame-{{ project.id }}">
+  {% if project.latest_frame_url %}
+    <img src="{{ project.latest_frame_url }}"
+         alt="Latest captured frame for {{ project.name }}"
+         loading="lazy">
+  {% else %}
+    <div class="frame-thumb-label">
+      <span class="frame-thumb-icon" aria-hidden="true">&#127760;</span>
+      <span>No frames captured yet</span>
+    </div>
+  {% endif %}
+</div>

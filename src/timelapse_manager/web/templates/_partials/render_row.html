@@ -1,0 +1,61 @@
+{#
+  Partial: render_row.html
+  Context: render — {id, kind, status, created_at, browser_streamable,
+                     download_url, stream_url}
+           current_user — {username, role}
+           csrf_token — str
+
+  Returned standalone by the render queue partial endpoint.
+  kind values: manual | scheduled | archive
+  status values: queued | running | complete | error | cancelled
+#}
+<div class="job-item" id="render-row-{{ render.id }}" role="row">
+  <div class="job-meta">
+    <div class="job-name">
+      <span class="kind-badge {{ render.kind }}">{{ render.kind | capitalize }}</span>
+      &nbsp;
+      Render #{{ render.id }}
+    </div>
+    <div class="job-detail">
+      {{ render.created_at_raw | localdt if render.created_at_raw else render.created_at }}
+      &nbsp;&middot;&nbsp;
+      {% if render.status == 'queued' %}
+        <span style="color:var(--color-text-dim);">Queued</span>
+      {% elif render.status == 'running' %}
+        <span style="color:var(--color-accent-hover);">
+          <span class="spinner htmx-indicator" aria-hidden="true"></span>
+          Rendering&hellip;
+        </span>
+        <div class="progress-bar" role="progressbar" aria-label="Render progress">
+          <div class="progress-fill" style="width:50%;"></div>
+        </div>
+      {% elif render.status == 'complete' %}
+        <span style="color:var(--color-running);">Complete</span>
+      {% elif render.status == 'error' %}
+        <span style="color:var(--color-error);">Error</span>
+      {% elif render.status == 'cancelled' %}
+        <span style="color:var(--color-stopped);">Cancelled</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="job-actions">
+    {% if render.status == 'complete' %}
+      {% if render.browser_streamable and render.stream_url %}
+        <a href="{{ render.stream_url }}"
+           class="btn btn-ghost btn-sm"
+           target="_blank"
+           rel="noopener">
+          &#9654; Play
+        </a>
+      {% endif %}
+      {% if render.download_url %}
+        <a href="{{ render.download_url }}"
+           class="btn btn-secondary btn-sm"
+           download>
+          &#8659; Download
+        </a>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>

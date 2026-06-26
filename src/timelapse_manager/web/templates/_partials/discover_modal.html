@@ -1,0 +1,63 @@
+{#
+  Partial: discover_modal.html — centered "Discover cameras" modal.
+
+  A self-contained dialog (distinct from the right-side drawer) holding the
+  network-scan form. The scan posts to POST /cameras/discover and swaps the
+  result list into #scan-results inside the modal.
+
+  Context:
+    csrf_token — str, required on the mutating scan form.
+
+  The opener that toggles this lives on the Cameras page
+  (`<button data-modal-open="#discover-modal">`). modal.js opens/closes it,
+  traps focus, and flips aria-hidden. The scan form keeps a native
+  method/action so it still submits without JavaScript.
+#}
+<div class="modal-backdrop" data-modal-for="discover-modal">
+  <div id="discover-modal" class="discover-modal" role="dialog"
+       aria-modal="true" aria-hidden="true"
+       aria-labelledby="discover-modal-title">
+    <header class="discover-modal-header">
+      <h2 class="card-title" id="discover-modal-title">Discover cameras</h2>
+      <button type="button" class="drawer-close" data-modal-close
+              aria-label="Close">&times;</button>
+    </header>
+    <div class="discover-modal-body">
+      <form method="post"
+            action="/cameras/discover"
+            style="display:flex;gap:var(--sp-2);align-items:flex-end;
+                   flex-wrap:wrap;"
+            hx-post="/cameras/discover"
+            hx-target="#scan-results"
+            hx-swap="innerHTML"
+            hx-indicator="#scan-spinner">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-group" style="flex:1 1 14rem;margin:0;">
+          <label for="scan-range" class="form-label">
+            IP range or CIDR
+          </label>
+          <input type="text"
+                 id="scan-range"
+                 name="scan_range"
+                 class="form-control mono"
+                 placeholder="192.168.1.0/24"
+                 autocomplete="off"
+                 spellcheck="false">
+          <span class="form-hint">
+            Leave blank to scan the local network.
+          </span>
+        </div>
+        <button type="submit" class="btn btn-primary">
+          <span id="scan-spinner" class="spinner htmx-indicator"
+                aria-hidden="true"></span>
+          <svg class="icon" aria-hidden="true"><use href="#icon-query"></use></svg>
+          Scan Network
+        </button>
+      </form>
+
+      {# Discovery results — populated by POST /cameras/discover via HTMX. #}
+      <div id="scan-results" aria-live="polite" style="margin-top:var(--sp-4);">
+      </div>
+    </div>
+  </div>
+</div>

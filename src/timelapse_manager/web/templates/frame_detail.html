@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{#
+  Full-page scene-metadata view for a single frame — the no-JS fallback the
+  frame tile's Info link points at. With JavaScript the link is HTMX-enhanced to
+  swap the metadata into the frame browser's panel instead; this page is what a
+  plain navigation lands on. It reuses the same metadata partial and context the
+  HTMX endpoint serves.
+
+  Context:
+    project_id     — int, the owning project (for the back link)
+    frame          — {id, sequence_index, capture_timestamp_raw}
+    scene_groups   — list of {title, rows: [{label, value}]}
+    schema_version — int | None
+#}
+
+{% block title %}Frame #{{ frame.sequence_index }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}Frame #{{ frame.sequence_index }}{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <a href="/projects/{{ project_id }}" style="color:var(--color-text-muted);text-decoration:none;">
+    Project
+  </a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <a href="/frames?project_id={{ project_id }}" style="color:var(--color-text-muted);text-decoration:none;">
+    Frames
+  </a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">Frame #{{ frame.sequence_index }}</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Frame #{{ frame.sequence_index }}</h1>
+  </div>
+  <div class="page-actions">
+    <a href="/frames?project_id={{ project_id }}" class="btn btn-ghost btn-sm">
+      &larr; Back to frames
+    </a>
+  </div>
+</div>
+
+{% with in_panel = false %}
+  {% include "_partials/frame_metadata.html" %}
+{% endwith %}
+
+{% endblock %}

@@ -1,0 +1,46 @@
+
+/* --------------------------------------------------------------------------
+   Reset & Base
+   -------------------------------------------------------------------------- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Honour the HTML `hidden` attribute even on elements whose layout class sets a
+   `display` value (e.g. `.form-row { display: grid }`). Without this, toggling
+   `element.hidden` leaves such elements visible because the class wins on
+   specificity over the UA `[hidden] { display: none }` rule. */
+[hidden] {
+  display: none !important;
+}
+
+html {
+  font-size: 14px;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--color-accent-hover);
+  text-decoration: underline;
+}
+
+code, .mono {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+
+img { display: block; max-width: 100%; }

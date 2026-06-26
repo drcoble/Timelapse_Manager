@@ -1,0 +1,100 @@
+{#
+  Partial: camera_detect_results.html — protocol-detection results fragment.
+
+  Swapped into the camera form's #camera-detect-results container by the Detect
+  button (hx-post="/cameras/detect-protocol"). Lists every protocol that was
+  probed; responders are selectable radios that fill the form's protocol /
+  snapshot_uri / stream_uri inputs for review before saving.
+
+  Context:
+    candidates — list of ProtocolCandidate {protocol, ok, snapshot_uri,
+                 stream_uri, confidence, detail}; empty when error is set.
+    recommended_primary — protocol str to pre-select, or None.
+    ok_count — number of responders (candidates with ok == true).
+    error — an error string to show instead of results, or None.
+
+  No credentials are ever rendered here.
+#}
+{% if error %}
+  <div class="alert error" role="alert" style="margin-top:var(--sp-3);">
+    {{ error }}
+  </div>
+{% elif ok_count == 0 %}
+  <div class="alert" role="status" style="margin-top:var(--sp-3);">
+    No protocols responded at this address. Check the address and credentials.
+  </div>
+{% else %}
+  <div style="margin-top:var(--sp-3);">
+    {% if ok_count > 1 %}
+      <div class="alert" role="status" style="margin-bottom:var(--sp-2);">
+        <strong>{{ ok_count }} protocols detected.</strong>
+        Pick one to fill the form, then review before saving.
+      </div>
+    {% else %}
+      <div class="alert" role="status" style="margin-bottom:var(--sp-2);">
+        <strong>1 protocol detected.</strong> Selected below to fill the form.
+      </div>
+    {% endif %}
+    <div class="form-stack" role="radiogroup" aria-label="Detected protocols">
+      {% for c in candidates if c.ok %}
+        {% set checked = (c.protocol == recommended_primary) %}
+        <label class="form-check"
+               style="display:flex;gap:var(--sp-2);align-items:flex-start;
+                      padding:var(--sp-2);border:1px solid var(--color-border);
+                      border-radius:var(--radius-sm);">
+          <input type="radio" name="detected_protocol"
+                 value="{{ c.protocol }}"
+                 {{ 'checked' if checked else '' }}
+                 data-snapshot-uri="{{ c.snapshot_uri or '' }}"
+                 data-stream-uri="{{ c.stream_uri or '' }}"
+                 onchange="tlmApplyDetected(this);">
+          <span>
+            <strong>{{ c.protocol | upper }}</strong>
+            <span class="status-badge"
+                  style="font-size:0.7rem;margin-left:var(--sp-2);
+                         background:var(--color-surface-2);
+                         color:var(--color-text-muted);
+                         border-color:var(--color-border);">
+              {{ c.confidence | upper }} confidence
+            </span>
+            {% if checked %}
+              <span class="status-badge"
+                    style="font-size:0.7rem;margin-left:var(--sp-1);">
+                recommended
+              </span>
+            {% endif %}
+            <br>
+            <span class="form-hint">{{ c.detail }}</span>
+            {% if c.snapshot_uri %}
+              <br><span class="form-hint">snapshot:
+                <span class="mono">{{ c.snapshot_uri }}</span></span>
+            {% endif %}
+            {% if c.stream_uri %}
+              <br><span class="form-hint">stream:
+                <span class="mono">{{ c.stream_uri }}</span></span>
+            {% endif %}
+          </span>
+        </label>
+      {% endfor %}
+    </div>
+  </div>
+  {# Fill the surrounding form's protocol / snapshot_uri / stream_uri inputs
+     from the chosen radio's data attributes; apply the recommended one now. #}
+  <script>
+    function tlmApplyDetected(radio) {
+      var form = radio.closest('form');
+      if (!form) { return; }
+      var proto = form.querySelector('[name="protocol"]');
+      if (proto) { proto.value = radio.value; }
+      var snap = form.querySelector('[name="snapshot_uri"]');
+      if (snap) { snap.value = radio.getAttribute('data-snapshot-uri') || ''; }
+      var stream = form.querySelector('[name="stream_uri"]');
+      if (stream) { stream.value = radio.getAttribute('data-stream-uri') || ''; }
+    }
+    (function () {
+      var checked = document.querySelector(
+        '#camera-detect-results input[name="detected_protocol"]:checked');
+      if (checked) { tlmApplyDetected(checked); }
+    })();
+  </script>
+{% endif %}

@@ -1,0 +1,15 @@
+{#
+  Partial: ldap_test_result.html
+  Inline result banner for the LDAP test-connection action.
+
+  Context:
+    ldap_test_message     — str: human-readable outcome description
+    ldap_test_ok          — bool: True when connection succeeded
+    ldap_test_status_class — "success" | "error"
+#}
+
+<div class="alert {{ ldap_test_status_class }}"
+     role="status"
+     aria-live="polite">
+  {{ ldap_test_message }}
+</div>

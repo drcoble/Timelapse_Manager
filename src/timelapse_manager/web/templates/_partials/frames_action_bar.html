@@ -1,0 +1,84 @@
+{#
+  Selection / bulk-action bar for the frame grid. A single element swapped
+  between states (idle → selection → result/progress) by later phases. It is
+  hidden until a selection exists, so it is render-neutral on first paint:
+  selection.js sets/clears the [hidden] attribute on the 0↔N transition and
+  fills the count.
+
+  The count text is client-rendered ("N frames selected", or
+  "N selected (M visible)" when some selected tiles have scrolled out). The
+  action buttons drive selection.js: a click serialises the current selection
+  into one bulk request. Delete is destructive, so it uses an in-bar two-step
+  confirm (handled by selection.js) rather than firing immediately.
+
+  Context: can_operate.
+#}
+<div id="frames-action-bar" class="frames-action-bar" role="status"
+     aria-live="polite" aria-label="Frame selection actions" hidden>
+  <span class="selection-bar-count" aria-hidden="true"></span>
+  {% if can_operate %}
+  <span class="frames-action-bar-actions">
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-bulk-action="exclude">Exclude</button>
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-bulk-action="include">Include</button>
+    <button type="button" class="btn btn-sm btn-danger"
+            data-bulk-action="delete">Delete</button>
+    {# Placeholders for later phases — intentionally not wired yet. #}
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-offset-toggle aria-expanded="false"
+            aria-controls="frames-offset-panel">Offset&hellip;</button>
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-export-action>Export</button>
+  </span>
+  {% else %}
+  <span class="frames-action-bar-actions"></span>
+  {% endif %}
+  <button type="button" class="btn btn-sm btn-ghost"
+          data-selection-clear>Clear</button>
+</div>
+
+{% if can_operate %}
+{# Bulk timestamp-offset panel — a sibling of the action bar (so the bar's
+   own outerHTML swaps on other bulk ops leave it intact), revealed by the
+   Offset button. Not a modal: it expands below the bar. selection.js computes
+   the signed seconds from the direction + h/m/s inputs, shows a live preview,
+   and on Apply shifts every selected frame (materialising a range selection to
+   ids first), then reloads the window. #}
+<div id="frames-offset-panel" class="offset-panel" hidden
+     aria-label="Shift selected timestamps">
+  <div class="offset-panel-row">
+    <span class="offset-panel-title">Shift timestamps</span>
+    <div class="segmented offset-direction" role="radiogroup"
+         aria-label="Shift direction">
+      <label class="segmented-option">
+        <input type="radio" name="offset-dir" value="+" checked>
+        <span>+ Forward</span>
+      </label>
+      <label class="segmented-option">
+        <input type="radio" name="offset-dir" value="-">
+        <span>&minus; Back</span>
+      </label>
+    </div>
+    <label class="offset-field">
+      <input type="number" min="0" value="0" data-offset-h
+             aria-label="Hours"> h
+    </label>
+    <label class="offset-field">
+      <input type="number" min="0" max="59" value="0" data-offset-m
+             aria-label="Minutes"> m
+    </label>
+    <label class="offset-field">
+      <input type="number" min="0" max="59" value="0" data-offset-s
+             aria-label="Seconds"> s
+    </label>
+  </div>
+  <div class="offset-panel-preview" data-offset-preview aria-live="polite"></div>
+  <div class="offset-panel-row">
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-offset-apply>Apply offset</button>
+    <button type="button" class="btn btn-sm btn-ghost"
+            data-offset-cancel>Cancel</button>
+  </div>
+</div>
+{% endif %}

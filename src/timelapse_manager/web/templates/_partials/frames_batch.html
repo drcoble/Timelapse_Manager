@@ -1,0 +1,61 @@
+{#
+  Partial: frames_batch.html — one continuous-scroll batch of frame tiles plus a
+  fresh sentinel (or the end-cap). Returned by GET /frames/batch and also
+  included for the initial grid in frames.html.
+
+  Context: project — {id}; frames — list[_FrameView]; next_before — int | None
+           (the sequence_index cursor for the next/older batch, or None at the
+           start of the series); show_deleted — bool.
+
+  The sentinel is a real <a> (its href is the no-JS pagination fallback) carrying
+  hx-trigger="revealed" + hx-swap="outerHTML": as it scrolls into view it
+  fetches the next batch and replaces itself with [older tiles + a new sentinel].
+
+  The sentinel/end-cap also carries a small data-* contract describing this batch
+  for assistive-tech announcements (and future consumers): the oldest/newest item
+  timestamps, the newest item id, and the row count. Frames are listed
+  newest-first, so the oldest item is ``frames[-1]`` and the newest ``frames[0]``.
+#}
+{# Jump context (present only on a jump/at render, never on a scroll append):
+   a note when ?at= landed on the nearest frame, and a band marking the gap a
+   gap-jump landed at. Both sit above the tiles. #}
+{% if nearest_frame_note is defined and nearest_frame_note %}
+<div class="frames-nearest-note" role="note">
+  Nearest frame: {{ nearest_frame_note | localdt }}
+</div>
+{% endif %}
+{% if preceding_gap is defined and preceding_gap %}
+  {% with gap = preceding_gap %}{% include '_partials/frames_gap_band.html' %}{% endwith %}
+{% endif %}
+{% for frame in frames %}{% include '_partials/frame_tile.html' %}{% endfor %}
+{# Cursor differs by mode: a per-project batch pages on sequence_index and keeps
+   project_id in the URL; the "All Projects" batch pages on the frame id with no
+   project_id (its presence is the sole mode discriminator on the server). #}
+{% if next_before is not none %}
+{% set scope_qs = '' if all_projects else 'project_id=' ~ project.id ~ '&' %}
+<a class="frame-sentinel"
+   {% if frames %}
+   data-batch-count="{{ frames | length }}"
+   data-newest-id="{{ frames[0].id }}"
+   data-newest-timestamp="{{ frames[0].capture_timestamp_raw | localdt if frames[0].capture_timestamp_raw else (frames[0].capture_timestamp or '') }}"
+   data-oldest-timestamp="{{ frames[-1].capture_timestamp_raw | localdt if frames[-1].capture_timestamp_raw else (frames[-1].capture_timestamp or '') }}"
+   {% else %}
+   data-batch-count="0"
+   {% endif %}
+   href="/frames?{{ scope_qs }}before={{ next_before }}{% if show_deleted %}&show_deleted=1{% endif %}"
+   hx-get="/frames/batch?{{ scope_qs }}before={{ next_before }}{% if show_deleted %}&show_deleted=1{% endif %}"
+   hx-trigger="revealed"
+   hx-swap="outerHTML">Load older frames</a>
+{% else %}
+<div class="frame-end-cap"
+     {% if frames %}
+     data-batch-count="{{ frames | length }}"
+     data-newest-id="{{ frames[0].id }}"
+     data-newest-timestamp="{{ frames[0].capture_timestamp_raw | localdt if frames[0].capture_timestamp_raw else (frames[0].capture_timestamp or '') }}"
+     data-oldest-timestamp="{{ frames[-1].capture_timestamp_raw | localdt if frames[-1].capture_timestamp_raw else (frames[-1].capture_timestamp or '') }}"
+     {% else %}
+     data-batch-count="0"
+     {% endif %}>
+  {% if all_projects %}Beginning — all projects{% else %}Beginning of this project{% endif %}
+</div>
+{% endif %}

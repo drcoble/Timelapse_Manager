@@ -1,0 +1,93 @@
+
+/* --------------------------------------------------------------------------
+   Login Page
+   -------------------------------------------------------------------------- */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg);
+  padding: var(--sp-6);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.login-header {
+  padding: var(--sp-8) var(--sp-8) var(--sp-6);
+  text-align: center;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.login-logo {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto var(--sp-4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Meridian mark is amber-gold on dark, warm-bronze on light — the SVG strokes
+     inherit currentColor. */
+  color: var(--color-accent);
+}
+.login-logo svg { width: 40px; height: 40px; }
+
+.login-header h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 4px; }
+.login-header p  { font-size: 0.875rem; color: var(--color-text-muted); }
+.login-header .login-version {
+  font-size: 0.75rem;
+  color: var(--color-text-dim);
+  margin-top: 2px;
+}
+
+.login-body   { padding: var(--sp-6); }
+.login-footer {
+  padding: var(--sp-4) var(--sp-6);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.login-theme-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.login-theme-btn:hover {
+  color: var(--color-text);
+  border-color: var(--color-border-2);
+}
+.login-theme-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.login-error {
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-md);
+  padding: var(--sp-3) var(--sp-4);
+  font-size: 0.875rem;
+  color: var(--color-error);
+  margin-bottom: var(--sp-4);
+}

@@ -1,0 +1,272 @@
+{% extends "base.html" %}
+
+{% block title %}Settings — Timelapse Manager{% endblock %}
+{% block page_title_short %}Settings{% endblock %}
+
+{% block content %}
+
+{#
+  Per-field environment-provenance chip. ``env_overrides`` is the set of flat
+  System-panel keys whose effective value came from an environment variable
+  (computed at startup). When a key is present, a small "env" badge is rendered
+  beside its label; when the set is absent or empty (no provenance recorded) no
+  chips appear and the panel falls back to its read-only banner. The macro never
+  errors on a missing ``env_overrides`` — an undefined value is treated as empty.
+#}
+{% macro env_chip(field) %}
+  {%- if env_overrides is defined and env_overrides and field in env_overrides -%}
+    <span class="badge badge-env" title="Controlled by an environment variable">env</span>
+  {%- endif -%}
+{% endmacro %}
+
+{#
+  Settings page is admin-only. The route enforces this server-side, redirecting
+  non-admin requests to the dashboard with an error flash.
+
+  The four areas are presented as a client-side tab-bar (tabs.js): all panels
+  are rendered and shown/hidden in place — no server round-trip on tab switch.
+  Each panel owns its complete form and posts to its own endpoint (System and
+  Notifications both to /settings; LDAP and Credentials to their own routes).
+#}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Settings</h1>
+    <div class="subtitle">Server configuration &middot; TLS &middot; Sessions &middot; Network access &middot; Notifications &middot; Directory &middot; Credentials</div>
+  </div>
+</div>
+
+<div class="tabs" role="tablist" aria-label="Settings sections">
+  <button type="button" class="tab-item active" role="tab"
+          aria-selected="true" data-tab-target="#tab-system">System</button>
+  <button type="button" class="tab-item" role="tab"
+          aria-selected="false" data-tab-target="#tab-network">Network</button>
+  <button type="button" class="tab-item" role="tab"
+          aria-selected="false" data-tab-target="#tab-ldap">LDAP</button>
+  <button type="button" class="tab-item" role="tab"
+          aria-selected="false" data-tab-target="#tab-notifications">Notifications</button>
+  <button type="button" class="tab-item" role="tab"
+          aria-selected="false" data-tab-target="#tab-credentials">Credentials</button>
+</div>
+
+<div class="settings-tab-panels">
+
+  <!-- ===================== SYSTEM ===================== -->
+  <div id="tab-system" class="tab-panel" role="tabpanel" aria-label="System">
+
+    {#
+      System values are resolved from config/env at startup and are not
+      hot-reloaded — saving records the intent (audited); applying changes that
+      require a restart is out of this layer's scope.
+    #}
+    <div class="alert info" role="note" style="margin-bottom:var(--sp-5);">
+      <div class="alert-body">
+        These values are resolved from configuration and environment at startup.
+        Saving records the change for audit; values that require a restart take
+        effect after the service restarts.
+      </div>
+    </div>
+
+    <form method="post" action="/settings" novalidate id="settings-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <!-- ===== NETWORK ===== -->
+      <section class="form-section">
+        <div class="form-section-title">Network</div>
+        <div class="form-stack">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="http_port">HTTP Port {{ env_chip("http_port") }}</label>
+              <input type="number" id="http_port" name="http_port"
+                     class="form-control mono"
+                     value="{{ settings.http_port | default(8080) }}"
+                     min="1" max="65535">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="https_port">HTTPS Port {{ env_chip("https_port") }}</label>
+              <input type="number" id="https_port" name="https_port"
+                     class="form-control mono"
+                     value="{{ settings.https_port | default(8443) }}"
+                     min="1" max="65535">
+            </div>
+          </div>
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-label">Redirect HTTP to HTTPS {{ env_chip("redirect_http") }}</div>
+              <div class="toggle-desc">Automatically redirect unencrypted requests to HTTPS.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="redirect_http"
+                     {% if settings.redirect_http %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== TLS ===== -->
+      <section class="form-section">
+        <div class="form-section-title">TLS Certificate</div>
+        <div class="form-stack">
+          <div class="form-group">
+            <label class="form-label" for="tls_cert_path">Certificate file path {{ env_chip("tls_cert_path") }}</label>
+            <input type="text" id="tls_cert_path" name="tls_cert_path"
+                   class="form-control mono"
+                   placeholder="/etc/ssl/certs/timelapse.crt"
+                   value="{{ settings.tls_cert_path | default('') }}">
+            <span class="form-hint">Absolute path to the PEM certificate file on the server.</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="tls_key_path">Private key file path {{ env_chip("tls_key_path") }}</label>
+            <input type="text" id="tls_key_path" name="tls_key_path"
+                   class="form-control mono"
+                   placeholder="/etc/ssl/private/timelapse.key"
+                   value="{{ settings.tls_key_path | default('') }}">
+            <span class="form-hint">
+              Absolute path to the private key. The key is never displayed; enter only to update.
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== SESSIONS ===== -->
+      <section class="form-section">
+        <div class="form-section-title">Session Management</div>
+        <div class="form-stack">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="session_idle_timeout_minutes">
+                Idle timeout (minutes) {{ env_chip("session_idle_timeout_minutes") }}
+              </label>
+              <input type="number" id="session_idle_timeout_minutes"
+                     name="session_idle_timeout_minutes"
+                     class="form-control"
+                     value="{{ settings.session_idle_timeout_minutes | default(60) }}"
+                     min="5" max="10080">
+              <span class="form-hint">Sessions expire after this many minutes of inactivity.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="session_max_age_days">
+                Maximum session age (days) {{ env_chip("session_max_age_days") }}
+              </label>
+              <input type="number" id="session_max_age_days"
+                     name="session_max_age_days"
+                     class="form-control"
+                     value="{{ settings.session_max_age_days | default(30) }}"
+                     min="1" max="365">
+              <span class="form-hint">
+                Absolute maximum for "remember me" sessions. After this the user must sign in again.
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Save button -->
+      <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);border-top:1px solid var(--color-border);">
+        <button type="submit" class="btn btn-primary">Save Settings</button>
+        <a href="/" class="btn btn-ghost">Cancel</a>
+      </div>
+    </form>
+  </div>{# /tab-system #}
+
+  <!-- ===================== NETWORK ===================== -->
+  <div id="tab-network" class="tab-panel" role="tabpanel" aria-label="Network" hidden>
+    {#
+      Network / SSRF allow-list — own form, own endpoint (/settings/ssrf), own
+      partial. Admin-only; the route enforces this. Unlike the System tab, saving
+      here takes effect immediately.
+    #}
+    {% include '_partials/ssrf_settings.html' %}
+  </div>{# /tab-network #}
+
+  <!-- ===================== LDAP / DIRECTORY ===================== -->
+  <div id="tab-ldap" class="tab-panel" role="tabpanel" aria-label="LDAP" hidden>
+    {#
+      LDAP / Directory settings — own form, own endpoint, own partial.
+      Admin-only; the route enforces this.
+    #}
+    {% include '_partials/ldap_settings.html' %}
+  </div>{# /tab-ldap #}
+
+  <!-- ===================== NOTIFICATIONS ===================== -->
+  <div id="tab-notifications" class="tab-panel" role="tabpanel"
+       aria-label="Notifications" hidden>
+    <form method="post" action="/settings" novalidate id="notifications-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <section class="form-section">
+        <div class="form-section-title">Notifications</div>
+        <div class="form-stack">
+
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-label">Capture error alerts</div>
+              <div class="toggle-desc">Notify when a project enters error state.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="notify_capture_error"
+                     {% if settings.notify_capture_error %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-label">Low disk alerts</div>
+              <div class="toggle-desc">Notify when a project is paused due to low disk space.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="notify_low_disk"
+                     {% if settings.notify_low_disk %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-label">Render complete alerts</div>
+              <div class="toggle-desc">Notify when a render job finishes.</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" name="notify_render_complete"
+                     {% if settings.notify_render_complete %}checked{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="form-group" style="margin-top:var(--sp-4);">
+            <label class="form-label" for="throttle_rate_per_minute">
+              Login throttle (attempts per minute)
+            </label>
+            <input type="number" id="throttle_rate_per_minute"
+                   name="throttle_rate_per_minute"
+                   class="form-control"
+                   value="{{ settings.throttle_rate_per_minute | default(10) }}"
+                   min="1" max="60"
+                   style="max-width:120px;">
+            <span class="form-hint">Maximum login attempts per minute before rate limiting applies.</span>
+          </div>
+
+        </div>
+      </section>
+
+      <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);border-top:1px solid var(--color-border);">
+        <button type="submit" class="btn btn-primary">Save Settings</button>
+        <a href="/" class="btn btn-ghost">Cancel</a>
+      </div>
+    </form>
+  </div>{# /tab-notifications #}
+
+  <!-- ===================== CAMERA CREDENTIALS ===================== -->
+  <div id="tab-credentials" class="tab-panel" role="tabpanel"
+       aria-label="Credentials" hidden>
+    {#
+      Default camera credentials — own form, own endpoint, own partial.
+      Admin-only; the route enforces this.
+    #}
+    {% include '_partials/camera_default_credentials.html' %}
+  </div>{# /tab-credentials #}
+
+</div>{# /settings-tab-panels #}
+
+{% endblock %}

@@ -1,0 +1,6 @@
+{# Drawer-body fragment for creating a project. The root element carries the
+   drawer title, which drawer.js copies into the drawer header on open. #}
+<div data-drawer-title="New Project">
+  {% set in_drawer = true %}
+  {% include '_partials/new_project_form.html' %}
+</div>

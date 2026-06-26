@@ -1,0 +1,336 @@
+{#
+  Partial: ldap_settings.html
+  Renders the LDAP / Directory settings section for inclusion in settings.html
+  and for HTMX out-of-band swaps after a save.
+
+  Context:
+    ldap                  — LdapSettingsView (bind_password is masked "***" if set)
+    ldap_tls_modes        — tuple of accepted TLS mode strings
+    ldap_membership_modes — tuple of accepted membership mode strings
+    ldap_error            — str | None — validation error message to show inline
+    csrf_token            — str
+#}
+
+<section id="ldap" class="form-section">
+  <div class="form-section-title">LDAP / Directory</div>
+
+  {% if ldap_error %}
+  <div class="alert error" role="alert" style="margin-bottom:var(--sp-4);">
+    {{ ldap_error }}
+  </div>
+  {% endif %}
+
+  <form
+    id="ldap-settings-form"
+    method="post"
+    action="/settings/ldap"
+    novalidate
+  >
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="form-stack">
+
+      <!-- Enable / disable toggle -->
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Enable directory authentication</div>
+          <div class="toggle-desc">
+            When enabled, users may sign in with directory credentials.
+            Disable to fall back to local accounts only.
+          </div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" name="ldap_enabled"
+                 {% if ldap.enabled %}checked{% endif %}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <!-- Server URLs -->
+      <div class="form-group">
+        <label class="form-label" for="ldap_server_urls">
+          Server URLs
+          <span class="required" aria-hidden="true">*</span>
+        </label>
+        <textarea id="ldap_server_urls" name="ldap_server_urls"
+                  class="form-control mono" rows="3"
+                  placeholder="ldap://dir.example.com&#10;ldaps://dir2.example.com:636">{{ ldap.server_urls | join('\n') }}</textarea>
+        <span class="form-hint">
+          One URL per line. Servers are tried in order on failure. Use
+          <span class="mono">ldap://</span> for plain or StartTLS,
+          <span class="mono">ldaps://</span> for implicit TLS.
+        </span>
+      </div>
+
+      <!-- TLS mode -->
+      <div class="form-group">
+        <label class="form-label" for="ldap_tls_mode">TLS mode</label>
+        <select id="ldap_tls_mode" name="ldap_tls_mode" class="form-control"
+                style="max-width:200px;">
+          {% for mode in ldap_tls_modes %}
+          <option value="{{ mode }}"
+                  {% if ldap.tls_mode == mode %}selected{% endif %}>
+            {% if mode == 'none' %}None (plaintext)
+            {% elif mode == 'ldaps' %}LDAPS (implicit TLS)
+            {% elif mode == 'starttls' %}StartTLS (upgrade)
+            {% else %}{{ mode }}
+            {% endif %}
+          </option>
+          {% endfor %}
+        </select>
+        <span class="form-hint">
+          Choose <em>LDAPS</em> for port 636, <em>StartTLS</em> to upgrade a
+          plain connection on port 389.
+        </span>
+      </div>
+
+      <!-- CA certificate trust anchor -->
+      <div class="form-group">
+        <label class="form-label" for="ldap_tls_ca_cert_path">
+          CA certificate path
+        </label>
+        <input type="text" id="ldap_tls_ca_cert_path" name="ldap_tls_ca_cert_path"
+               class="form-control mono"
+               placeholder="/etc/ssl/certs/internal-ca.pem"
+               value="{{ ldap.tls_ca_cert_path or '' }}">
+        <span class="form-hint">
+          Optional path to a CA certificate (PEM) to trust for LDAPS/StartTLS
+          with a private CA. Leave blank to use the system trust store.
+        </span>
+      </div>
+
+      <!-- Service account (bind DN / password) -->
+      <div class="form-section-title" style="font-size:0.8rem;padding-top:var(--sp-2);">
+        Service account
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_bind_dn">Bind DN</label>
+          <input type="text" id="ldap_bind_dn" name="ldap_bind_dn"
+                 class="form-control mono"
+                 placeholder="cn=svc,dc=example,dc=com"
+                 value="{{ ldap.bind_dn }}">
+          <span class="form-hint">Leave blank for an anonymous service bind.</span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_bind_password">Bind password</label>
+          <input type="password" id="ldap_bind_password" name="ldap_bind_password"
+                 class="form-control" autocomplete="new-password"
+                 value="{{ ldap.bind_password }}">
+          <span class="form-hint">
+            {% if ldap.bind_password_set %}
+              A password is stored (shown masked). Leave as
+              <span class="mono">***</span> to keep it; type a new value to change it.
+            {% else %}
+              No password stored. Leave blank for an unauthenticated bind.
+            {% endif %}
+          </span>
+        </div>
+      </div>
+
+      <!-- User search -->
+      <div class="form-section-title" style="font-size:0.8rem;padding-top:var(--sp-2);">
+        User search
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_search_base">
+            Search base
+            <span class="required" aria-hidden="true">*</span>
+          </label>
+          <input type="text" id="ldap_search_base" name="ldap_search_base"
+                 class="form-control mono"
+                 placeholder="ou=people,dc=example,dc=com"
+                 value="{{ ldap.search_base }}">
+          <span class="form-hint">Subtree root to search for user accounts.</span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_search_filter">Search filter</label>
+          <input type="text" id="ldap_search_filter" name="ldap_search_filter"
+                 class="form-control mono"
+                 placeholder="(objectClass=inetOrgPerson)"
+                 value="{{ ldap.search_filter }}">
+          <span class="form-hint">
+            Combined with the username match. Leave blank to match any object class.
+          </span>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_username_attribute">
+            Username attribute
+            <span class="required" aria-hidden="true">*</span>
+          </label>
+          <input type="text" id="ldap_username_attribute" name="ldap_username_attribute"
+                 class="form-control mono"
+                 placeholder="uid"
+                 value="{{ ldap.username_attribute }}">
+          <span class="form-hint">
+            Attribute whose value is matched against the login username
+            (e.g. <span class="mono">uid</span>,
+            <span class="mono">sAMAccountName</span>).
+          </span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_display_name_attribute">
+            Display name attribute
+          </label>
+          <input type="text" id="ldap_display_name_attribute"
+                 name="ldap_display_name_attribute"
+                 class="form-control mono"
+                 placeholder="cn"
+                 value="{{ ldap.display_name_attribute }}">
+          <span class="form-hint">
+            Attribute used as the user's display name
+            (e.g. <span class="mono">cn</span>,
+            <span class="mono">displayName</span>).
+          </span>
+        </div>
+      </div>
+
+      <!-- Group membership -->
+      <div class="form-section-title" style="font-size:0.8rem;padding-top:var(--sp-2);">
+        Group membership
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_membership_mode">
+            Membership resolution
+          </label>
+          <select id="ldap_membership_mode" name="ldap_membership_mode"
+                  class="form-control" style="max-width:240px;">
+            {% for mode in ldap_membership_modes %}
+            <option value="{{ mode }}"
+                    {% if ldap.membership_mode == mode %}selected{% endif %}>
+              {% if mode == 'memberof' %}memberOf attribute
+              {% elif mode == 'group_search' %}Group entry search
+              {% else %}{{ mode }}
+              {% endif %}
+            </option>
+            {% endfor %}
+          </select>
+          <span class="form-hint">
+            <em>memberOf</em>: read the user entry's
+            <span class="mono">memberOf</span> attribute.
+            <em>Group entry search</em>: search group entries whose
+            <span class="mono">member</span> attribute names the user.
+          </span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_group_search_base">
+            Group search base
+          </label>
+          <input type="text" id="ldap_group_search_base" name="ldap_group_search_base"
+                 class="form-control mono"
+                 placeholder="ou=groups,dc=example,dc=com"
+                 value="{{ ldap.group_search_base }}">
+          <span class="form-hint">
+            Used by group-entry search mode. Defaults to the domain root when
+            blank.
+          </span>
+        </div>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Resolve nested / recursive group membership</div>
+          <div class="toggle-desc">
+            Follow group-of-group relationships. Applies to group-entry search mode.
+          </div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" name="ldap_nested_groups"
+                 {% if ldap.nested_groups %}checked{% endif %}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <!-- Role group mappings -->
+      <div class="form-section-title" style="font-size:0.8rem;padding-top:var(--sp-2);">
+        Role group mappings
+      </div>
+      <span class="form-hint" style="display:block;margin-bottom:var(--sp-3);">
+        Users must be a member of a mapped group to be granted access.
+        Highest-privilege role wins when a user belongs to multiple mapped groups.
+      </span>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_admin_group_dn">Admin group DN</label>
+          <input type="text" id="ldap_admin_group_dn" name="ldap_admin_group_dn"
+                 class="form-control mono"
+                 placeholder="cn=admins,ou=groups,dc=example,dc=com"
+                 value="{{ ldap.admin_group_dn }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_admin_group_filter">
+            Admin group filter
+          </label>
+          <input type="text" id="ldap_admin_group_filter" name="ldap_admin_group_filter"
+                 class="form-control mono"
+                 placeholder=""
+                 value="{{ ldap.admin_group_filter }}">
+          <span class="form-hint">Optional extra filter for the group search.</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_operator_group_dn">
+            Operator group DN
+          </label>
+          <input type="text" id="ldap_operator_group_dn" name="ldap_operator_group_dn"
+                 class="form-control mono"
+                 placeholder="cn=operators,ou=groups,dc=example,dc=com"
+                 value="{{ ldap.operator_group_dn }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_operator_group_filter">
+            Operator group filter
+          </label>
+          <input type="text" id="ldap_operator_group_filter"
+                 name="ldap_operator_group_filter"
+                 class="form-control mono"
+                 placeholder=""
+                 value="{{ ldap.operator_group_filter }}">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="ldap_viewer_group_dn">Viewer group DN</label>
+          <input type="text" id="ldap_viewer_group_dn" name="ldap_viewer_group_dn"
+                 class="form-control mono"
+                 placeholder="cn=viewers,ou=groups,dc=example,dc=com"
+                 value="{{ ldap.viewer_group_dn }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ldap_viewer_group_filter">
+            Viewer group filter
+          </label>
+          <input type="text" id="ldap_viewer_group_filter"
+                 name="ldap_viewer_group_filter"
+                 class="form-control mono"
+                 placeholder=""
+                 value="{{ ldap.viewer_group_filter }}">
+        </div>
+      </div>
+
+      <!-- Save / test-connection actions -->
+      <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);
+                  border-top:1px solid var(--color-border);flex-wrap:wrap;
+                  align-items:center;">
+        <button type="submit" class="btn btn-primary">Save LDAP Settings</button>
+
+        <button type="button" class="btn btn-secondary"
+                hx-post="/settings/ldap/test-connection"
+                hx-target="#ldap-test-result"
+                hx-swap="innerHTML">
+          Test connection
+        </button>
+
+        <a href="/settings" class="btn btn-ghost">Cancel</a>
+      </div>
+
+      <!-- Test-connection result target -->
+      <div id="ldap-test-result" style="margin-top:var(--sp-2);"></div>
+
+    </div>{# /form-stack #}
+  </form>
+</section>

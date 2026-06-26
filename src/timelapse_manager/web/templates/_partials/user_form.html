@@ -1,0 +1,136 @@
+{#
+  Partial: user_form.html — inline add/edit user form fragment.
+
+  Context:
+    account — None for the create form; the User row {id, username, role, ...}
+              for the edit form.
+    csrf_token — str, required on every mutating form.
+    flash_messages — optional list of {type, message} shown as inline errors.
+
+  Admin, Operator, and Viewer roles are offered.
+
+  Two structurally distinct shapes by mode (the callers swap into different
+  containers):
+
+  * Create mode renders a <div class="card"> loaded into the page's
+    ``#user-form-container`` div; a normal <form> posting to ``POST /users``.
+  * Edit mode renders a <tr id="user-row-{id}"> that REPLACES the user's display
+    row (the Edit button does ``hx-swap="outerHTML"`` on that row). The fragment
+    keeps the same row id so the apply's ``hx-target`` still resolves; the form
+    ``hx-post``s to ``POST /users/{id}/edit`` and swaps the refreshed display row
+    back in. The username is immutable here and rendered read-only.
+#}
+{% set editing = account is not none %}
+
+{% macro fields(editing, account) %}
+  {% for flash in flash_messages %}
+    <div class="alert error" role="alert" style="margin-bottom:var(--sp-3);">
+      {{ flash.message }}
+    </div>
+  {% endfor %}
+  <div class="form-stack">
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="form_username">
+          Username<span class="required" aria-hidden="true">*</span>
+        </label>
+        {% if editing %}
+          {# Username is immutable on edit. #}
+          <input type="text" id="form_username" class="form-control"
+                 value="{{ account.username }}" readonly>
+        {% else %}
+          <input type="text" id="form_username" name="username"
+                 class="form-control" required autocomplete="off">
+        {% endif %}
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="form_role">
+          Role<span class="required" aria-hidden="true">*</span>
+        </label>
+        {% set current_role = account.role if editing else 'viewer' %}
+        <select id="form_role" name="role" class="form-control" required>
+          <option value="viewer"
+                  {{ 'selected' if current_role == 'viewer' else '' }}>
+            Viewer
+          </option>
+          <option value="operator"
+                  {{ 'selected' if current_role == 'operator' else '' }}>
+            Operator
+          </option>
+          <option value="admin"
+                  {{ 'selected' if current_role == 'admin' else '' }}>
+            Admin
+          </option>
+        </select>
+      </div>
+    </div>
+
+    {% if not editing %}
+      {# Password is set only when creating; edit changes the role only. #}
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="form_password">
+            Password<span class="required" aria-hidden="true">*</span>
+          </label>
+          <input type="password" id="form_password" name="password"
+                 class="form-control" required autocomplete="new-password"
+                 aria-describedby="form-pw-hint">
+          <span class="form-hint" id="form-pw-hint">
+            Minimum 12 characters recommended.
+          </span>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="form_password_confirm">
+            Confirm password<span class="required" aria-hidden="true">*</span>
+          </label>
+          <input type="password" id="form_password_confirm"
+                 name="password_confirm" class="form-control" required
+                 autocomplete="new-password">
+        </div>
+      </div>
+    {% endif %}
+
+    <div style="display:flex;gap:var(--sp-3);">
+      <button type="submit" class="btn btn-primary">
+        {{ 'Save Changes' if editing else 'Create User' }}
+      </button>
+      {% if editing %}
+        <a href="/users" class="btn btn-ghost">Cancel</a>
+      {% else %}
+        <button type="button" class="btn btn-ghost"
+                onclick="document.getElementById('user-form-card').remove();">
+          Cancel
+        </button>
+      {% endif %}
+    </div>
+  </div>
+{% endmacro %}
+
+{% if editing %}
+  {# Replaces the display <tr>; keeps the row id so the apply target survives. #}
+  <tr id="user-row-{{ account.id }}">
+    <td colspan="5">
+      <form novalidate
+            method="post"
+            action="/users/{{ account.id }}/edit"
+            hx-post="/users/{{ account.id }}/edit"
+            hx-target="#user-row-{{ account.id }}"
+            hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ fields(editing, account) }}
+      </form>
+    </td>
+  </tr>
+{% else %}
+  <div class="card mb-6" id="user-form-card">
+    <div class="card-header">
+      <div class="card-title">Add User</div>
+    </div>
+    <div class="card-body">
+      <form novalidate method="post" action="/users">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ fields(editing, account) }}
+      </form>
+    </div>
+  </div>
+{% endif %}

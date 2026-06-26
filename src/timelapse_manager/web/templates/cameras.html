@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{% block title %}Cameras — Timelapse Manager{% endblock %}
+{% block page_title_short %}Cameras{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Cameras</h1>
+    <div class="subtitle">{{ cameras | length }} camera(s) registered</div>
+  </div>
+  {% if can_operate %}
+  <div class="page-actions">
+    {# Opens the centered Discover modal (modal.js). The modal carries the
+       network-scan form, which posts to /cameras/discover. #}
+    <button type="button" class="btn btn-secondary"
+            data-modal-open="#discover-modal">
+      <svg class="icon" aria-hidden="true"><use href="#icon-query"></use></svg>
+      Discover&hellip;
+    </button>
+    <button class="btn btn-primary"
+            hx-get="/cameras/add-form"
+            hx-target="#camera-form-container"
+            hx-swap="innerHTML">
+      <svg class="icon" aria-hidden="true"><use href="#icon-camera"></use></svg> Add Camera
+    </button>
+  </div>
+  {# No-JS fallback: the modal needs JavaScript to open, so without it the scan
+     form is shown inline and submits as a full-page POST to /cameras/discover.
+     No element ids here — the modal owns the single #scan-results target. #}
+  <noscript>
+    <form method="post" action="/cameras/discover"
+          style="margin-top:var(--sp-2);display:flex;gap:var(--sp-2);
+                 align-items:flex-end;flex-wrap:wrap;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="scan-range-noscript" class="form-label">
+        IP range or CIDR (leave blank to scan the local network)
+      </label>
+      <input type="text" id="scan-range-noscript" name="scan_range"
+             class="form-control mono" placeholder="192.168.1.0/24"
+             autocomplete="off" spellcheck="false">
+      <button type="submit" class="btn btn-secondary">Scan Network</button>
+    </form>
+  </noscript>
+  {% endif %}
+</div>
+
+{# Next-step nudge shown right after a camera is created. #}
+{% if request.query_params.get('created') and can_operate %}
+<div class="alert info" role="status"
+     style="display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4);">
+  <span>Camera added. Ready to start capturing.</span>
+  <a href="/projects/new" class="btn btn-sm btn-primary"
+     data-drawer-open="#drawer-main" hx-get="/drawers/new-project"
+     hx-target="#drawer-main .drawer-body" hx-swap="innerHTML"
+     data-drawer-title="New Project">Create a project &rarr;</a>
+</div>
+{% endif %}
+
+{# Inline form container — populated by HTMX when "Add Camera" is clicked #}
+<div id="camera-form-container" style="margin-bottom:var(--sp-6);"></div>
+
+<!-- Registered cameras table -->
+{% if cameras %}
+<div class="card mb-6">
+  <div class="card-header">
+    <div class="card-title">Registered Cameras</div>
+  </div>
+  <div style="overflow-x:auto;">
+    <table class="data-table" aria-label="Registered cameras">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Protocol</th>
+          <th scope="col">Address</th>
+          <th scope="col">Geolocation</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody id="cameras-tbody">
+        {% for camera in cameras %}
+          {% include '_partials/camera_row.html' %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="card mb-6">
+  <div class="empty-state" style="padding:var(--sp-12);">
+    <div class="empty-state-icon" aria-hidden="true">
+      <svg class="icon" style="width:32px;height:32px;"><use href="#icon-camera"></use></svg>
+    </div>
+    <div class="empty-state-title">No cameras registered</div>
+    <div class="empty-state-desc">
+      {% if can_operate %}
+        Scan the network to discover ONVIF-compatible cameras, or add one manually.
+      {% else %}
+        No cameras have been configured. Contact your administrator.
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# Centered Discover modal — its scan form posts to POST /cameras/discover and
+   swaps the result list into the #scan-results that lives inside the modal. #}
+{% if can_operate %}
+  {% include '_partials/discover_modal.html' %}
+{% endif %}
+
+{% endblock %}

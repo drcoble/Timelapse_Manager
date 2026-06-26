@@ -1,0 +1,260 @@
+name: Release
+
+# Release artifacts are built on version tags only; the per-commit CI workflow
+# (ci.yml) stays fast and is unaffected. V1 ships the linux/amd64 slice: a
+# PyInstaller bundle and a linux/amd64 Docker image, both checksummed, signed,
+# and accompanied by a CycloneDX SBOM, with a base-image CVE gate.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the GitHub release and upload assets
+  packages: write   # push the image to GHCR
+  # Note: id-token: write is NOT needed here because we use key-based cosign
+  # (RELEASE_COSIGN_PRIVATE_KEY secret) rather than keyless/OIDC signing.
+  # Key-based was chosen to match the existing offline signing model (GPG) and
+  # to avoid requiring OIDC token grants. The trade-off: the owner must manage
+  # the cosign key pair; keyless/OIDC would remove that burden but adds the
+  # id-token permission and a dependency on Fulcio/Rekor availability.
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Per-tag unit gate: the bundle resolver and /healthz version shaping must
+  # pass before any artifact is built. (The full suite ran on the merge to main.)
+  # ---------------------------------------------------------------------------
+  unit:
+    name: packaging unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.11"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Packaging unit tests
+        run: uv run pytest tests/unit/packaging -q
+
+  # ---------------------------------------------------------------------------
+  # PyInstaller bundle (linux/amd64) + clean-host smoke test.
+  # ---------------------------------------------------------------------------
+  bundle:
+    name: build bundle (linux/amd64)
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.11"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Build release bundle
+        # release.sh freezes the app, bundles the pinned FFmpeg, tars the output,
+        # and runs a local smoke test.
+        run: ./packaging/release.sh
+      - name: Clean-host smoke test (no Python, no system FFmpeg)
+        # The authoritative smoke: extract the tarball inside a stripped image
+        # with no Python and no FFmpeg on PATH, run the frozen exe, hit /healthz.
+        run: |
+          tarball="$(ls dist/timelapse-manager-*-linux-amd64.tar.gz)"
+          docker run --rm -v "$PWD/dist:/dist:ro" debian:bookworm-slim bash -c '
+            set -e
+            ! command -v python3 >/dev/null 2>&1 || { echo "python present"; exit 1; }
+            cd /tmp && tar -xzf /dist/'"$(basename "$tarball")"'
+            d="$(ls -d timelapse-manager-*-linux-amd64)"
+            apt-get update && apt-get install -y --no-install-recommends curl
+            TLM_PATHS__DATA_DIR=/tmp/state ./"$d"/timelapse-manager run &
+            for i in $(seq 1 30); do
+              curl -fsk https://127.0.0.1:8443/healthz && break || sleep 1
+            done
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: dist/timelapse-manager-*-linux-amd64.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Docker image (linux/amd64), base-image CVE gate, push by digest.
+  # ---------------------------------------------------------------------------
+  image:
+    name: build image + CVE scan (linux/amd64)
+    needs: unit
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Resolve lowercase image name
+        # GHCR requires a lowercase path; github.repository preserves the repo's
+        # original case, so a mixed-case repo name would break the push.
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve base-image digest
+        # The Dockerfile's PYTHON_IMAGE default is an all-zeros placeholder so an
+        # un-pinned build fails loudly. Resolve the live python:3.12-slim-bookworm
+        # digest here and pass it as a build-arg so the release is reproducible and
+        # never floats on a moving tag. The digest already carries its sha256:
+        # prefix, so the build-arg below adds no extra prefix.
+        id: base
+        run: |
+          digest="$(docker buildx imagetools inspect python:3.12-slim-bookworm \
+            --format '{{.Manifest.Digest}}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (by digest)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.img.outputs.name }}:${{ github.ref_name }}
+          build-args: |
+            PYTHON_IMAGE=python:3.12-slim-bookworm@${{ steps.base.outputs.digest }}
+      - name: Trivy base-image scan (release gate)
+        # Fails the release on FIXABLE HIGH/CRITICAL findings only. ignore-unfixed
+        # is true: vulnerabilities with no upstream fix (common in the slim base's
+        # distro packages, e.g. perl-base/zlib1g/libsqlite3) cannot be actioned by
+        # a dependency or base bump, so they are tracked-not-blocked rather than
+        # silently waived per-CVE. A fixable finding (bump the dep or base image)
+        # still fails the gate. .trivyignore remains the path for the rare case of
+        # a fixable finding that is genuinely a false positive.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore
+      # -----------------------------------------------------------------------
+      # cosign image signing (key-based).
+      #
+      # Runs AFTER the Trivy gate so a vulnerable image is never signed.
+      # The private key is imported from the RELEASE_COSIGN_PRIVATE_KEY secret
+      # (env:// reference) so it never touches disk. The .sig is pushed to
+      # GHCR under the same repository path; consumers verify with cosign.pub
+      # (published as a release asset by the `publish` job).
+      #
+      # Owner must:
+      #   1. Generate a key pair:  cosign generate-key-pair
+      #   2. Add RELEASE_COSIGN_PRIVATE_KEY = contents of cosign.key
+      #      and RELEASE_COSIGN_PASSWORD    = the key passphrase
+      #      as repository secrets (Settings → Secrets → Actions).
+      #   3. Commit cosign.pub to the repo root so it is uploaded as a
+      #      release asset (see the `publish` job below).
+      # -----------------------------------------------------------------------
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign GHCR image by digest
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.RELEASE_COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.RELEASE_COSIGN_PASSWORD }}
+        run: |
+          cosign sign --key env://COSIGN_PRIVATE_KEY --yes \
+            "${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}"
+      - name: Record image digest
+        run: echo "${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}" > image-digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+
+  # ---------------------------------------------------------------------------
+  # systemd install + lifecycle test in a systemd-enabled container.
+  # ---------------------------------------------------------------------------
+  systemd:
+    name: systemd install test
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bundle
+          path: dist
+      - name: Install + verify the unit in a systemd container
+        run: |
+          docker run --rm --privileged -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            -v "$PWD:/work" jrei/systemd-debian:12 bash -c '
+              set -e
+              cd /tmp && tar -xzf /work/dist/timelapse-manager-*-linux-amd64.tar.gz
+              d="$(ls -d timelapse-manager-*-linux-amd64)"
+              ./"$d"/packaging/install.sh
+              systemctl is-active timelapse-manager
+              ss -tlnp | grep -E ":8080|:8443"
+            '
+
+  # ---------------------------------------------------------------------------
+  # SBOM + checksums + signature, then publish the GitHub release.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: SBOM + sign + publish
+    needs: [bundle, image, systemd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.11"
+          enable-cache: true
+      - run: uv sync --frozen
+      - uses: actions/download-artifact@v4
+        with: { name: bundle, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { name: image-digest, path: dist }
+      - name: Generate CycloneDX SBOM
+        run: uv run python dev/gen_sbom.py --output dist/cyclonedx-bom.json
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+      - name: Checksums + detached signature
+        run: |
+          ./dev/sign_release.sh --key "${{ secrets.RELEASE_GPG_KEY_ID }}" \
+            dist/timelapse-manager-*-linux-amd64.tar.gz \
+            dist/cyclonedx-bom.json \
+            dist/image-digest.txt
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/timelapse-manager-*-linux-amd64.tar.gz
+            dist/cyclonedx-bom.json
+            dist/image-digest.txt
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
+            cosign.pub
+
+  # ---------------------------------------------------------------------------
+  # Deferred-target seams: present but skipped so the matrix expansion is
+  # visible without gating V1 (linux/amd64 only).
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: build bundle (macOS) [deferred]
+    if: false
+    runs-on: macos-latest
+    steps:
+      - run: echo "Deferred - macOS bundle is built post-V1 from the same spec."
+
+  build-windows:
+    name: build bundle (Windows) [deferred]
+    if: false
+    runs-on: windows-latest
+    steps:
+      - run: echo "Deferred - Windows bundle + WinSW wrapper are built post-V1."
+
+  build-linux-arm64:
+    name: build bundle (linux/arm64) [deferred]
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deferred - linux/arm64 image + bundle are built post-V1."

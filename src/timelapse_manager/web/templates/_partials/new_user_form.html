@@ -1,0 +1,50 @@
+{# Create-user form body, shared by the full page (/users/new) and the drawer
+   (/drawers/new-user). Set ``in_drawer`` true to render Cancel as a
+   drawer-close button. Roles match the rest of the app: Admin and Viewer. #}
+<form method="post" action="/users" novalidate
+      onsubmit="if(this.password.value!==this.password_confirm.value){this.querySelector('#new-user-pw-error').hidden=false;this.password_confirm.focus();return false;}return true;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="form-stack">
+    <div class="form-group">
+      <label class="form-label" for="new_username">
+        Username<span class="required" aria-hidden="true">*</span>
+      </label>
+      <input type="text" id="new_username" name="username" class="form-control"
+             required autocomplete="off" autofocus>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="new_role">
+        Role<span class="required" aria-hidden="true">*</span>
+      </label>
+      <select id="new_role" name="role" class="form-control" required>
+        <option value="viewer" selected>Viewer</option>
+        <option value="admin">Admin</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="new_password">
+        Password<span class="required" aria-hidden="true">*</span>
+      </label>
+      <input type="password" id="new_password" name="password" class="form-control"
+             required autocomplete="new-password" aria-describedby="new-pw-hint">
+      <span class="form-hint" id="new-pw-hint">Minimum 12 characters recommended.</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="new_password_confirm">
+        Confirm password<span class="required" aria-hidden="true">*</span>
+      </label>
+      <input type="password" id="new_password_confirm" name="password_confirm"
+             class="form-control" required autocomplete="new-password">
+      <span class="form-hint" id="new-user-pw-error" role="alert"
+            style="color:var(--color-error);" hidden>Passwords do not match.</span>
+    </div>
+    <div style="display:flex;gap:var(--sp-3);">
+      <button type="submit" class="btn btn-primary">Create User</button>
+      {% if in_drawer %}
+      <button type="button" class="btn btn-ghost" data-drawer-close>Cancel</button>
+      {% else %}
+      <a href="/users" class="btn btn-ghost">Cancel</a>
+      {% endif %}
+    </div>
+  </div>
+</form>

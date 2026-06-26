@@ -1,0 +1,24 @@
+{#
+  Partial: status_banner.html
+  Context: error_count — int (recent error-or-above events; 0 = healthy)
+           latest_error — _EventView | None (most recent error, if any)
+
+  Loaded lazily into #status-banner via hx-get="/partials/status". The route is
+  failure-isolated: on any query error it still renders with error_count=0, so
+  this partial degrades to a healthy/empty banner rather than failing the page.
+#}
+<div id="status-banner">
+  {% if error_count and error_count > 0 %}
+  <div class="status-banner status-banner-error" role="status" aria-live="polite">
+    <span class="status-banner-icon" aria-hidden="true">&#9888;</span>
+    <span class="status-banner-text">
+      {{ error_count }} recent error{% if error_count != 1 %}s{% endif %}.
+      {% if latest_error %}
+        Latest: {{ latest_error.message }}
+        {% if latest_error.timestamp %}<span class="status-banner-time">({{ latest_error.timestamp }})</span>{% endif %}
+      {% endif %}
+    </span>
+    <a href="/events?level=error" class="status-banner-link">View events</a>
+  </div>
+  {% endif %}
+</div>

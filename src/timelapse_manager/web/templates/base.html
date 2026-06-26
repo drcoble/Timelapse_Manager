@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  {# CSRF token in meta — read by HTMX on every mutating request via hx-headers on <body> #}
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}Timelapse Manager{% endblock %}</title>
+  {#
+    No-flash theme script: runs BEFORE the stylesheet so the correct
+    data-theme is set before the first paint, preventing a flash.
+    For signed-in users the server inlines their stored preference;
+    for anonymous users we fall back to localStorage.
+  #}
+  <script>
+    (function () {
+      var pref = {{ user_theme | tojson }};
+      if (!pref || pref === 'system') {
+        try { pref = localStorage.getItem('theme') || 'system'; } catch (e) {}
+      }
+      if (pref === 'light' || pref === 'dark') {
+        document.documentElement.setAttribute('data-theme', pref);
+      }
+      // 'system' → no data-theme attr → CSS @media drives it
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/htmx.min.js"></script>
+</head>
+{#
+  hx-headers on <body> injects X-CSRF-Token into every HTMX request automatically.
+  The meta tag is read at request time so the value is always current.
+#}
+<body hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
+
+  {# Icon sprite — hidden <symbol> defs referenced via <use> throughout #}
+  {% include '_partials/shell/icons.html' %}
+
+  <div class="app-shell">
+
+    {#
+      The breadcrumb blocks must stay lexically in base.html so child templates
+      can still override them via inheritance (a block inside an {% include %}
+      is invisible to {% extends %}). We capture the resolved output here and
+      pass it into the header partial as a variable.
+    #}
+    {% set header_breadcrumb %}{% block breadcrumb %}<span class="ctx-current">{% block page_title_short %}Dashboard{% endblock %}</span>{% endblock %}{% endset %}
+    {% include '_partials/shell/header.html' %}
+
+    {% include '_partials/shell/nav.html' %}
+
+    <!-- ===== MAIN ===== -->
+    <main class="app-main" id="main-content">
+
+      {#
+        Status banner — lazily loaded so a monitoring query hiccup can never
+        500 an authenticated page. The partial route is failure-isolated and
+        returns a benign empty banner on any error.
+      #}
+      <div id="status-banner"
+           hx-get="/partials/status"
+           hx-trigger="load"
+           hx-swap="outerHTML"></div>
+
+      {# Flash messages rendered as toasts in a fixed region #}
+      {% if flash_messages %}
+      <div class="toast-region" role="status" aria-live="polite">
+        {% for msg in flash_messages %}
+        {% include '_partials/toast.html' %}
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+
+    </main>
+
+  </div>{# /app-shell #}
+
+  {# Persistent right-side drawer shell (outside the inert-able nav/main).
+     Fragment routes load their form into `.drawer-body`; drawer.js opens the
+     panel once the content has swapped in, and traps focus while it is open. #}
+  <div class="drawer-backdrop" data-drawer-backdrop></div>
+  <aside id="drawer-main" class="drawer" role="dialog" aria-modal="true"
+         aria-hidden="true" aria-labelledby="drawer-title">
+    <header class="drawer-header">
+      <h2 class="drawer-title" id="drawer-title"></h2>
+      <button type="button" class="drawer-close" data-drawer-close
+              aria-label="Close">&times;</button>
+    </header>
+    <div class="drawer-body"></div>
+  </aside>
+
+  {#
+    Theme toggle script. Cycles: current → next in [light, dark, system].
+    Persists to the server (signed-in users) and to localStorage (fallback).
+    Loaded at end-of-body (not deferred) so #theme-toggle-btn is already parsed.
+  #}
+  <script src="/static/js/theme.js"></script>
+
+  {#
+    Browser timezone detection. The server-rendered stored value is passed to
+    the external script via a tiny window.__viewerTz shim (kept as a literal
+    `| tojson` expression so the rendered value is byte-identical to before).
+    The shim must precede the external <script src>.
+  #}
+  <script>window.__viewerTz = {{ viewer_timezone | tojson }};</script>
+  <script src="/static/js/timezone.js"></script>
+
+  {# Component behaviours — event-delegated, tolerate HTMX-swapped markup #}
+  <script src="/static/js/drawer.js"></script>
+  <script src="/static/js/modal.js"></script>
+  <script src="/static/js/chips.js"></script>
+  <script src="/static/js/ribbon.js"></script>
+  <script src="/static/js/frames-nav.js"></script>
+  <script src="/static/js/scrubber.js"></script>
+  <script src="/static/js/selection.js"></script>
+  <script src="/static/js/density.js"></script>
+  <script src="/static/js/events-nav.js"></script>
+  <script src="/static/js/tabs.js"></script>
+  <script src="/static/js/scroll-announce.js"></script>
+
+</body>
+</html>

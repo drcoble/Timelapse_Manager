@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{#
+  Audit / security log — admin-only, continuous scroll (GET /events/audit; the
+  route 403s a non-admin before this renders). Shows only audit/security records.
+  Context: events list[_EventView]; next_before int|None; filter_qs (encoded
+           active filter); search_q str.
+#}
+
+{% block title %}Audit Log — Timelapse Manager{% endblock %}
+{% block page_title_short %}Audit Log{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Audit &amp; Security Log</h1>
+    <div class="subtitle">
+      Authentication and administrative control actions &middot; admin-only
+    </div>
+  </div>
+</div>
+
+{% include '_partials/events_tabs.html' %}
+
+{# Filter bar — GET so the filter is bookmarkable. Submitting reloads the newest
+   matching batch into the list; the filter rides the sentinel's cursor so the
+   scroll continuation stays scoped to the search. #}
+<form id="audit-filter-form" method="get" action="/events/audit" class="filter-bar"
+      role="search"
+      hx-get="/audit/batch" hx-target="#audit-tbody" hx-swap="innerHTML"
+      hx-push-url="false">
+  <div class="form-group" style="flex:1;min-width:12rem;">
+    <label class="form-label" for="audit-q">Search</label>
+    <input id="audit-q" name="q" type="search" class="form-control"
+           value="{{ search_q }}" placeholder="message contains…" autocomplete="off">
+  </div>
+  <button type="submit" class="btn btn-secondary">Filter</button>
+</form>
+
+<div class="table-wrap">
+  <table class="data-table events-table">
+    <thead>
+      <tr>
+        <th>Time (UTC)</th>
+        <th>Level</th>
+        <th>Type</th>
+        <th>Scope</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody id="audit-tbody">
+      {% if events %}
+        {% include '_partials/audit_batch.html' %}
+      {% else %}
+        <tr>
+          <td colspan="5" class="empty-state-cell">No records match the current filter.</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+
+{# Polite live region: assistive tech hears each scroll-loaded batch append. #}
+<div id="audit-load-status" role="status" aria-live="polite" class="visually-hidden"></div>
+
+{% endblock %}

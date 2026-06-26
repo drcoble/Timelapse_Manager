@@ -1,0 +1,104 @@
+{#
+  Single-project frame-navigation controls: the date/time jump and the
+  interactive ribbon (the scrubber). Included only in single-project mode (the
+  time axis needs one project's sequence); All-Projects renders a hint in its
+  place instead.
+
+  Layout: a sticky scrubber panel holds the jump-row (reserved for the jump
+  buttons a later phase adds), the date/time jump form, and the ribbon. The
+  panel sits below the selection/result action bar in the sticky stack.
+
+  Context: project, show_deleted.
+#}
+<div class="scrubber-panel">
+  {# Jump-row — quick navigation across the campaign. Start/Newest leap to the
+     ends; Prev/Next gap step through capture lapses (relative to the current
+     `at` anchor). Real buttons, tab-reachable before the grid; each swaps a
+     fresh window into #frame-grid. #}
+  {% set _sd = '&show_deleted=1' if show_deleted else '' %}
+  {% set _at = request.query_params.get('at', '') %}
+  {% set _atq = ('&at=' ~ _at) if _at else '' %}
+  <div class="scrubber-jump-row jump-btn-group">
+    <button type="button" class="btn btn-sm btn-ghost"
+            hx-get="/frames?project_id={{ project.id }}&jump=start{{ _sd }}"
+            hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false"
+            aria-label="Jump to the start of capture">&#10515; Start</button>
+    <button type="button" class="btn btn-sm btn-ghost"
+            hx-get="/frames?project_id={{ project.id }}&jump=newest{{ _sd }}"
+            hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false"
+            aria-label="Jump to the newest frame">&#10514; Newest</button>
+    <button type="button" class="btn btn-sm btn-ghost"
+            hx-get="/frames?project_id={{ project.id }}&jump=prev_gap{{ _sd }}{{ _atq }}"
+            hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false"
+            aria-label="Jump to the previous capture gap">&#9198; Prev gap</button>
+    <button type="button" class="btn btn-sm btn-ghost"
+            hx-get="/frames?project_id={{ project.id }}&jump=next_gap{{ _sd }}{{ _atq }}"
+            hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false"
+            aria-label="Jump to the next capture gap">&#9197; Next gap</button>
+  </div>
+
+  {# Display density — Comfortable / Compact tile sizes, or a single-row
+     Filmstrip. Client-only (density.js): the choice is applied to #frame-grid
+     and remembered in localStorage, with no server round-trip. #}
+  <div class="density-toggle">
+    <div class="segmented" role="radiogroup" aria-label="Display density">
+      <label class="segmented-option">
+        <input type="radio" name="frame-density" value="comfortable" checked>
+        <span title="Comfortable — larger tiles">Comfortable</span>
+      </label>
+      <label class="segmented-option">
+        <input type="radio" name="frame-density" value="compact">
+        <span title="Compact — smaller tiles">Compact</span>
+      </label>
+      <label class="segmented-option">
+        <input type="radio" name="frame-density" value="filmstrip">
+        <span title="Filmstrip — one horizontal row">Filmstrip</span>
+      </label>
+    </div>
+  </div>
+
+  {# Date/time jump — the accessible, no-JS jump path. A plain GET returns the
+     full page windowed at `at`; with JS the response is swapped into
+     #frame-grid only. Tab-reachable before the grid. #}
+  <form class="frame-jump"
+        hx-get="/frames" hx-target="#frame-grid" hx-swap="innerHTML"
+        hx-push-url="false"
+        action="/frames" method="get"
+        style="margin-bottom:var(--sp-4);display:flex;align-items:flex-end;gap:var(--sp-3);flex-wrap:wrap;">
+    <input type="hidden" name="project_id" value="{{ project.id }}">
+    {% if show_deleted %}<input type="hidden" name="show_deleted" value="1">{% endif %}
+    <div>
+      <label class="form-label" for="frame-jump-at">Jump to date &amp; time</label>
+      <input type="datetime-local" id="frame-jump-at" name="at" class="form-control"
+             style="max-width:240px;">
+    </div>
+    <button type="submit" class="btn btn-secondary btn-sm">Go</button>
+  </form>
+
+  {# Interactive ribbon (single-project only) — the scrubber. role="slider" with
+     arrow-key stepping (Enter/Space commits a jump) makes it keyboard-operable;
+     a click both jumps and pre-fills the date-jump above for minute-precision
+     correction. The date-jump form remains the parallel no-JS / screen-reader
+     path. The aria-value* attributes are populated by scrubber.js once the SVG's
+     epoch bounds load. Lazy-loaded so its DB work stays off the page-render
+     path. #}
+  <div class="frame-ribbon" role="slider" tabindex="0"
+       aria-label="Capture timeline scrubber"
+       data-project-id="{{ project.id }}"
+       hx-get="/partials/projects/{{ project.id }}/ribbon?h=36&amp;decorative=1"
+       hx-trigger="load" hx-swap="innerHTML"></div>
+
+  {# Zoom strip — a finer ribbon of the loaded window, shown only for long
+     campaigns (where the overview compresses each day to a sliver). scrubber.js
+     lazy-loads the windowed ribbon here as you navigate; a click jumps the grid
+     at fine resolution via the same ribbon:jump path. A SIBLING of .frame-ribbon
+     (never a descendant) so it cannot perturb the overview's epoch-bounds read
+     or its drag-select. Empty + hidden until populated. #}
+  <div class="frame-zoom-strip" data-project-id="{{ project.id }}"
+       aria-label="Zoomed capture timeline" hidden
+       style="margin-bottom:var(--sp-5);"></div>
+
+  {# Escalation banner placeholder — hidden until a drag-select on the ribbon
+     produces a counted range descriptor; selection.js reveals + populates it. #}
+  {% include '_partials/frames_escalation_banner.html' %}
+</div>

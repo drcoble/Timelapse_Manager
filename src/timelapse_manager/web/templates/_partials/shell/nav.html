@@ -1,0 +1,61 @@
+<!-- ===== LEFT NAV ===== -->
+<nav class="app-nav" aria-label="Main navigation">
+  <a href="/"
+     class="nav-item {% if request.url.path == '/' %}active{% endif %}"
+     aria-current="{% if request.url.path == '/' %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-dashboard"></use></svg></span>
+    <span>Dashboard</span>
+  </a>
+  <a href="/cameras"
+     class="nav-item {% if request.url.path.startswith('/cameras') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/cameras') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-camera"></use></svg></span>
+    <span>Cameras</span>
+  </a>
+  <a href="/projects"
+     class="nav-item {% if request.url.path.startswith('/projects') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/projects') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-capture"></use></svg></span>
+    <span>Projects</span>
+  </a>
+  <a href="/frames"
+     class="nav-item {% if request.url.path.startswith('/frames') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/frames') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-frame"></use></svg></span>
+    <span>Frames</span>
+  </a>
+  <a href="/renders"
+     class="nav-item {% if request.url.path.startswith('/renders') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/renders') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-render"></use></svg></span>
+    <span>Renders</span>
+  </a>
+  <a href="/events"
+     class="nav-item {% if request.url.path.startswith('/events') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/events') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-events"></use></svg></span>
+    <span>Events</span>
+  </a>
+  <a href="/about"
+     class="nav-item {% if request.url.path.startswith('/about') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/about') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-about"></use></svg></span>
+    <span>About</span>
+  </a>
+
+  {% if current_user.role == 'admin' %}
+  <div class="nav-divider" role="separator"></div>
+  <a href="/users"
+     class="nav-item admin-nav {% if request.url.path.startswith('/users') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/users') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-users"></use></svg></span>
+    <span>Users</span>
+  </a>
+  <a href="/settings"
+     class="nav-item admin-nav {% if request.url.path.startswith('/settings') %}active{% endif %}"
+     aria-current="{% if request.url.path.startswith('/settings') %}page{% endif %}">
+    <span class="nav-icon" aria-hidden="true"><svg class="icon"><use href="#icon-settings"></use></svg></span>
+    <span>Settings</span>
+  </a>
+  {% endif %}
+</nav>

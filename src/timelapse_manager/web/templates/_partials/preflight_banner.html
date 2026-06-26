@@ -1,0 +1,18 @@
+{#
+  Partial: preflight_banner.html — storage pre-flight estimate for a new project.
+  Context: level ('ok'|'caution'|'danger'), days (int|None), per_day_display,
+           free_display. Swapped into #preflight-container as the operator sets
+           the capture interval in the create form.
+#}
+<div class="preflight-banner {{ level }}" role="status">
+  <svg class="icon" aria-hidden="true"><use href="#icon-capture"></use></svg>
+  <span>
+    Estimated <strong>{{ per_day_display }}/day</strong> at this interval.
+    <strong>{{ free_display }}</strong> free
+    {% if days is not none %}
+      — about <strong>{{ days }} day{{ 's' if days != 1 else '' }}</strong> until full at this rate.
+    {% else %}
+      (no measurable growth).
+    {% endif %}
+  </span>
+</div>

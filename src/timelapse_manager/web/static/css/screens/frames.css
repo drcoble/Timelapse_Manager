@@ -1,0 +1,364 @@
+
+/* --------------------------------------------------------------------------
+   Frame Browser
+   -------------------------------------------------------------------------- */
+
+/* Frame grid (paginated view). The minimum tile width is a custom property so
+   the density toggle (density.js sets data-density on the grid) can switch
+   between comfortable and compact without restyling each tile. */
+#frame-grid { --tile-min: 180px; }
+#frame-grid[data-density="comfortable"] { --tile-min: 180px; }
+#frame-grid[data-density="compact"] { --tile-min: 130px; }
+.frame-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--tile-min, 180px), 1fr));
+  gap: var(--sp-3);
+}
+
+/* Filmstrip: a single horizontal row of thumbnails (single-project only). The
+   continuous-scroll sentinel still fires on horizontal reveal. New class names
+   avoid the older (removed) .frame-strip rules. */
+#frame-grid[data-density="filmstrip"].frame-grid {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+}
+#frame-grid[data-density="filmstrip"] .frame-tile {
+  flex: 0 0 auto;
+  width: 200px;
+}
+#frame-grid[data-density="filmstrip"] .frame-sentinel,
+#frame-grid[data-density="filmstrip"] .frame-end-cap {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.frame-tile {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+.frame-tile:hover { border-color: var(--color-accent); }
+
+/* Positioning context for the overlaid select control (frames-selection-bar.css). */
+.frame-tile-thumb-wrap { position: relative; }
+.frame-tile.soft-deleted {
+  opacity: 0.5;
+  border: 1px dashed var(--color-error);
+}
+
+.frame-tile-meta {
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  border-top: 1px solid var(--color-border);
+}
+
+/* Project label on a tile in the cross-project "All Projects" grid. */
+.frame-tile-project {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  color: var(--color-accent-hover);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.frame-tile-actions {
+  display: flex;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2) var(--sp-2);
+}
+
+.frame-metadata dt {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-dim);
+  margin-top: var(--sp-3);
+}
+.frame-metadata dd {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--color-text);
+  margin-left: 0;
+}
+.frame-metadata dd.normal { font-family: var(--font-sans); }
+.frame-metadata dt:first-child { margin-top: 0; }
+
+/* Continuous-scroll: the sentinel and end-cap span the full grid width. */
+.frame-grid .frame-sentinel,
+.frame-grid .frame-end-cap {
+  grid-column: 1 / -1;
+}
+
+/* ===== Frame-detail drawer ===== */
+.frame-drawer-image {
+  display: block;
+  border-radius: var(--radius);
+  margin-bottom: var(--sp-4);
+}
+.frame-drawer-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+.frame-drawer-row {
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--sp-3) 0;
+  margin-bottom: var(--sp-4);
+}
+.frame-drawer-row-main {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.frame-drawer-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-dim);
+}
+.frame-drawer-value {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--color-text);
+  margin-right: auto;
+}
+.frame-drawer-ts-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.frame-drawer-meta {
+  margin-bottom: var(--sp-4);
+}
+.frame-drawer-scene {
+  margin-bottom: var(--sp-4);
+}
+.frame-drawer-scene > summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+.frame-drawer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--color-border);
+}
+
+/* "N new frames" pill — revealed by the poll when frames are added upstream.
+   Sits above the grid; [hidden] keeps it out of flow until there is news. */
+.frame-new-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+}
+.frame-new-pill[hidden] {
+  display: none;
+}
+.frame-new-pill-count {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+/* Excluded-from-render badge. A frame with this badge stays fully visible in the
+   browser but is skipped when the timelapse video is rendered — distinct from the
+   soft-deleted state (which hides the frame). Neutral "stopped" palette so it
+   reads as "set aside", not as an error. */
+.badge-excluded {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--color-stopped-bg);
+  color: var(--color-stopped);
+  border: 1px solid var(--color-stopped);
+}
+
+/* Escalation banner — the "≈N frames in <range>" prompt after a drag-select,
+   offering to escalate the gesture to a full range/project selection. Reveals
+   inside the scrubber panel; the accent-dim fill ties it to the drag highlight
+   and the selection accent without competing with the action bar above it. */
+.escalation-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-accent-dim);
+  color: var(--color-accent-text);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+}
+.escalation-banner[hidden] {
+  display: none;
+}
+.escalation-banner-count {
+  font-weight: 600;
+}
+.escalation-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.escalation-banner :focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* Jump-row buttons (Start / Newest / Prev gap / Next gap) above the date-jump. */
+.jump-btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+/* In-grid capture-gap band — marks a lapse where no frames were captured, so
+   the gap a jump landed at is legible in the stream, not only on the ribbon. */
+.frames-gap-band {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  grid-column: 1 / -1;
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--color-ribbon-gap);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+.frames-gap-band-icon { color: var(--color-error); }
+.frames-gap-band-text { font-family: 'Geist Mono', ui-monospace, monospace; }
+
+/* "Nearest frame: …" note when a date/time jump lands between captures. */
+.frames-nearest-note {
+  grid-column: 1 / -1;
+  margin-bottom: var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-dim);
+  font-style: italic;
+}
+
+/* Bulk timestamp-offset panel — an inline reveal below the selection bar (not a
+   modal). Expands when the Offset button is pressed; selection.js drives it. */
+.offset-panel {
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding: var(--sp-3);
+  border-left: 3px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+}
+.offset-panel[hidden] { display: none; }
+.offset-panel-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.offset-panel-row + .offset-panel-row,
+.offset-panel-preview + .offset-panel-row { margin-top: var(--sp-3); }
+.offset-panel-title {
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+.offset-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+.offset-field input {
+  width: 4rem;
+  padding: 2px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+}
+.offset-panel-preview {
+  margin-top: var(--sp-2);
+  font-size: var(--text-sm);
+  color: var(--color-text-dim);
+  font-family: 'Geist Mono', ui-monospace, monospace;
+}
+
+/* Export progress in the action bar — constrain the shared renders progress bar
+   so it sits inline next to the status text rather than filling the row. */
+.export-progress {
+  display: inline-block;
+  width: 140px;
+  vertical-align: middle;
+}
+
+/* Display-density toggle in the scrubber panel. */
+.density-toggle {
+  margin-bottom: var(--sp-3);
+}
+
+/* All-Projects: the time-axis controls are single-project only, so a hint
+   stands in their place pointing to per-project navigation. */
+.frames-allprojects-hint {
+  margin: var(--sp-2) 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+/* Drawer selection bridge — injected by selection.js at the top of the frame
+   drawer when the opened frame is part of a multi-frame selection, offering a
+   pivot back to the bulk action bar. */
+.drawer-selection-bridge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.drawer-selection-bridge-label {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+.drawer-selection-bridge-act {
+  flex: none;
+}

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Renders — Timelapse Manager{% endblock %}
+{% block page_title_short %}Renders{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Renders</h1>
+    <div class="subtitle">Timelapse video queue and completed outputs</div>
+  </div>
+</div>
+
+{% if renders %}
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Render Queue</div>
+      {# Refresh renders list every 10s while any job is in progress #}
+      <span class="spinner htmx-indicator"
+            aria-hidden="true"
+            style="opacity:0;transition:opacity 200ms;"
+            id="render-refresh-indicator"></span>
+    </div>
+
+    {#
+      Poll every 10s: the server returns a full /renders response and we
+      swap this element wholesale (outerHTML). hx-select="#renders-list"
+      plucks only this div from the response so the surrounding card header
+      is not duplicated. outerHTML replaces the element itself — the polling
+      attrs survive because they come from the newly swapped-in markup.
+    #}
+    <div class="job-list"
+         id="renders-list"
+         role="list"
+         style="padding:var(--sp-4);"
+         hx-get="/renders"
+         hx-trigger="every 10s"
+         hx-swap="outerHTML"
+         hx-select="#renders-list"
+         hx-indicator="#render-refresh-indicator">
+      {% for render in renders %}
+        {% include '_partials/render_row.html' %}
+      {% endfor %}
+    </div>
+  </div>
+
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon" aria-hidden="true">&#9881;</div>
+    <div class="empty-state-title">No renders yet</div>
+    <div class="empty-state-desc">
+      {% if can_operate %}
+        Open a project and click "Render Now" to generate a timelapse video.
+      {% else %}
+        No timelapse videos have been rendered yet.
+      {% endif %}
+    </div>
+    {% if can_operate %}
+      <a href="/projects" class="btn btn-primary">Go to Projects</a>
+    {% endif %}
+  </div>
+{% endif %}
+
+{% endblock %}
