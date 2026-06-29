@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+
+{% block title %}Preferences — Timelapse Manager{% endblock %}
+{% block page_title_short %}Preferences{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Display Preferences</h1>
+    <div class="subtitle">Colour theme &middot; Timezone</div>
+  </div>
+</div>
+
+<div class="settings-tab-panels">
+
+  <!-- ===== THEME ===== -->
+  <section class="form-section">
+    <div class="form-section-title">Colour Theme</div>
+    <div class="form-stack">
+      <div class="form-group">
+        <label class="form-label" id="theme-segment-label">Theme</label>
+        <div class="segmented" role="radiogroup" aria-labelledby="theme-segment-label"
+             id="theme-segment">
+          <label class="segmented-option">
+            <input type="radio" name="theme" value="system"
+                   {% if user_theme == 'system' %}checked{% endif %}>
+            <span>System</span>
+          </label>
+          <label class="segmented-option">
+            <input type="radio" name="theme" value="light"
+                   {% if user_theme == 'light' %}checked{% endif %}>
+            <span>Light</span>
+          </label>
+          <label class="segmented-option">
+            <input type="radio" name="theme" value="dark"
+                   {% if user_theme == 'dark' %}checked{% endif %}>
+            <span>Dark</span>
+          </label>
+        </div>
+        <span class="form-hint">
+          Follow the operating system, or pin a light or dark scheme. The theme
+          toggle in the header cycles through these options too.
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== TIMEZONE ===== -->
+  <section class="form-section">
+    <div class="form-section-title">Display Timezone</div>
+    <div class="form-stack">
+      <div class="form-group">
+        <label class="form-label" for="timezone-input">Timezone</label>
+        <div style="display:flex;gap:var(--sp-2);align-items:flex-start;">
+          <input type="text" id="timezone-input" name="timezone"
+                 class="form-control mono"
+                 placeholder="Auto-detected from browser"
+                 value="{{ viewer_timezone or '' }}"
+                 style="max-width:320px;">
+          <button type="button" id="timezone-detect-btn" class="btn btn-ghost btn-sm">
+            Auto-detect
+          </button>
+        </div>
+        <span class="form-hint">
+          Enter an IANA timezone name (e.g. <code>America/New_York</code>,
+          <code>Europe/London</code>, <code>Asia/Tokyo</code>).
+          Leave blank to use your browser&rsquo;s auto-detected timezone.
+          Capture schedules and date bounds are always shown in UTC.
+        </span>
+      </div>
+      {% if viewer_timezone %}
+      <div class="form-group">
+        <span class="form-hint">
+          Currently showing timestamps in: <strong class="mono">{{ viewer_timezone }}</strong>
+        </span>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+
+  <!-- Save button -->
+  <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);border-top:1px solid var(--color-border);">
+    <button type="button" id="save-preferences-btn" class="btn btn-primary">
+      Save Preferences
+    </button>
+    <a href="/" class="btn btn-ghost">Cancel</a>
+  </div>
+
+  <!-- ===== CHANGE PASSWORD ===== -->
+  {#
+    Only local accounts have an app-managed password. LDAP accounts have their
+    credentials managed by the directory service and cannot set one here.
+
+    Outcome feedback: POST /account/password follows the post/redirect/get
+    pattern and signals the result via query params on the redirect target
+    (?password_changed=1 on success, ?password_error=<code> on failure), the
+    same idiom other pages use. The banner below renders that result.
+  #}
+  {% set _pw_ok = request.query_params.get('password_changed') %}
+  {% set _pw_err = request.query_params.get('password_error') %}
+  {% if _pw_ok or _pw_err %}
+  <section class="form-section" aria-live="polite">
+    {% if _pw_ok %}
+    <div class="form-hint" role="status"
+         style="color:var(--color-success, #2e7d32); font-weight:600;">
+      Password updated.
+    </div>
+    {% else %}
+    <div class="form-hint" role="alert"
+         style="color:var(--color-danger, #c62828); font-weight:600;">
+      {% if _pw_err == 'ldap' %}Your password is managed by your directory and cannot be changed here.
+      {% elif _pw_err == 'current' %}Current password is incorrect.
+      {% elif _pw_err == 'mismatch' %}New password and confirmation do not match.
+      {% elif _pw_err == 'policy' %}Your new password does not meet the minimum length requirement.
+      {% else %}Could not update password. Please try again.
+      {% endif %}
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if current_user.auth_source == 'local' %}
+  <section class="form-section" aria-labelledby="change-password-heading">
+    <div class="form-section-title" id="change-password-heading">Change Password</div>
+    <form method="post" action="/account/password" novalidate>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-stack">
+        <div class="form-group">
+          <label class="form-label" for="current_password">Current password</label>
+          <input type="password"
+                 id="current_password"
+                 name="current_password"
+                 class="form-control"
+                 required
+                 autocomplete="current-password"
+                 style="max-width:320px;">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="new_password">New password</label>
+            <input type="password"
+                   id="new_password"
+                   name="new_password"
+                   class="form-control"
+                   required
+                   autocomplete="new-password"
+                   aria-describedby="new-pw-hint">
+            <span class="form-hint" id="new-pw-hint">Minimum 12 characters recommended.</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="confirm_password">Confirm new password</label>
+            <input type="password"
+                   id="confirm_password"
+                   name="confirm_password"
+                   class="form-control"
+                   required
+                   autocomplete="new-password">
+          </div>
+        </div>
+        <div>
+          <button type="submit" class="btn btn-secondary">Update Password</button>
+        </div>
+      </div>
+    </form>
+  </section>
+  {% else %}
+  <section class="form-section" aria-labelledby="change-password-heading">
+    <div class="form-section-title" id="change-password-heading">Password</div>
+    <p class="form-hint" style="margin:0;">
+      Your password is managed by your directory.
+    </p>
+  </section>
+  {% endif %}
+
+</div>{# /preferences content #}
+
+{#
+  Theme applies live on segment change (instant feedback); Save persists both
+  theme and timezone to /account/theme and /account/timezone, then reloads so
+  timestamps re-render in the chosen zone.
+#}
+<script>
+  (function () {
+    function selectedTheme() {
+      var checked = document.querySelector('#theme-segment input:checked');
+      return checked ? checked.value : 'system';
+    }
+    function applyTheme(t) {
+      if (t === 'system') {
+        document.documentElement.removeAttribute('data-theme');
+      } else {
+        document.documentElement.setAttribute('data-theme', t);
+      }
+      try { localStorage.setItem('theme', t); } catch (e) {}
+    }
+
+    // Live-apply the theme as the user picks a segment.
+    var seg = document.getElementById('theme-segment');
+    if (seg) {
+      seg.addEventListener('change', function () { applyTheme(selectedTheme()); });
+    }
+
+    // Auto-detect timezone from the browser.
+    var detect = document.getElementById('timezone-detect-btn');
+    if (detect) {
+      detect.addEventListener('click', function () {
+        try {
+          var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+          if (tz) document.getElementById('timezone-input').value = tz;
+        } catch (e) {}
+      });
+    }
+
+    var btn = document.getElementById('save-preferences-btn');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var csrf = document.querySelector('meta[name="csrf-token"]');
+      if (!csrf) return;
+      var token = csrf.getAttribute('content');
+      var theme = selectedTheme();
+      var timezone = document.getElementById('timezone-input').value.trim();
+
+      function post(url, body) {
+        return fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': token
+          },
+          body: body
+        });
+      }
+
+      Promise.all([
+        post('/account/theme', 'theme=' + encodeURIComponent(theme)),
+        post('/account/timezone', 'timezone=' + encodeURIComponent(timezone))
+      ]).then(function () {
+        applyTheme(theme);
+        window.location.reload();
+      }).catch(function () {
+        alert('Could not save preferences. Please try again.');
+      });
+    });
+  })();
+</script>
+
+{% endblock %}

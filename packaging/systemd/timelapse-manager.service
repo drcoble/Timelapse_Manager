@@ -1,0 +1,89 @@
+# systemd unit for Timelapse Manager (self-contained bundle deployment).
+#
+# This is a TEMPLATE. The tokens @INSTALL_DIR@, @STATE_DIR@, @CONFIG_DIR@,
+# @SERVICE_USER@, and @SERVICE_GROUP@ are substituted by packaging/install.sh
+# at install time. To install by hand, replace them yourself, drop the result
+# at /etc/systemd/system/timelapse-manager.service, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now timelapse-manager
+#
+# The service runs the bundled, self-contained executable in the foreground.
+# It serves the web UI over HTTPS (8443) with an HTTP listener (8080) that
+# redirects to HTTPS by default -- those listener defaults are the application's,
+# not overridden here. Change ports/binding via the config file or TLM_* env in
+# the EnvironmentFile below; do not edit listeners into this unit.
+
+[Unit]
+Description=Timelapse Manager (IP-camera timelapse capture and rendering)
+Documentation=https://github.com/timelapse-manager/timelapse-manager
+# Cameras and notifications need the network; wait for it to be fully up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated, unprivileged service account with no login shell (created by the
+# installer). The service must never run as root.
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+
+# Optional operator overrides (ports, paths, log level, etc.) as TLM_* vars or
+# KEY=VALUE lines. The leading '-' makes the file optional: a missing file is
+# not an error. Never put secrets that should not be world-readable here without
+# also tightening the file's mode; a mounted key file is the preferred path.
+EnvironmentFile=-@CONFIG_DIR@/timelapse-manager.env
+
+# Point the app at the packaged config file if present (optional).
+Environment=TLM_CONFIG=@CONFIG_DIR@/config.yml
+# State (SQLite DB, frames, generated cert, local token) lives under the state
+# dir; keep the app's defaults pointed there.
+Environment=TLM_PATHS__DATA_DIR=@STATE_DIR@
+Environment=TLM_DATABASE__URL=sqlite:///@STATE_DIR@/timelapse.db
+# Run Python with unbuffered stdio for parity with the container image (which
+# already sets this). The structured logger flushes each record itself, so this
+# does not affect log delivery to the journal; it only ensures any direct
+# stdout/stderr writes (tracebacks before logging is configured, child-process
+# output) appear live rather than sitting in a block buffer.
+Environment=PYTHONUNBUFFERED=1
+
+# Run the bundled self-contained executable in the foreground. `run` is the
+# foreground-serve entry point of the frozen bundle.
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=@INSTALL_DIR@/timelapse-manager run
+
+# Graceful restarts with backoff so a crash loop does not hammer the host.
+Restart=on-failure
+RestartSec=5s
+# If it fails more than 5 times within 60s, stop trying and surface the fault.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# --- Hardening -----------------------------------------------------------
+# Drop privileges and shrink the attack surface. ProtectSystem=strict makes the
+# whole filesystem read-only except the paths explicitly granted below.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Only these paths are writable under ProtectSystem=strict. Scope tightly to the
+# state and config dirs; everything else stays read-only.
+ReadWritePaths=@STATE_DIR@ @CONFIG_DIR@
+# Privileged ports (<1024) are not used by the defaults (8080/8443), so no
+# AmbientCapabilities=CAP_NET_BIND_SERVICE is granted. If you reconfigure the
+# listeners onto 80/443, add that capability here.
+
+[Install]
+WantedBy=multi-user.target

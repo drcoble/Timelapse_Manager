@@ -1,0 +1,61 @@
+/* --------------------------------------------------------------------------
+   Centered modal — used for contained actions (e.g. camera Discover) that
+   are not a create/detail flow. Distinct from the side drawer.
+   -------------------------------------------------------------------------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 299;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-mid);
+}
+.modal-backdrop.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Scroll-lock the page behind an open modal (set by modal.js). */
+body.modal-open {
+  overflow: hidden;
+}
+
+.discover-modal {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-2);
+  border-radius: var(--radius-xl);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+  z-index: 300;
+  transform: translateY(8px);
+  transition: transform var(--transition-mid);
+}
+.modal-backdrop.open .discover-modal {
+  transform: translateY(0);
+}
+
+.discover-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border-bottom: 1px solid var(--color-border);
+}
+.discover-modal-body {
+  padding: var(--sp-4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop,
+  .discover-modal {
+    transition: none;
+  }
+}

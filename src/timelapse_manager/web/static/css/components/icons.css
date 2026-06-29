@@ -1,0 +1,26 @@
+/* --------------------------------------------------------------------------
+   Icons — inline SVG sprite consumers (<svg class="icon"><use .../></svg>)
+   -------------------------------------------------------------------------- */
+
+/* The sprite itself: present in the DOM but takes no space and never paints. */
+.icon-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+/* Default icon: scales with the surrounding text; inherits currentColor. */
+.icon {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.125em;
+  flex: none;
+}
+
+/* Brand mark in the header badge box. */
+.header-logo-icon .icon {
+  width: 16px;
+  height: 16px;
+}

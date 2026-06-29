@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}New Project — Timelapse Manager{% endblock %}
+{% block page_title_short %}New Project{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">New Project</span>
+{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>New Project</h1>
+    <div class="subtitle">Configure a capture project and assign a camera.</div>
+  </div>
+</div>
+
+{% include '_partials/new_project_form.html' %}
+
+{% endblock %}

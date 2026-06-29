@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+
+{#
+  Operational event log — continuous scroll (GET /events; any authenticated
+  role). Audit/security records are excluded (admin-only /events/audit).
+  Context: events list[_EventView]; next_before int|None; filter_qs (encoded
+  active filters); selected_levels list; search_q str; scope str;
+  level_options tuple.
+#}
+
+{% block title %}Events — Timelapse Manager{% endblock %}
+{% block page_title_short %}Events{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Event Log</h1>
+    <div class="subtitle">Operational events across capture, render, and storage</div>
+  </div>
+</div>
+
+{% include '_partials/events_tabs.html' %}
+
+{# Filter bar — GET so filters are bookmarkable; submitting reloads the newest
+   matching batch. Changing any filter re-scopes the whole continuous stream.
+
+   Level is a multi-select chip group (all active = all levels shown). The chips
+   are the interactive control; events-nav.js keeps the hidden `level` input in
+   sync so the no-JS GET still carries the selection and re-queries the list. #}
+<form id="events-filter-form" method="get" action="/events" class="filter-bar"
+      role="search"
+      hx-get="/events" hx-target="#events-tbody" hx-swap="innerHTML"
+      hx-push-url="false">
+  <div class="form-group">
+    <span class="form-label" id="events-level-label">Level</span>
+    {# All chips pressed by default = all levels shown. The WARN chip maps to the
+       backend level value `warning`. events-nav.js collects the pressed chips
+       into the hidden `level` input on every toggle and re-queries the list. #}
+    <div class="chip-group" id="events-level-chips" role="group"
+         aria-labelledby="events-level-label">
+      {% for lv in level_options %}
+      <button type="button"
+              class="chip chip-level {{ lv }}"
+              data-level="{{ lv }}"
+              aria-pressed="{{ 'true' if ((not selected_levels) or (lv in selected_levels)) else 'false' }}">
+        {% if lv == 'warning' %}WARN{% else %}{{ lv | upper }}{% endif %}
+      </button>
+      {% endfor %}
+    </div>
+    {# Mirror of the pressed chips, kept in sync by events-nav.js so the form's
+       GET (and the no-JS fallback) carries the active levels. Empty = all. #}
+    <input type="hidden" name="level" id="events-level-input"
+           value="{{ selected_levels | join(',') }}">
+  </div>
+  <div class="form-group">
+    <label class="form-label" for="scope">Scope</label>
+    <select id="scope" name="scope" class="form-control">
+      <option value="" {% if not scope %}selected{% endif %}>All scopes</option>
+      <option value="system" {% if scope == 'system' %}selected{% endif %}>System</option>
+      <option value="camera" {% if scope == 'camera' %}selected{% endif %}>Camera</option>
+      <option value="project" {% if scope == 'project' %}selected{% endif %}>Project</option>
+    </select>
+  </div>
+  <div class="form-group" style="flex:1;min-width:12rem;">
+    <label class="form-label" for="q">Search</label>
+    <input id="q" name="q" type="search" class="form-control"
+           value="{{ search_q }}" placeholder="message contains…" autocomplete="off">
+  </div>
+  <button type="submit" class="btn btn-secondary">Filter</button>
+</form>
+
+{# Date/time jump — the accessible, no-JS jump path. A plain GET returns the full
+   page windowed at `at`; with JS the response is swapped into #events-tbody only.
+   The live chip selection is injected via hx-vals (js:) so the jump carries the
+   active levels without a duplicate hidden input in this form. #}
+<form id="events-jump" class="filter-bar"
+      hx-get="/events" hx-target="#events-tbody" hx-swap="innerHTML"
+      hx-push-url="false"
+      hx-vals='js:{level: window.eventsActiveLevels ? window.eventsActiveLevels() : ""}'
+      action="/events" method="get"
+      style="margin-bottom:var(--sp-4);display:flex;align-items:flex-end;gap:var(--sp-3);flex-wrap:wrap;">
+  {% if scope %}<input type="hidden" name="scope" value="{{ scope }}">{% endif %}
+  {% if search_q %}<input type="hidden" name="q" value="{{ search_q }}">{% endif %}
+  {# No-JS fallback: this hidden input carries the current levels for a plain GET;
+     with JS the hx-vals above overrides it with the live chip selection. #}
+  <input type="hidden" name="level" value="{{ selected_levels | join(',') }}">
+  <div>
+    <label class="form-label" for="events-jump-at">Jump to date &amp; time</label>
+    <input type="datetime-local" id="events-jump-at" name="at" class="form-control"
+           style="max-width:240px;">
+  </div>
+  <button type="submit" class="btn btn-secondary btn-sm">Go</button>
+</form>
+
+{# "N new events" pill — hidden until the poll detects events newer than the
+   list's newest id. role="status" announces the count once on a 0->N edge. The
+   active filters ride the poll URL (built in events-nav.js) so the count
+   reflects only matching new events. #}
+<div id="events-new-pill" class="frame-new-pill" role="status" aria-live="polite"
+     hidden>
+  <span class="frame-new-pill-count" data-new-count></span>
+  {# Refresh reloads the list from the newest event (a fresh first batch); the JS
+     resets the poll baseline from the new data-newest-id on afterSwap. #}
+  <button type="button" class="btn btn-xs btn-secondary" data-new-refresh
+          hx-get="/events/batch{% if filter_qs %}?{{ filter_qs }}{% endif %}"
+          hx-target="#events-tbody" hx-swap="innerHTML" hx-push-url="false">Refresh</button>
+</div>
+
+<div class="table-wrap">
+  <table class="data-table events-table">
+    <thead>
+      <tr>
+        <th>Time (UTC)</th>
+        <th>Level</th>
+        <th>Type</th>
+        <th>Scope</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody id="events-tbody">
+      {% if events %}
+        {% include '_partials/events_batch.html' %}
+      {% else %}
+        <tr>
+          <td colspan="5" class="empty-state-cell">No events match the current filter.</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+
+{# Polite live region: assistive tech hears each scroll-loaded batch append. #}
+<div id="events-load-status" role="status" aria-live="polite" class="visually-hidden"></div>
+
+{% endblock %}

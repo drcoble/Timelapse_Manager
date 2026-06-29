@@ -1,0 +1,50 @@
+{#
+  Partial: camera_geo_poll_result.html — inline result for the "Poll camera"
+  geolocation action.
+
+  Swapped into the camera form's #cam-{id}-geo-poll-result container by the
+  Poll camera button (hx-get="/cameras/{id}/geolocation").
+
+  Context:
+    fetched_lat — float | None   latitude reported by the camera
+    fetched_lon — float | None   longitude reported by the camera
+    error       — str | None     one of: "unreachable", "no_location"
+
+  The "Use these values" button fills the surrounding form's latitude /
+  longitude / geo_source inputs by name (this.closest('form').querySelector),
+  matching the pattern established by camera_detect_results.html. No camera id
+  or uid-scoped ids are needed here.
+#}
+{% if fetched_lat is not none and fetched_lon is not none %}
+  <div class="alert success" role="status"
+       style="display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;">
+    <span>
+      Camera reports:
+      <span class="mono">{{ fetched_lat }}, {{ fetched_lon }}</span>
+    </span>
+    <button type="button" class="btn btn-ghost"
+            data-lat="{{ fetched_lat }}"
+            data-lon="{{ fetched_lon }}"
+            onclick="(function(btn){
+              var form = btn.closest('form');
+              if (!form) { return; }
+              var lat = form.querySelector('[name=&quot;latitude&quot;]');
+              if (lat) { lat.value = btn.getAttribute('data-lat'); }
+              var lon = form.querySelector('[name=&quot;longitude&quot;]');
+              if (lon) { lon.value = btn.getAttribute('data-lon'); }
+              var src = form.querySelector('[name=&quot;geo_source&quot;]');
+              if (src) { src.value = 'camera'; }
+              btn.closest('.alert').remove();
+            })(this);">
+      Use these values
+    </button>
+  </div>
+{% elif error == 'unreachable' %}
+  <div class="alert error" role="status">
+    Could not reach this camera. Check the address and credentials.
+  </div>
+{% elif error == 'no_location' %}
+  <div class="alert info" role="status">
+    Camera did not report a location. Enter coordinates manually.
+  </div>
+{% endif %}

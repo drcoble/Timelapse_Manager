@@ -1,0 +1,62 @@
+# nfpm packaging spec — builds both .deb and .rpm from one declaration.
+#
+# Wraps the PyInstaller one-dir bundle produced by `release.sh` (under ./dist)
+# plus a concrete systemd unit (rendered by build-linux-packages.sh from the
+# tokenised packaging/systemd unit) into native Linux installers. nfpm is a
+# single static binary, so this works on any Linux build host without rpmbuild.
+#
+# Build with: packaging/build-linux-packages.sh
+# (VERSION and ARCH are read from the environment; see that script.)
+
+name: timelapse-manager
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+# TODO(owner): replace the maintainer placeholder with the public maintainer
+# identity before publishing packages. The email address will appear in the
+# .deb/.rpm package metadata and should be the address the project uses for
+# security/bug reports, not a private address.
+maintainer: Timelapse Manager maintainers <maintainer@REPLACE_ME>
+description: |
+  Connect to network IP cameras, capture stills at configurable intervals over
+  long durations, and assemble them into timelapse videos. Ships a self-contained
+  bundle (Python runtime + dependencies + pinned FFmpeg) and runs as a systemd
+  service.
+vendor: Timelapse Manager
+homepage: https://github.com/drcoble/Timelapse_Manager
+license: Apache-2.0
+
+# The frozen bundle installs under /opt; the unit + managed dirs are laid down
+# here and finished by the maintainer scripts (service user, migrations, enable).
+contents:
+  - src: ./dist/timelapse-manager-${VERSION}-linux-${ARCH}/
+    dst: /opt/timelapse-manager
+  - src: ./packaging/build/timelapse-manager.service
+    dst: /lib/systemd/system/timelapse-manager.service
+  - dst: /var/lib/timelapse-manager
+    type: dir
+    file_info:
+      mode: 0750
+      owner: timelapse
+      group: timelapse
+  - dst: /etc/timelapse-manager
+    type: dir
+    file_info:
+      mode: 0750
+      owner: timelapse
+      group: timelapse
+
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - adduser
+  rpm:
+    depends:
+      - shadow-utils

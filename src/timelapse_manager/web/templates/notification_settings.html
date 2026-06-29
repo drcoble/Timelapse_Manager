@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+
+{#
+  Notification settings — admin-only (the route is AdminUser-gated; a viewer is
+  403 before this renders). Context:
+    settings       — NotificationSettingsView (password is masked: "***" if set)
+    channels       — tuple of selectable channel names ("email", "webhook")
+    security_modes — tuple of SMTP security modes
+
+  Transport configuration changes take effect on the next restart; only the
+  routing rules are re-read live by the dispatcher.
+#}
+
+{% block title %}Notifications — Timelapse Manager{% endblock %}
+{% block page_title_short %}Notifications{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Notification Settings</h1>
+    <div class="subtitle">
+      Email &amp; webhook channels &middot; routing rules &middot;
+      transport changes apply on restart
+    </div>
+  </div>
+</div>
+
+<form method="post" action="/notification-settings" novalidate id="notification-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <!-- ===== ENABLED CHANNELS ===== -->
+  <section class="form-section">
+    <div class="form-section-title">Enabled channels</div>
+    <div class="form-stack">
+      {% for channel in channels %}
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">{{ channel | capitalize }}</div>
+          <div class="toggle-desc">
+            {% if channel == 'email' %}Deliver alerts over SMTP.{% else %}POST alerts to webhook URLs.{% endif %}
+          </div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" name="channel_{{ channel }}"
+                 {% if channel in settings.enabled_channels %}checked{% endif %}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <!-- ===== SMTP ===== -->
+  <section class="form-section">
+    <div class="form-section-title">SMTP (email)</div>
+    <div class="form-stack">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="smtp_server">Server</label>
+          <input type="text" id="smtp_server" name="smtp_server" class="form-control mono"
+                 placeholder="smtp.example.com"
+                 value="{{ settings.smtp_server }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="smtp_port">Port</label>
+          <input type="number" id="smtp_port" name="smtp_port" class="form-control mono"
+                 min="1" max="65535"
+                 value="{{ settings.smtp_port if settings.smtp_port is not none else '' }}">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="smtp_security">Security</label>
+        <select id="smtp_security" name="smtp_security" class="form-control">
+          {% for mode in security_modes %}
+          <option value="{{ mode }}" {% if settings.smtp_security == mode %}selected{% endif %}>
+            {{ mode | upper }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="smtp_username">Username</label>
+          <input type="text" id="smtp_username" name="smtp_username" class="form-control mono"
+                 autocomplete="off" value="{{ settings.smtp_username }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="smtp_password">Password</label>
+          <input type="password" id="smtp_password" name="smtp_password" class="form-control"
+                 autocomplete="new-password"
+                 value="{{ settings.smtp_password }}">
+          <span class="form-hint">
+            {% if settings.smtp_password_set %}
+              A password is stored (shown masked). Leave as
+              <span class="mono">***</span> to keep it; type a new value to change it.
+            {% else %}
+              No password stored. Leave blank for an unauthenticated relay.
+            {% endif %}
+          </span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="smtp_from_address">From address</label>
+        <input type="email" id="smtp_from_address" name="smtp_from_address"
+               class="form-control mono" placeholder="alerts@example.com"
+               value="{{ settings.smtp_from_address }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="smtp_recipients">Recipients (one per line)</label>
+        <textarea id="smtp_recipients" name="smtp_recipients" class="form-control mono"
+                  rows="3" placeholder="ops@example.com">{{ settings.smtp_recipients | join('\n') }}</textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== WEBHOOKS ===== -->
+  <section class="form-section">
+    <div class="form-section-title">Webhooks</div>
+    <div class="form-stack">
+      <div class="form-group">
+        <label class="form-label" for="webhook_urls">Webhook URLs (one per line)</label>
+        <textarea id="webhook_urls" name="webhook_urls" class="form-control mono"
+                  rows="3" placeholder="https://hooks.example.com/notify">{{ settings.webhook_urls | join('\n') }}</textarea>
+        <span class="form-hint">
+          Each URL receives a JSON POST. Credentials embedded in a URL are stored
+          as entered and never echoed in logs.
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== ROUTING RULES ===== -->
+  <section class="form-section">
+    <div class="form-section-title">Routing rules</div>
+    <div class="form-stack">
+      <div class="form-group">
+        <label class="form-label" for="routing_rules">Rules (JSON)</label>
+        <textarea id="routing_rules" name="routing_rules" class="form-control mono"
+                  rows="6">{{ settings.routing_rules | tojson(indent=2) }}</textarea>
+        <span class="form-hint">
+          A JSON array of rules. Each rule maps matching events to channels, e.g.
+          <span class="mono">{"event_types": ["render.failed"], "min_level": "error", "channels": ["email"]}</span>.
+          Routing rules are re-read live; no restart needed.
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-4);border-top:1px solid var(--color-border);">
+    <button type="submit" class="btn btn-primary">Save Notification Settings</button>
+    <a href="/" class="btn btn-ghost">Cancel</a>
+  </div>
+
+</form>
+
+{% endblock %}

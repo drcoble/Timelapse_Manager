@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Initial Setup — Timelapse Manager</title>
+  {# No-flash theme: apply the localStorage preference before the stylesheet. #}
+  <script>
+    (function () {
+      try {
+        var pref = localStorage.getItem('theme');
+        if (pref === 'light' || pref === 'dark') {
+          document.documentElement.setAttribute('data-theme', pref);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+{# First-run setup page has no app shell — runs before any user exists #}
+<body>
+
+<main class="login-page">
+  <div class="setup-card">
+
+    <div class="setup-header">
+      {# Meridian mark — see login.html. Inlined (no shell sprite pre-auth). #}
+      <div class="login-logo" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
+             stroke-width="1.5" stroke-linecap="round">
+          <line x1="8" y1="1.5" x2="8" y2="14.5"></line>
+          <line x1="1.5" y1="8" x2="14.5" y2="8"></line>
+          <circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"></circle>
+        </svg>
+      </div>
+      <h1>Timelapse Manager</h1>
+      <p style="color:var(--color-text-muted);font-size:0.875rem;margin-top:var(--sp-2);">
+        Create your administrator account to get started.
+      </p>
+      {% if app_version %}
+      <p class="login-version">Version {{ app_version }}</p>
+      {% endif %}
+    </div>
+
+    <div class="setup-body">
+
+      <div class="setup-notice" role="note">
+        This setup screen is shown once. After creating the admin account,
+        you can add additional users from Settings.
+      </div>
+
+      {% if errors %}
+      <div class="login-error" role="alert" style="margin-bottom:var(--sp-4);">
+        {% for err in errors %}
+        <div>{{ err }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <form method="post" action="/first-run" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <div class="form-stack">
+
+          <div class="form-group">
+            <label class="form-label" for="username">
+              Admin username<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="username"
+              type="text"
+              name="username"
+              class="form-control"
+              placeholder="admin"
+              autocomplete="username"
+              required
+              aria-required="true"
+              autofocus
+              value="{{ form_values.username | default('') }}"
+            >
+            <span class="form-hint">Choose a username for the administrator account.</span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="password">
+              Password<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="password"
+              type="password"
+              name="password"
+              class="form-control"
+              placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;"
+              autocomplete="new-password"
+              required
+              aria-required="true"
+              aria-describedby="password-hint"
+            >
+            <span class="password-hint" id="password-hint">
+              Minimum 12 characters recommended. Use a mix of letters, numbers, and symbols.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="password_confirm">
+              Confirm password<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="password_confirm"
+              type="password"
+              name="password_confirm"
+              class="form-control"
+              placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;"
+              autocomplete="new-password"
+              required
+              aria-required="true"
+            >
+          </div>
+
+          <button type="submit" class="btn btn-primary w-full" style="margin-top:var(--sp-2);">
+            Create Administrator Account
+          </button>
+
+        </div>
+      </form>
+
+    </div>{# /setup-body #}
+
+  </div>{# /setup-card #}
+</main>
+
+</body>
+</html>

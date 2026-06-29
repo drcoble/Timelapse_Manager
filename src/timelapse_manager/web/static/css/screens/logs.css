@@ -1,0 +1,41 @@
+
+/* --------------------------------------------------------------------------
+   Log List
+   -------------------------------------------------------------------------- */
+.log-list {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.log-entry {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: var(--sp-3);
+  align-items: baseline;
+  padding: 4px var(--sp-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.log-entry:last-child { border-bottom: none; }
+.log-entry:hover { background: var(--color-surface-2); }
+.log-time  { color: var(--color-text-dim); white-space: nowrap; }
+.log-level { font-weight: 700; white-space: nowrap; }
+.log-level.ok   { color: var(--color-running); }
+.log-level.warn { color: var(--color-paused); }
+.log-level.err  { color: var(--color-error); }
+.log-level.info { color: var(--color-info); }
+.log-msg   { color: var(--color-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Continuous-scroll event log: sentinel + end-cap are table rows. */
+.log-sentinel td,
+.log-end-cap td {
+  text-align: center;
+  padding: var(--sp-4);
+  color: var(--color-text-dim);
+  font-size: var(--text-sm);
+}
+.log-sentinel a {
+  color: var(--color-accent-text);
+}

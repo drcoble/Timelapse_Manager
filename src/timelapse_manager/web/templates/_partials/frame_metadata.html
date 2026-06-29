@@ -1,0 +1,61 @@
+{#
+  Partial: frame_metadata.html
+  Swapped into #frame-meta-panel by HTMX on GET /projects/{pid}/frames/{fid}/metadata.
+  Also rendered as a full frame-detail page when JS is absent (fallback link target).
+
+  Context:
+    frame          — {id, sequence_index, capture_timestamp_raw}
+    scene_groups   — list of {title: str, rows: list of {label: str, value: str}}
+    schema_version — int | None
+#}
+<div class="card">
+  <div class="card-header">
+    <div class="card-title">
+      Scene metadata &mdash; Frame #{{ frame.sequence_index }}
+      {% if frame.capture_timestamp_raw %}
+        <span style="font-weight:400;color:var(--color-text-dim);margin-left:var(--sp-3);">
+          {{ frame.capture_timestamp_raw | localdt }}
+        </span>
+      {% endif %}
+    </div>
+    {# Close button: clears the panel without a round-trip. Only meaningful in
+       the HTMX panel; the standalone frame-detail page has its own back link,
+       and the panel element it would target does not exist there. #}
+    {% if in_panel | default(true) %}
+    <button type="button"
+            class="btn btn-xs btn-ghost"
+            onclick="document.getElementById('frame-meta-panel').innerHTML=''"
+            aria-label="Close metadata panel"
+            title="Close">&#10005;</button>
+    {% endif %}
+  </div>
+
+  <div class="card-body">
+    {% if not scene_groups %}
+      <p style="margin:0;color:var(--color-text-dim);font-size:0.875rem;">
+        No scene metadata recorded for this frame.
+      </p>
+    {% else %}
+      {% for group in scene_groups %}
+        {# Group section header #}
+        <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--color-text-dim);margin-bottom:var(--sp-2);{% if not loop.first %}margin-top:var(--sp-5);{% endif %}">
+          {{ group.title }}
+        </div>
+        <dl class="info-grid" style="grid-template-columns:1fr;">
+          {% for row in group.rows %}
+            <div class="info-cell">
+              <dt class="info-label">{{ row.label }}</dt>
+              <dd class="info-value">{{ row.value }}</dd>
+            </div>
+          {% endfor %}
+        </dl>
+      {% endfor %}
+
+      {% if schema_version is not none %}
+        <div style="margin-top:var(--sp-5);font-size:0.7rem;color:var(--color-text-dim);">
+          schema v{{ schema_version }}
+        </div>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>

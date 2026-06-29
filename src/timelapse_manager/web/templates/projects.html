@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block title %}Projects — Timelapse Manager{% endblock %}
+{% block page_title_short %}Projects{% endblock %}
+
+{% block content %}
+
+{#
+  Compact projects management table. Columns:
+  Name · Camera · Status · Frames · Interval · Actions.
+  Active projects are listed in the main table; archived projects collapse into
+  a reduced-opacity disclosure below it. The Frames and Interval columns hide on
+  narrow screens (col-hide-mobile + a media query in screens/projects.css).
+#}
+
+{% set active_projects = projects | selectattr('lifecycle_state', 'ne', 'archived') | list %}
+{% set archived_projects = projects | selectattr('lifecycle_state', 'eq', 'archived') | list %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Projects</h1>
+    <div class="subtitle">
+      {{ projects | length }} project(s) total
+    </div>
+  </div>
+  {% if can_operate %}
+  <div class="page-actions">
+    <a href="/projects/new" class="btn btn-primary" data-drawer-open="#drawer-main" hx-get="/drawers/new-project" hx-target="#drawer-main .drawer-body" hx-swap="innerHTML" data-drawer-title="New Project">&#43; New Project</a>
+  </div>
+  {% endif %}
+</div>
+
+{% macro project_row(project) %}
+  <tr>
+    <td class="project-cell-name">
+      <a href="/projects/{{ project.id }}">{{ project.name }}</a>
+    </td>
+    <td class="project-cell-camera">{{ project.camera_name }}</td>
+    <td class="project-cell-status">
+      {% if project.operational_status == 'running' %}
+        <span class="status-badge running"><span class="status-dot running" aria-hidden="true"></span>Running</span>
+      {% elif project.operational_status == 'paused' %}
+        <span class="status-badge paused"><span class="status-dot paused" aria-hidden="true"></span>Paused</span>
+      {% elif project.operational_status == 'lowdisk' %}
+        <span class="status-badge lowdisk"><span class="status-dot lowdisk" aria-hidden="true"></span>Low Disk</span>
+      {% elif project.operational_status == 'error' %}
+        <span class="status-badge error"><span class="status-dot error" aria-hidden="true"></span>Error</span>
+      {% else %}
+        <span class="status-badge stopped"><span class="status-dot stopped" aria-hidden="true"></span>Stopped</span>
+      {% endif %}
+    </td>
+    <td class="project-cell-frames col-hide-mobile">{{ project.frame_count | default(0) }}</td>
+    <td class="project-cell-interval col-hide-mobile">
+      {% if project.capture_interval_seconds %}
+        {{ project.interval_value }} {{ project.interval_unit }}
+      {% else %}
+        &mdash;
+      {% endif %}
+    </td>
+    <td class="project-cell-actions">
+      <a href="/projects/{{ project.id }}" class="btn btn-ghost btn-sm">Open</a>
+    </td>
+  </tr>
+{% endmacro %}
+
+{% if projects %}
+  <table class="data-table projects-table">
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Camera</th>
+        <th scope="col">Status</th>
+        <th scope="col" class="col-hide-mobile">Frames</th>
+        <th scope="col" class="col-hide-mobile">Interval</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for project in active_projects %}
+        {{ project_row(project) }}
+      {% endfor %}
+      {% if not active_projects %}
+        <tr>
+          <td colspan="6" class="project-cell-empty">No active projects.</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  {% if archived_projects %}
+    <details class="projects-archived">
+      <summary>Archived projects ({{ archived_projects | length }})</summary>
+      <table class="data-table projects-table">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Camera</th>
+            <th scope="col">Status</th>
+            <th scope="col" class="col-hide-mobile">Frames</th>
+            <th scope="col" class="col-hide-mobile">Interval</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for project in archived_projects %}
+            {{ project_row(project) }}
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% endif %}
+
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon" aria-hidden="true">&#127909;</div>
+    <div class="empty-state-title">No projects yet</div>
+    <div class="empty-state-desc">
+      {% if can_operate %}
+        Add a camera first, then create a project to begin capturing.
+      {% else %}
+        No projects exist. Contact your administrator.
+      {% endif %}
+    </div>
+    {% if can_operate %}
+      <a href="/projects/new" class="btn btn-primary" data-drawer-open="#drawer-main" hx-get="/drawers/new-project" hx-target="#drawer-main .drawer-body" hx-swap="innerHTML" data-drawer-title="New Project">&#43; New Project</a>
+    {% endif %}
+  </div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,90 @@
+
+/* --------------------------------------------------------------------------
+   Buttons
+   -------------------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px 14px;
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+  line-height: 1.4;
+  text-decoration: none;
+  /* Minimum 44px touch target height for accessibility */
+  min-height: 36px;
+}
+.btn:hover { text-decoration: none; }
+
+.btn-primary {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  border-color: var(--color-accent);
+}
+.btn-primary:hover {
+  background: var(--color-accent-hover);
+  border-color: var(--color-accent-hover);
+  color: var(--color-on-accent);
+}
+
+.btn-secondary {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  border-color: var(--color-border-2);
+}
+.btn-secondary:hover { background: var(--color-surface-3); color: var(--color-text); }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-muted);
+  border-color: transparent;
+}
+.btn-ghost:hover { background: var(--color-surface-2); color: var(--color-text); }
+
+.btn-danger {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+.btn-danger:hover { background: var(--color-error); color: var(--color-on-accent); }
+
+.btn-success {
+  background: var(--color-running-bg);
+  color: var(--color-running);
+  border-color: var(--color-running);
+}
+.btn-success:hover { background: var(--color-running); color: var(--color-on-accent); }
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  min-height: 28px;
+}
+
+.btn-xs {
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  min-height: 24px;
+}
+
+.btn-icon {
+  padding: 6px;
+  width: 36px;
+  height: 36px;
+  justify-content: center;
+}
+
+.btn[disabled], .btn.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* Wide button — full width */
+.w-full { width: 100%; justify-content: center; }

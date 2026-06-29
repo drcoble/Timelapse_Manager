@@ -1,0 +1,35 @@
+{#
+  Escalation banner — the Gmail-style "you selected a span, do you want all of
+  it?" prompt shown after a drag-select on the timeline. It is rendered hidden as
+  a placeholder inside the scrubber panel; selection.js reveals and populates it
+  once a range descriptor has been counted.
+
+    [data-escalation-count]      — filled with "≈N frames in <range>"
+    [data-escalation-scope]      — the two escalation buttons (in_range / in_project)
+    [data-escalation-dismiss]    — clears the descriptor selection
+
+  Operator-gated: only operators/admins act on a selection, so a viewer never
+  sees the escalation affordance (it feeds a mutation they cannot perform).
+
+  Context: can_operate, project.
+#}
+{% if can_operate %}
+<div id="frames-escalation-banner" class="escalation-banner" role="status"
+     aria-live="polite" aria-label="Range selection" hidden>
+  <span class="escalation-banner-count" data-escalation-count></span>
+  <span class="escalation-banner-actions">
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-escalation-scope="in_range">
+      Select all in range
+    </button>
+    <button type="button" class="btn btn-sm btn-secondary"
+            data-escalation-scope="in_project"
+            data-escalation-label="this project">
+      Select all in project
+    </button>
+    <button type="button" class="btn btn-sm btn-ghost" data-escalation-dismiss>
+      Dismiss
+    </button>
+  </span>
+</div>
+{% endif %}

@@ -1,0 +1,134 @@
+{#
+  Meridian icon sprite — a hidden inline SVG of <symbol> definitions referenced
+  elsewhere via <svg class="icon"><use href="#icon-NAME"></use></svg>.
+  Geometric, instrument-panel style (ruled marks, arcs, brackets). 16x16 grid.
+  Stroked icons inherit currentColor; filled glyphs (play/pause/stop, dots) set
+  fill explicitly. Included once at the top of <body> so every page can <use> it.
+#}
+<svg class="icon-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    {# Brand: a meridian crossing — longitude line over horizon with the sun at its peak #}
+    <symbol id="icon-logo" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <line x1="8" y1="1.5" x2="8" y2="14.5"></line>
+      <line x1="1.5" y1="8" x2="14.5" y2="8"></line>
+      <circle cx="8" cy="8" r="1.8" fill="currentColor" stroke="none"></circle>
+    </symbol>
+
+    {# Capture running — clock face at the meridian moment #}
+    <symbol id="icon-capture" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <circle cx="8" cy="8.5" r="5.5"></circle>
+      <line x1="8" y1="0.5" x2="8" y2="2.5"></line>
+    </symbol>
+
+    {# Camera — a measured sensor plane with two mount tabs #}
+    <symbol id="icon-camera" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="5" width="12" height="8" rx="1"></rect>
+      <path d="M5 5 V3 H7 V5"></path>
+      <path d="M9 5 V3 H11 V5"></path>
+    </symbol>
+
+    {# Frame — a film frame flattened to ruled lines #}
+    <symbol id="icon-frame" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="3" width="12" height="10" rx="1"></rect>
+      <line x1="2" y1="6.5" x2="14" y2="6.5"></line>
+      <line x1="2" y1="9.5" x2="14" y2="9.5"></line>
+    </symbol>
+
+    {# Render — a compression stack, shortest bar on top #}
+    <symbol id="icon-render" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <line x1="5" y1="4" x2="11" y2="4"></line>
+      <line x1="3.5" y1="8" x2="12.5" y2="8"></line>
+      <line x1="2" y1="12" x2="14" y2="12"></line>
+    </symbol>
+
+    {# Events — a ruled log page, lines of differing length #}
+    <symbol id="icon-events" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <line x1="3" y1="4" x2="13" y2="4"></line>
+      <line x1="3" y1="8" x2="13" y2="8"></line>
+      <line x1="3" y1="12" x2="9" y2="12"></line>
+    </symbol>
+
+    {# Dashboard — a contact sheet (2x2) #}
+    <symbol id="icon-dashboard" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+      <rect x="2" y="2" width="5" height="5" rx="0.5"></rect>
+      <rect x="9" y="2" width="5" height="5" rx="0.5"></rect>
+      <rect x="2" y="9" width="5" height="5" rx="0.5"></rect>
+      <rect x="9" y="9" width="5" height="5" rx="0.5"></rect>
+    </symbol>
+
+    {# Users — head + shoulder arc #}
+    <symbol id="icon-users" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <circle cx="8" cy="5.5" r="3"></circle>
+      <path d="M2.5 14 a5.5 5.5 0 0 1 11 0"></path>
+    </symbol>
+
+    {# Settings — a compass rose of radial marks #}
+    <symbol id="icon-settings" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <line x1="11" y1="8" x2="14" y2="8"></line>
+      <line x1="9.5" y1="5.4" x2="11" y2="2.8"></line>
+      <line x1="6.5" y1="5.4" x2="5" y2="2.8"></line>
+      <line x1="5" y1="8" x2="2" y2="8"></line>
+      <line x1="6.5" y1="10.6" x2="5" y2="13.2"></line>
+      <line x1="9.5" y1="10.6" x2="11" y2="13.2"></line>
+      <circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none"></circle>
+    </symbol>
+
+    {# Alert — a ruled diamond #}
+    <symbol id="icon-alert" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">
+      <path d="M8 2 L14 8 L8 14 L2 8 Z"></path>
+      <line x1="5.5" y1="8" x2="10.5" y2="8"></line>
+    </symbol>
+
+    {# About — circle with an information bar #}
+    <symbol id="icon-about" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <circle cx="8" cy="8" r="6"></circle>
+      <line x1="8" y1="7.5" x2="8" y2="11.5"></line>
+      <circle cx="8" cy="4.6" r="0.7" fill="currentColor" stroke="none"></circle>
+    </symbol>
+
+    {# Archive — a bracket pair around a rule #}
+    <symbol id="icon-archive" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 3 H3 V13 H5"></path>
+      <path d="M11 3 H13 V13 H11"></path>
+      <line x1="6" y1="8" x2="10" y2="8"></line>
+    </symbol>
+
+    {# Play — solid right triangle #}
+    <symbol id="icon-play" viewBox="0 0 16 16">
+      <path d="M4 3 L13 8 L4 13 Z" fill="currentColor"></path>
+    </symbol>
+
+    {# Pause — two bars #}
+    <symbol id="icon-pause" viewBox="0 0 16 16">
+      <rect x="4" y="3" width="3" height="10" rx="0.5" fill="currentColor"></rect>
+      <rect x="9" y="3" width="3" height="10" rx="0.5" fill="currentColor"></rect>
+    </symbol>
+
+    {# Stop — solid square #}
+    <symbol id="icon-stop" viewBox="0 0 16 16">
+      <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"></rect>
+    </symbol>
+
+    {# Device-reported — concentric signal arcs from a node #}
+    <symbol id="icon-device" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+      <circle cx="3.5" cy="12.5" r="1" fill="currentColor" stroke="none"></circle>
+      <path d="M3.5 9.5 a3 3 0 0 1 3 3"></path>
+      <path d="M3.5 6.5 a6 6 0 0 1 6 6"></path>
+      <path d="M3.5 3.5 a9 9 0 0 1 9 9"></path>
+    </symbol>
+
+    {# Download — line into a base #}
+    <symbol id="icon-download" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="8" y1="2" x2="8" y2="10"></line>
+      <path d="M5 7.5 L8 10.5 L11 7.5"></path>
+      <line x1="3" y1="13.5" x2="13" y2="13.5"></line>
+    </symbol>
+
+    {# Query — a bracket and an arrow into it #}
+    <symbol id="icon-query" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 3 H2 V13 H4"></path>
+      <line x1="6" y1="8" x2="12" y2="8"></line>
+      <path d="M10 5.5 L12.5 8 L10 10.5"></path>
+    </symbol>
+  </defs>
+</svg>

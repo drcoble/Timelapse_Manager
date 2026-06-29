@@ -1,0 +1,115 @@
+{#
+  Partial: ptz_preset_select.html — the per-project PTZ preset / position picker.
+
+  Swapped into the project form's #ptz-preset-container when the camera
+  selection changes (hx-get="/cameras/ptz-presets"), and server-rendered on
+  the edit form's initial load so the saved selection shows preselected.
+
+  Context:
+    presets          — list of objects with .id and .label; empty when the
+                       camera exposes no presets or could not be reached.
+    presets_ok       — True when the camera was reached and its PTZ state was
+                       read successfully.
+    ptz_supported    — True when the camera reports PTZ capability at all.
+    selected_preset_id — the project's saved preset id to preselect, or None
+                       (only meaningful on the edit form's initial render).
+    ptz_pan          — float|None — saved pan position (degrees); may be 0.0.
+    ptz_tilt         — float|None — saved tilt position (degrees); may be 0.0.
+    ptz_zoom         — float|None — saved zoom level (camera units); may be 1.0.
+
+  Rendering rules:
+    Has PTZ + presets (ptz_supported and presets_ok and presets):
+      Show preset selector + advanced position details element.
+    Reachable, no PTZ (presets_ok and not ptz_supported):
+      Render nothing — non-PTZ cameras are the common case; no UI clutter.
+    Unreachable (not presets_ok):
+      Show a dim informational hint only; PTZ will be skipped.
+
+  No credentials are ever rendered here.
+#}
+{% if presets_ok and ptz_supported and presets %}
+
+  <div class="form-group">
+    <label class="form-label" for="ptz_preset_id">Camera position (PTZ)</label>
+    <select id="ptz_preset_id" name="ptz_preset_id" class="form-control"
+            aria-describedby="ptz-preset-hint">
+      <option value=""{% if not selected_preset_id %} selected{% endif %}>
+        — none / don't move —
+      </option>
+      {% for p in presets %}
+      <option value="{{ p.id }}"{% if p.id == selected_preset_id %} selected{% endif %}>
+        {{- p.label -}}
+      </option>
+      {% endfor %}
+    </select>
+    <span class="form-hint" id="ptz-preset-hint">
+      Move the camera to a saved preset before capture begins. Choose
+      &ldquo;none&rdquo; to leave the camera where it is.
+    </span>
+  </div>
+
+  <details style="margin-top:var(--sp-2);"
+    {% if ptz_pan is not none or ptz_tilt is not none or ptz_zoom is not none %}open{% endif %}>
+    <summary style="cursor:pointer;font-weight:600;">
+      Advanced &mdash; set an exact position
+    </summary>
+    <div class="form-stack" style="margin-top:var(--sp-3);">
+      <div class="form-row">
+
+        <div class="form-group">
+          <label class="form-label" for="ptz_pan">Pan</label>
+          <input
+            id="ptz_pan"
+            type="number"
+            name="ptz_pan"
+            class="form-control"
+            step="any"
+            placeholder="-180 to 180"
+            value="{{ ptz_pan if ptz_pan is not none else '' }}"
+            aria-describedby="ptz-advanced-hint"
+          >
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="ptz_tilt">Tilt</label>
+          <input
+            id="ptz_tilt"
+            type="number"
+            name="ptz_tilt"
+            class="form-control"
+            step="any"
+            placeholder="-90 to 90"
+            value="{{ ptz_tilt if ptz_tilt is not none else '' }}"
+          >
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="ptz_zoom">Zoom</label>
+          <input
+            id="ptz_zoom"
+            type="number"
+            name="ptz_zoom"
+            class="form-control"
+            step="any"
+            placeholder="1+"
+            value="{{ ptz_zoom if ptz_zoom is not none else '' }}"
+          >
+        </div>
+
+      </div>
+      <span class="form-hint" id="ptz-advanced-hint">
+        Pan/tilt in degrees; zoom in camera units. Leave blank to use the
+        preset position only. Ranges are camera-specific.
+      </span>
+    </div>
+  </details>
+
+{% elif not presets_ok %}
+
+  <span class="form-hint" style="color:var(--color-text-dim);">
+    Could not load PTZ presets &mdash; camera unreachable. Position controls
+    will be skipped.
+  </span>
+
+{% endif %}
+{# Reachable but no PTZ (presets_ok and not ptz_supported): render nothing. #}

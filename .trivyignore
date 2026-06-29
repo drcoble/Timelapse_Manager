@@ -1,0 +1,30 @@
+# Trivy vulnerability waivers for the Timelapse Manager runtime image.
+#
+# The release pipeline scans the built linux/amd64 image and FAILS the release
+# gate on any unresolved HIGH or CRITICAL finding. This file is the documented
+# waiver path: each entry suppresses one finding that has been reviewed and
+# judged not to apply (e.g. a false positive, or a CVE in a component the app
+# never exercises).
+#
+# Rules:
+#   * One CVE ID per line (e.g. CVE-2024-12345). Blank lines and #-comments are
+#     ignored by Trivy.
+#   * Every waiver MUST carry a comment: who reviewed it, the date, and WHY it
+#     does not apply. An unexplained waiver is treated as a review defect.
+#   * Prefer fixing (bump the base image / dependency) over waiving. Waivers are
+#     for findings with no available fix that are genuinely not reachable.
+#   * Re-review waivers at each release; remove any that a base-image bump has
+#     resolved so the list does not rot.
+#
+# Format example (keep entries below this line):
+#
+#   # CVE-2024-00000 -- <reviewer>, 2026-06-10. Affects <pkg> codepath X, which
+#   #   this image never invokes (no <feature>); no fixed version published.
+#   CVE-2024-00000
+#
+# The release gate runs with ignore-unfixed=true, so unfixable distro CVEs in the
+# slim base (perl-base, zlib1g, libsqlite3, ncurses, etc.) are tracked-not-blocked
+# without per-CVE entries here. This file is therefore reserved for the rare case
+# of a FIXABLE HIGH/CRITICAL that is a reviewed false positive.
+#
+# (No active waivers.)

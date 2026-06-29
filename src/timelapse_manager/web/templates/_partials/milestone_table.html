@@ -1,0 +1,138 @@
+{#
+  Partial: milestone_table.html — milestone list for the project Milestones tab.
+
+  Context:
+    milestones   — list of view objects with .id, .label, .position_frame_index
+                   (int|None), .position_timestamp (naive-UTC datetime|None).
+    project      — project view with .id.
+    can_operate  — bool; gates mutating controls.
+    csrf_token   — str.
+
+  Root element id="milestone-table" is the HTMX swap target shared by both
+  this fragment and milestone_form.html. Every mutation (create/edit/delete)
+  targets this element with hx-swap="outerHTML" so a success response (table)
+  and an error response (form, sharing the same root id) both land correctly.
+#}
+<div id="milestone-table">
+
+  {# ── Add form slot — holds the inline form when opened ─────────────────── #}
+  <div id="milestone-form-slot"></div>
+
+  {# ── Confirm slot — holds delete inline-confirm when opened ────────────── #}
+  {# hx-boost upgrades the plain <form> in inline_confirm.html to HTMX so the
+     delete POST returns the refreshed table fragment into #milestone-table.
+     Without this, the plain form POST would navigate away to the bare fragment.
+     The no-JS fallback (plain form POST) is harmless: the server returns the
+     table HTML which the browser renders as a page (no data loss). #}
+  <div id="milestone-confirm-slot"
+       hx-boost="true"
+       hx-target="#milestone-table"
+       hx-swap="outerHTML"></div>
+
+  {# ── Add milestone action (operator only) ──────────────────────────────── #}
+  {% if can_operate %}
+  <div style="margin-bottom:var(--sp-4);">
+    <button type="button" class="btn btn-primary btn-sm"
+            hx-get="/projects/{{ project.id }}/milestones/new"
+            hx-target="#milestone-form-slot"
+            hx-swap="innerHTML">
+      + Add Milestone
+    </button>
+  </div>
+  {% endif %}
+
+  {# ── Milestone list ─────────────────────────────────────────────────────── #}
+  {% if milestones %}
+  {# Grid columns: label | position | (actions if operator) #}
+  {% set _ms_cols = '1fr auto auto' if can_operate else '1fr auto' %}
+  <div class="data-table" role="table" aria-label="Milestones">
+    <div role="rowgroup">
+      <div role="row" style="display:contents;">
+        <div class="data-table-header" role="columnheader"
+             style="display:grid;grid-template-columns:{{ _ms_cols }};
+                    gap:var(--sp-4);padding:var(--sp-2) var(--sp-3);
+                    border-bottom:1px solid var(--color-border);
+                    font-size:var(--text-xs);text-transform:uppercase;
+                    color:var(--color-text-muted);font-weight:500;letter-spacing:0.04em;">
+          <span>Label</span>
+          <span>Position</span>
+          {% if can_operate %}<span></span>{% endif %}
+        </div>
+      </div>
+    </div>
+    <div role="rowgroup">
+      {% for ms in milestones %}
+      <div id="milestone-row-{{ ms.id }}" role="row"
+           style="display:grid;grid-template-columns:{{ _ms_cols }};
+                  gap:var(--sp-4);align-items:center;
+                  padding:var(--sp-3);
+                  border-bottom:1px solid var(--color-border);">
+
+        {# Label #}
+        <div role="cell" style="font-weight:500;">
+          {{ ms.label }}
+        </div>
+
+        {# Position — machine value in mono #}
+        <div role="cell">
+          {% if ms.position_frame_index is not none %}
+            <span class="mono" style="font-size:var(--text-sm);
+                  color:var(--color-text-muted);">frame {{ ms.position_frame_index }}</span>
+          {% elif ms.position_timestamp is not none %}
+            <span class="mono" style="font-size:var(--text-sm);
+                  color:var(--color-text-muted);">{{ ms.position_timestamp | localdt }}</span>
+          {% else %}
+            <span style="color:var(--color-text-dim);">&mdash;</span>
+          {% endif %}
+        </div>
+
+        {# Per-row actions (operator only) #}
+        {% if can_operate %}
+        <div role="cell" style="display:flex;gap:var(--sp-2);justify-content:flex-end;">
+          <button type="button" class="btn btn-ghost btn-xs"
+                  aria-label="Edit {{ ms.label }}"
+                  hx-get="/projects/{{ project.id }}/milestones/{{ ms.id }}/edit"
+                  hx-target="#milestone-form-slot"
+                  hx-swap="innerHTML">
+            &#9998;
+          </button>
+          <button type="button" class="btn btn-danger btn-xs"
+                  aria-label="Delete {{ ms.label }}"
+                  hx-get="/projects/{{ project.id }}/milestones/{{ ms.id }}/delete-confirm"
+                  hx-target="#milestone-confirm-slot"
+                  hx-swap="innerHTML">
+            &#128465;
+          </button>
+        </div>
+        {% endif %}
+
+      </div>{# /milestone-row #}
+      {% endfor %}
+    </div>
+  </div>{# /data-table #}
+
+  {% else %}
+
+  {# ── Empty state ────────────────────────────────────────────────────────── #}
+  <div class="empty-state" style="padding:var(--sp-8) 0;">
+    <div class="empty-state-icon" aria-hidden="true">&#9873;</div>
+    <div class="empty-state-title">No milestones yet</div>
+    <div class="empty-state-desc">
+      {% if can_operate %}
+        Add a milestone to mark a named position in the timeline. Milestones
+        become chapter markers in rendered videos.
+      {% else %}
+        No milestones have been placed on this project.
+      {% endif %}
+    </div>
+  </div>
+
+  {% endif %}
+
+  {# ── Quiet hint about automatic chapter markers ─────────────────────────── #}
+  <p class="form-hint" style="margin-top:var(--sp-4);">
+    Automatic weekly and monthly chapter markers are configured in the project&rsquo;s
+    render <strong>Settings</strong>. Chapter markers embed only in MP4 and MKV outputs.
+  </p>
+
+</div>{# /milestone-table #}

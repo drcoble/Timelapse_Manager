@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+
+{% block title %}Frames — {% if all_projects %}All Projects{% else %}{{ project.name }}{% endif %} — Timelapse Manager{% endblock %}
+{% block page_title_short %}Frames{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/projects" style="color:var(--color-text-muted);text-decoration:none;">Projects</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  {% if not all_projects %}
+  <a href="/projects/{{ project.id }}" style="color:var(--color-text-muted);text-decoration:none;">
+    {{ project.name }}
+  </a>
+  <span style="color:var(--color-text-dim);">/</span>
+  {% endif %}
+  <span class="ctx-current">Frames</span>
+{% endblock %}
+
+{% block content %}
+
+{# Base for the show-deleted toggle / filter links — carries project_id only when
+   a single project is selected (its absence is the "All Projects" mode). #}
+{% set scope_q = '' if all_projects else 'project_id=' ~ project.id %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Frame Browser</h1>
+    <div class="subtitle">{% if all_projects %}All Projects{% else %}{{ project.name }}{% endif %}</div>
+  </div>
+  {% if can_operate %}
+  <div class="page-actions">
+    {# Show/hide deleted frames toggle — preserves the project scope. #}
+    {% if request.query_params.get('show_deleted') %}
+      <a href="/frames{% if scope_q %}?{{ scope_q }}{% endif %}"
+         class="btn btn-secondary btn-sm">
+        Hide Deleted
+      </a>
+    {% else %}
+      <a href="/frames?{% if scope_q %}{{ scope_q }}&{% endif %}show_deleted=1"
+         class="btn btn-ghost btn-sm">
+        Show Deleted
+      </a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# Project filter — "All Projects" (global, id-keyset) or a single project
+   (sequence_index keyset). Changing it navigates to a fresh first page. No-JS:
+   it is a real GET form with a submit button. #}
+<form method="get" action="/frames" class="filter-bar"
+      style="margin-bottom:var(--sp-5);display:flex;align-items:center;gap:var(--sp-3);">
+  <label class="form-label" for="frame-project-select">Project</label>
+  <select id="frame-project-select" name="project_id" class="form-control"
+          style="max-width:260px;"
+          onchange="this.form.requestSubmit ? this.form.requestSubmit() : this.form.submit()">
+    <option value="" {% if all_projects %}selected{% endif %}>All Projects</option>
+    {% for p in projects %}
+    <option value="{{ p.id }}"
+      {% if not all_projects and p.id == project.id %}selected{% endif %}>{{ p.name }}</option>
+    {% endfor %}
+  </select>
+  {% if show_deleted %}<input type="hidden" name="show_deleted" value="1">{% endif %}
+  <noscript><button type="submit" class="btn btn-secondary btn-sm">Go</button></noscript>
+</form>
+
+{# Single-project navigation controls (date-jump + ribbon). The time axis needs
+   one project's sequence, so these are single-project only; All-Projects shows a
+   hint in their place. #}
+{% if not all_projects %}
+  {% include '_partials/frames_controls.html' %}
+{% else %}
+  <p class="frames-allprojects-hint">
+    Pick a project above to navigate by time, jump to capture gaps, or select
+    frames by time range. Selecting and editing individual frames works here too.
+  </p>
+{% endif %}
+
+{# Import frames — single-project + operator/admin only. A <details> inline
+   disclosure keeps the frame browser visible while the form is open, requires
+   no extra GET route, and degrades to a working plain <form> with JS off. The
+   result target (#frames-import-result) is a SIBLING so the form persists
+   across repeated imports and after the disclosure is collapsed. #}
+{% if not all_projects and can_operate %}
+<details class="frames-import-disclosure"
+         style="margin-bottom:var(--sp-5);">
+  <summary class="btn btn-secondary btn-sm"
+           style="display:inline-flex;align-items:center;gap:var(--sp-2);
+                  cursor:pointer;"
+           aria-label="Import frames into {{ project.name }}">
+    &#43; Import frames
+  </summary>
+  <div class="card"
+       style="margin-top:var(--sp-3);padding:var(--sp-4);">
+    {% include '_partials/frames_import_form.html' %}
+  </div>
+</details>
+{# Swap target: the import route returns a fragment whose root carries
+   id="frames-import-result", replacing this via outerHTML. Placed as a
+   sibling of <details> so it survives form swaps and disclosure toggles. #}
+<div id="frames-import-result"></div>
+{% endif %}
+
+{# Selection / bulk-action bar — hidden until a selection exists. #}
+{% include '_partials/frames_action_bar.html' %}
+
+{# Polite live region for selection/bulk-action announcements. Distinct from
+   #frame-load-status (owned by scroll-announce.js, rescanned on every swap):
+   selection.js writes the live count here so swap-driven scroll announcements
+   never clobber it. Always present so it is render-neutral and never re-created
+   by a grid swap. #}
+<div id="frame-action-status" role="status" aria-live="polite"
+     class="visually-hidden"></div>
+
+{# Frame grid — newest first; the sentinel in frames_batch.html appends older
+   frames (keyset cursor) as it scrolls into view. No-JS: the sentinel is a real
+   link that loads the next page. #}
+{% if frames %}
+  {# "N new frames" pill — hidden until the poll detects frames newer than the
+     grid's newest id. role="status" announces the count once on a 0->N edge. #}
+  <div id="frame-new-pill" class="frame-new-pill" role="status" aria-live="polite"
+       hidden
+       data-project-id="{{ '' if all_projects else project.id }}"
+       {% if show_deleted %}data-show-deleted="1"{% endif %}>
+    <span class="frame-new-pill-count" data-new-count></span>
+    {# Refresh reloads the grid from the newest frame (a fresh first batch) and
+       the JS resets the poll baseline from the new data-newest-* on afterSwap. #}
+    <button type="button" class="btn btn-xs btn-secondary" data-new-refresh
+            hx-get="/frames/batch{% if not all_projects %}?project_id={{ project.id }}{% endif %}{% if show_deleted %}{{ '&' if not all_projects else '?' }}show_deleted=1{% endif %}"
+            hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false">Refresh</button>
+  </div>
+  <div class="frame-grid" id="frame-grid" role="grid" aria-label="Captured frames"
+       data-density="comfortable">
+    {% include '_partials/frames_batch.html' %}
+  </div>
+  {# Polite live region: assistive tech hears each scroll-loaded batch append. #}
+  <div id="frame-load-status" role="status" aria-live="polite" class="visually-hidden"></div>
+{% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon" aria-hidden="true">&#128196;</div>
+    <div class="empty-state-title">No frames yet</div>
+    <div class="empty-state-desc">
+      {% if request.query_params.get('show_deleted') %}
+        No frames match the current filter (including deleted).
+      {% elif all_projects %}
+        No frames have been captured in any project yet.
+      {% else %}
+        No frames have been captured for this project yet.
+      {% endif %}
+    </div>
+  </div>
+{% endif %}
+
+{# Shared panel — HTMX-swapped frame scene metadata loads here on Info click #}
+<div id="frame-meta-panel"
+     role="complementary"
+     aria-label="Frame scene metadata"
+     aria-live="polite"
+     style="margin-top:var(--sp-6);"></div>
+
+{% endblock %}

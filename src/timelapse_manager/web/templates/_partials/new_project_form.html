@@ -1,0 +1,269 @@
+{# Create-project form body, shared by the full page (/projects/new) and the
+   right-side drawer (/drawers/new-project). Set ``in_drawer`` true to render the
+   Cancel control as a drawer-close button instead of a link.
+
+   When exactly one camera is capture-ready (has a protocol configured), it is
+   pre-selected so the common single-camera case needs no manual pick. #}
+{% if cameras %}
+
+  {% set _ready = cameras | selectattr('protocol') | list %}
+  {% set _sole = _ready[0].id if (_ready | length) == 1 else None %}
+
+  <div class="card" style="max-width:560px;">
+    <div class="card-body" style="padding:var(--sp-6);">
+
+      <form method="post" action="/projects" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <div class="form-stack">
+
+          <div class="form-group">
+            <label class="form-label" for="name">
+              Project name<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="name"
+              type="text"
+              name="name"
+              class="form-control"
+              placeholder="e.g. Rooftop Construction 2026"
+              required
+              aria-required="true"
+              autofocus
+            >
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="camera_id">
+              Camera<span class="required" aria-hidden="true">*</span>
+            </label>
+            <select
+              id="camera_id"
+              name="camera_id"
+              class="form-control"
+              required
+              aria-required="true"
+              hx-get="/cameras/stream-profiles"
+              hx-trigger="change"
+              hx-target="#stream-profile-container"
+              hx-swap="innerHTML"
+              hx-include="[name='camera_id']"
+            >
+              <option value="" disabled {% if not _sole %}selected{% endif %}>Select a camera&hellip;</option>
+              {% for camera in cameras %}
+              <option value="{{ camera.id }}"{% if camera.id == _sole %} selected{% endif %}>
+                {{- camera.name -}}
+                {%- if not camera.protocol %} (not capture-ready){% endif %}
+              </option>
+              {% endfor %}
+            </select>
+            <span class="form-hint">Only cameras with a configured protocol can capture frames.</span>
+          </div>
+
+          {# Stream-profile picker, loaded when a camera is chosen. #}
+          <div id="stream-profile-container" aria-live="polite"></div>
+
+          {# PTZ preset / position picker, loaded on camera change. #}
+          <div
+            id="ptz-preset-container"
+            aria-live="polite"
+            hx-get="/cameras/ptz-presets"
+            hx-trigger="change from:#camera_id"
+            hx-include="[name='camera_id']"
+            hx-swap="innerHTML"
+          ></div>
+
+          {# Capture mode: continuous interval vs. solar / scheduled-times only. #}
+          {% set _is_solar_mode = (capture_mode == 'solar') %}
+          <div class="form-group">
+            <span class="form-label" id="capture-mode-label">Capture mode</span>
+            <div role="radiogroup" aria-labelledby="capture-mode-label"
+                 style="display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-1);">
+              <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+                <input type="radio" name="capture_mode" value="interval"
+                       {% if not _is_solar_mode %}checked{% endif %}
+                       onchange="tlmCaptureModeChange(this);"
+                       style="accent-color:var(--color-accent);margin-top:3px;">
+                <span>
+                  <strong>Continuous (interval)</strong>
+                  <span class="form-hint" style="display:block;">Capture a frame every set interval during the active window.</span>
+                </span>
+              </label>
+              <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+                <input type="radio" name="capture_mode" value="solar"
+                       {% if _is_solar_mode %}checked{% endif %}
+                       onchange="tlmCaptureModeChange(this);"
+                       style="accent-color:var(--color-accent);margin-top:3px;">
+                <span>
+                  <strong>Solar / scheduled times only</strong>
+                  <span class="form-hint" style="display:block;">No continuous capture &mdash; capture only at the times set under <em>Exact-time captures</em> below (solar noon, sunrise, sunset, or exact clock times).</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group interval-only-field"{% if _is_solar_mode %} hidden{% endif %}>
+            <label class="form-label" id="interval-label" for="capture_interval_value">
+              Capture interval<span class="required" aria-hidden="true">*</span>
+            </label>
+            <div class="input-group" role="group" aria-labelledby="interval-label">
+              <input
+                id="capture_interval_value"
+                type="number"
+                name="capture_interval_value"
+                class="form-control"
+                min="1"
+                step="1"
+                placeholder="5"
+                required
+                aria-required="true"
+                aria-describedby="interval-hint"
+                {% if _is_solar_mode %}disabled{% endif %}
+              >
+              <select
+                id="capture_interval_unit"
+                name="capture_interval_unit"
+                class="form-control"
+                aria-label="Interval unit"
+              >
+                <option value="seconds">seconds</option>
+                <option value="minutes" selected>minutes</option>
+                <option value="hours">hours</option>
+                <option value="days">days</option>
+                <option value="weeks">weeks</option>
+                <option value="months">months</option>
+              </select>
+            </div>
+            <div class="chip-group"
+                 data-chip-target="#capture_interval_value"
+                 data-chip-unit-target="#capture_interval_unit"
+                 style="margin-top:var(--sp-2);">
+              <button type="button" class="chip" data-value="30" data-unit="seconds">30s</button>
+              <button type="button" class="chip" data-value="1" data-unit="minutes">1m</button>
+              <button type="button" class="chip" data-value="5" data-unit="minutes">5m</button>
+              <button type="button" class="chip" data-value="10" data-unit="minutes">10m</button>
+              <button type="button" class="chip" data-value="1" data-unit="hours">1h</button>
+            </div>
+            <span class="form-hint" id="interval-hint">How often to capture a frame. Minimum 1 second.</span>
+            {# Storage pre-flight — lazy estimate of growth vs free disk #}
+            <div id="preflight-container"
+                 hx-get="/projects/preflight"
+                 hx-trigger="change from:#capture_interval_value delay:300ms, change from:#capture_interval_unit"
+                 hx-include="#capture_interval_value, #capture_interval_unit"
+                 hx-swap="innerHTML"></div>
+          </div>
+
+          {# Capture schedule — window, days, timezone, presets. Only gates
+             interval capture, so it is hidden in solar / scheduled-times mode. #}
+          <div class="interval-only-field"{% if _is_solar_mode %} hidden{% endif %}>
+            {% include "_partials/capture_schedule_fields.html" %}
+          </div>
+
+          {# Exact-time captures — once-per-day single-shot anchors. In solar mode
+             these ARE the capture times; in interval mode they are optional. #}
+          {% include "_partials/_exact_time_fieldset.html" %}
+
+          {# Campaign bounds (optional) — kept last because it is optional; most
+             projects leave it open-ended. #}
+          <fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+            <legend style="padding:0 var(--sp-2);font-weight:600;">Campaign bounds (optional)</legend>
+            <p class="form-hint" style="margin-top:0;">
+              These bound the campaign as a whole and are separate from any daily
+              capture-window schedule. Leave blank for an open-ended campaign.
+              Dates are interpreted as UTC.
+            </p>
+
+            <div class="form-group">
+              <label class="form-label" for="start_date">Start date</label>
+              <input id="start_date" type="datetime-local" name="start_date"
+                     class="form-control" aria-describedby="start-date-hint">
+              <span class="form-hint" id="start-date-hint">Capture does not run before this instant. Leave blank to start immediately.</span>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="end_date">End date</label>
+              <input id="end_date" type="datetime-local" name="end_date"
+                     class="form-control" aria-describedby="end-date-hint">
+              <span class="form-hint" id="end-date-hint">At this instant capture stops and the project is archived. Must be after the start date.</span>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="max_frame_count">Maximum frames</label>
+              <input id="max_frame_count" type="number" name="max_frame_count"
+                     class="form-control" style="max-width:160px;" min="1" step="1"
+                     placeholder="e.g. 5000" aria-describedby="max-frames-hint">
+              <span class="form-hint" id="max-frames-hint">Capture stops once this many frames have been captured, then the project is archived. Leave blank for no cap.</span>
+            </div>
+          </fieldset>
+
+          <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-2);">
+            <button type="submit" class="btn btn-primary">Create Project</button>
+            {% if in_drawer %}
+            <button type="button" class="btn btn-ghost" data-drawer-close>Cancel</button>
+            {% else %}
+            <a href="/projects" class="btn btn-ghost">Cancel</a>
+            {% endif %}
+          </div>
+
+        </div>
+
+        {# Capture-mode toggle: show/hide interval + schedule-window fields vs the
+           solar/exact-time anchors, and disable the (required) interval input
+           when hidden so it neither validates nor submits in solar mode. #}
+        <script>
+        (function () {
+          function tlmCaptureModeSync() {
+            var checked = document.querySelector('input[name="capture_mode"]:checked');
+            var solar = !!(checked && checked.value === 'solar');
+            document.querySelectorAll('.interval-only-field').forEach(function (el) {
+              el.hidden = solar;
+            });
+            var intervalInput = document.getElementById('capture_interval_value');
+            if (intervalInput) { intervalInput.disabled = solar; }
+            var unit = document.getElementById('capture_interval_unit');
+            if (unit) { unit.disabled = solar; }
+          }
+          function tlmCaptureModeChange() {
+            tlmCaptureModeSync();
+            var checked = document.querySelector('input[name="capture_mode"]:checked');
+            if (checked && checked.value === 'solar') {
+              var rows = document.querySelectorAll('#exact-time-rows .exact-time-row');
+              if (rows.length === 0 && typeof window.tlmExactTimeAddRow === 'function') {
+                window.tlmExactTimeAddRow();
+                var added = document.querySelectorAll('#exact-time-rows .exact-time-row');
+                var newRow = added[added.length - 1];
+                var kind = newRow && newRow.querySelector('select[name="anchor_kind"]');
+                var solarOpt = kind && kind.querySelector('option[value="solar_noon"]');
+                if (kind && solarOpt && !solarOpt.disabled) {
+                  kind.value = 'solar_noon';
+                  if (typeof window.tlmExactTimeKindChange === 'function') {
+                    window.tlmExactTimeKindChange(kind);
+                  }
+                }
+              }
+            }
+          }
+          window.tlmCaptureModeChange = tlmCaptureModeChange;
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', tlmCaptureModeSync);
+          }
+          tlmCaptureModeSync();
+        }());
+        </script>
+      </form>
+
+    </div>{# /card-body #}
+  </div>{# /card #}
+
+{% else %}
+
+  <div class="empty-state">
+    <div class="empty-state-icon" aria-hidden="true">&#128247;</div>
+    <div class="empty-state-title">No cameras available</div>
+    <div class="empty-state-desc">
+      Add a camera first, then create a project to begin capturing.
+    </div>
+    <a href="/cameras" class="btn btn-primary">&#43; Add a Camera</a>
+  </div>
+
+{% endif %}

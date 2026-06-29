@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: lint + typecheck + test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # A wedged xdist worker must fail fast and visibly rather than hang on the
+    # platform default (~6h). Normal runtime is ~5 min.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        # Tests and the encoder path expect FFmpeg to be available.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ffmpeg
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.11"
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies (from lockfile)
+        run: uv sync --frozen --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      - name: Type-check
+        run: uv run mypy src
+
+      - name: Test
+        # Run the suite in parallel across all runner cores (pytest-xdist).
+        # The suite is isolated per test (unique tmp_path, per-test singleton
+        # resets, ephemeral ports), so workers do not contend for shared state.
+        # The ``ui`` marker is excluded here: browser tests run in the separate
+        # ``browser-e2e`` job below which installs Playwright first.
+        #
+        # ``--reruns`` retries a test that fails once, matching the browser-e2e
+        # job. The full suite passes deterministically at higher worker counts;
+        # a rare failure here is a worker-distribution timing flake, not a real
+        # break (a genuinely broken test fails its reruns too).
+        run: uv run pytest -n auto -m "not ui" --reruns 2 --reruns-delay 1
+
+  browser-e2e:
+    name: browser E2E (Playwright / Chromium)
+    runs-on: ubuntu-latest
+    # Run on main-branch pushes and on PRs; kept separate from the matrix so a
+    # browser-install failure never blocks the unit/integration results.
+    # Normal runtime ~8-10 min incl. the Chromium install + --reruns.
+    timeout-minutes: 20
+    needs: quality
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        # The app lifespan calls resolve_ffmpeg_binary at startup; FFmpeg must
+        # be on PATH for the E2E server subprocess to boot successfully.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ffmpeg
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.11"
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies (from lockfile)
+        run: uv sync --frozen --python 3.11
+
+      - name: Install Playwright browser (Chromium)
+        # Installs only the Chromium browser + its OS-level dependencies.
+        # Kept separate from the main matrix so a download failure does not
+        # break unit/integration CI.
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run browser E2E tests
+        # Browser E2E is inherently timing-sensitive on a shared/loaded runner
+        # (each test boots its own live server + browser context). Auto-rerun a
+        # transient flake up to twice; a genuine failure still fails all
+        # attempts. Keeps the gate honest without per-flake babysitting.
+        # --timeout kills (and names) any single test that hangs past 180s, so a
+        # wedged browser/page never stalls the whole job indefinitely -- the Gitea
+        # Actions runner does not enforce the job-level timeout-minutes above.
+        run: >-
+          uv run pytest -m ui -v --no-header --reruns 2 --reruns-delay 5
+          --timeout 180 --timeout-method thread

@@ -1,0 +1,423 @@
+{# Exact-time captures fieldset — shared partial.
+   Include this inside an existing <form>; it must not contain a <form> tag.
+
+   Context vars consumed:
+     current_anchors       : list[dict] — each dict has keys:
+                               id (int|str), kind (str: "clock"|"solar_noon"),
+                               time (str "HH:MM" or ""), offset_minutes (int),
+                               enabled (bool).
+                             Pass [] or omit for a new project (renders empty
+                             state with an "Add" button).
+     camera_has_geolocation: bool — when False, the solar_noon option in the
+                             kind <select> is disabled and an inline note is
+                             shown. When True it is fully selectable.
+
+   Field-name contract (one set per row, lists are aligned by index):
+     exact_time_present     — ONE hidden marker emitted when the fieldset renders.
+     anchor_id[]            — hidden; stable DB id for existing rows, blank for new.
+     anchor_kind[]          — select: "clock" | "solar_noon"
+     anchor_time[]          — "HH:MM" text input; blank when kind = solar_noon
+                              but always present so lists stay index-aligned.
+     anchor_offset[]        — optional signed integer minutes; blank = 0.
+     anchor_enabled[]       — checkbox whose value is anchor_id for existing rows
+                              or "new:<zero-based-index>" for new rows.
+
+   All fields always POST regardless of visibility.
+   The backend uses exact_time_present to distinguish "fieldset absent" from
+   "fieldset present but empty".
+
+   Inline-script pattern mirrors capture_schedule_fields.html: a hidden
+   <template> row is cloned by tlmExactTimeAddRow(); kind reveal is handled by
+   tlmExactTimeKindChange(). Both are exposed on window so inline onchange=/
+   onclick= handlers can reach them.
+#}
+
+{# Presence marker — emitted once whenever this partial renders. #}
+<input type="hidden" name="exact_time_present" value="1">
+
+<fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+  <legend style="padding:0 var(--sp-2);font-weight:600;">Exact-time captures</legend>
+  <p class="form-hint" style="margin-top:0;margin-bottom:var(--sp-3);">
+    Once-per-day single-shot captures at a specific clock time or solar noon.
+    These fire regardless of the capture-window schedule.
+  </p>
+
+  {# Solar-noon notice when the camera has no geolocation configured. #}
+  {% if not camera_has_geolocation %}
+  <div class="alert alert-warning" role="alert"
+       style="margin-bottom:var(--sp-3);padding:var(--sp-2) var(--sp-3);
+              background:var(--color-warning-bg);
+              border:1px solid var(--color-warning);
+              border-radius:var(--radius-md);">
+    <svg class="icon" aria-hidden="true" style="vertical-align:-2px;margin-right:var(--sp-1);">
+      <use href="#icon-warning"></use>
+    </svg>
+    <span style="color:var(--color-warning);">Solar noon</span>
+    <span style="color:var(--color-text);"> requires the camera&rsquo;s location to be set.
+    Configure latitude &amp; longitude under <em>Cameras</em> to enable it.</span>
+  </div>
+  {% endif %}
+
+  {# Coordinate verification + upcoming solar capture time, in the camera's own
+     local timezone. Rendered server-side on load and refreshed live via HTMX as
+     solar rows change (see the hx-* attributes on #exact-time-rows below). #}
+  {% include "_partials/_solar_preview.html" %}
+
+  {# ── Row list ─────────────────────────────────────────────────────────────── #}
+  <div id="exact-time-rows" aria-label="Exact-time capture list"
+       {% if project and project.id %}
+       hx-get="/projects/{{ project.id }}/solar-preview"
+       hx-trigger="change delay:300ms, keyup changed delay:500ms"
+       hx-include="closest fieldset"
+       hx-target="#solar-preview"
+       hx-swap="outerHTML"
+       {% endif %}>
+
+    {% if current_anchors %}
+      {% for anchor in current_anchors %}
+        {# Determine row index (zero-based) for new-row checkbox values. #}
+        {% set _loop_idx = loop.index0 %}
+        {% set _kind     = anchor.get('kind', 'clock') %}
+        {% set _id       = anchor.get('id', '') %}
+        {% set _time     = anchor.get('time', '') %}
+        {% set _offset   = anchor.get('offset_minutes', 0) %}
+        {% set _enabled  = anchor.get('enabled', True) %}
+        {# For existing rows the checkbox value is the row id; for new rows it
+           would be "new:<idx>" — here all are existing rows so use the id. #}
+        {% set _chk_val  = _id | string %}
+        {% set _row_uid  = 'anchor-row-' ~ _loop_idx %}
+
+        <div class="form-row exact-time-row"
+             style="align-items:flex-start;gap:var(--sp-3);
+                    padding:var(--sp-3) 0;
+                    border-top:1px solid var(--color-border);"
+             id="{{ _row_uid }}">
+
+          {# Hidden id field (blank for new rows) #}
+          <input type="hidden" name="anchor_id" value="{{ _id }}">
+
+          {# Kind select #}
+          <div class="form-group" style="flex:0 0 auto;min-width:160px;">
+            <label class="form-label"
+                   for="{{ _row_uid }}-kind"
+                   style="font-size:var(--text-sm);">Type</label>
+            <select id="{{ _row_uid }}-kind"
+                    name="anchor_kind"
+                    class="form-control"
+                    onchange="tlmExactTimeKindChange(this);"
+                    {% if not camera_has_geolocation %}aria-describedby="{{ _row_uid }}-kind-desc"{% endif %}>
+              <option value="clock"
+                      {% if _kind == 'clock' %}selected{% endif %}>Clock time</option>
+              <option value="solar_noon"
+                      {% if _kind == 'solar_noon' %}selected{% endif %}
+                      {% if not camera_has_geolocation %}disabled{% endif %}>Solar noon</option>
+              <option value="sunrise"
+                      {% if _kind == 'sunrise' %}selected{% endif %}
+                      {% if not camera_has_geolocation %}disabled{% endif %}>Sunrise</option>
+              <option value="sunset"
+                      {% if _kind == 'sunset' %}selected{% endif %}
+                      {% if not camera_has_geolocation %}disabled{% endif %}>Sunset</option>
+            </select>
+            {% if not camera_has_geolocation %}
+            <span class="form-hint" id="{{ _row_uid }}-kind-desc"
+                  style="font-size:var(--text-xs);color:var(--color-text-dim);">
+              Set camera location to enable solar noon.
+            </span>
+            {% endif %}
+          </div>
+
+          {# Time input — hidden (but always present in DOM and always POSTs)
+             when kind = solar_noon, per the contract. #}
+          <div class="form-group" style="flex:0 0 auto;min-width:120px;"
+               data-time-group
+               id="{{ _row_uid }}-time-group"
+               {% if _kind == 'solar_noon' %}hidden{% endif %}>
+            <label class="form-label"
+                   for="{{ _row_uid }}-time"
+                   style="font-size:var(--text-sm);">Time (HH:MM)</label>
+            <input type="text"
+                   id="{{ _row_uid }}-time"
+                   name="anchor_time"
+                   class="form-control mono"
+                   pattern="[0-2][0-9]:[0-5][0-9]"
+                   placeholder="HH:MM"
+                   style="max-width:100px;"
+                   value="{{ _time if _kind == 'clock' else '' }}"
+                   autocomplete="off"
+                   aria-describedby="{{ _row_uid }}-time-hint">
+            <span class="form-hint" id="{{ _row_uid }}-time-hint"
+                  style="font-size:var(--text-xs);">24-hour format</span>
+          </div>
+          {# When kind=solar_noon the time-group div carries [hidden] so the
+             field is not visible, but the input still POSTs a blank value
+             (the HTML hidden attribute on a container does not suppress child
+             inputs — only disabled does). This keeps lists aligned. #}
+
+          {# Offset input #}
+          <div class="form-group" style="flex:0 0 auto;min-width:140px;">
+            <label class="form-label"
+                   for="{{ _row_uid }}-offset"
+                   style="font-size:var(--text-sm);">Offset (min)</label>
+            <input type="number"
+                   id="{{ _row_uid }}-offset"
+                   name="anchor_offset"
+                   class="form-control mono"
+                   style="max-width:100px;"
+                   step="1"
+                   placeholder="0"
+                   value="{{ _offset if _offset else '' }}"
+                   aria-describedby="{{ _row_uid }}-offset-hint">
+            <span class="form-hint" id="{{ _row_uid }}-offset-hint"
+                  style="font-size:var(--text-xs);">
+              &plusmn; minutes from the anchor. Blank = 0.
+            </span>
+          </div>
+
+          {# Enabled checkbox #}
+          <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+            <label style="display:flex;align-items:center;gap:var(--sp-1);
+                          cursor:pointer;font-size:var(--text-sm);">
+              <input type="checkbox"
+                     name="anchor_enabled"
+                     value="{{ _chk_val }}"
+                     {% if _enabled %}checked{% endif %}
+                     style="accent-color:var(--color-accent);width:15px;height:15px;">
+              Enabled
+            </label>
+          </div>
+
+          {# Remove row button #}
+          <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+            <button type="button"
+                    class="btn btn-ghost btn-sm"
+                    aria-label="Remove this capture time"
+                    onclick="tlmExactTimeRemoveRow(this);">
+              &times; Remove
+            </button>
+          </div>
+
+        </div>{# /exact-time-row #}
+      {% endfor %}
+
+    {% else %}
+      {# Empty state — shown when no anchors are configured yet. #}
+      <p id="exact-time-empty-state"
+         class="form-hint"
+         style="color:var(--color-text-dim);font-style:italic;
+                padding:var(--sp-3) 0;margin:0;">
+        No exact-time captures configured. Click &ldquo;Add capture time&rdquo; to add one.
+      </p>
+    {% endif %}
+
+  </div>{# /exact-time-rows #}
+
+  {# Add row button #}
+  <div style="margin-top:var(--sp-3);">
+    <button type="button"
+            class="btn btn-secondary btn-sm"
+            onclick="tlmExactTimeAddRow();">
+      &#43; Add capture time
+    </button>
+  </div>
+
+</fieldset>
+
+{# ── Hidden template row — cloned by tlmExactTimeAddRow() ───────────────────
+   All name attributes are present so the server receives them in the POST.
+   anchor_id is blank (new row). anchor_enabled value uses "new:<idx>" pattern.
+   The template element is inert and never submitted itself. #}
+<template id="exact-time-row-template">
+  <div class="form-row exact-time-row"
+       style="align-items:flex-start;gap:var(--sp-3);
+              padding:var(--sp-3) 0;
+              border-top:1px solid var(--color-border);">
+
+    {# Blank id for new rows #}
+    <input type="hidden" name="anchor_id" value="">
+
+    {# Kind select #}
+    <div class="form-group" style="flex:0 0 auto;min-width:160px;">
+      <label class="form-label"
+             style="font-size:var(--text-sm);">Type</label>
+      <select name="anchor_kind"
+              class="form-control"
+              onchange="tlmExactTimeKindChange(this);"
+              aria-label="Capture type">
+        <option value="clock" selected>Clock time</option>
+        <option value="solar_noon"
+                {% if not camera_has_geolocation %}disabled{% endif %}>Solar noon</option>
+        <option value="sunrise"
+                {% if not camera_has_geolocation %}disabled{% endif %}>Sunrise</option>
+        <option value="sunset"
+                {% if not camera_has_geolocation %}disabled{% endif %}>Sunset</option>
+      </select>
+    </div>
+
+    {# Time input group — visible by default (kind starts as clock) #}
+    <div class="form-group" style="flex:0 0 auto;min-width:120px;" data-time-group>
+      <label class="form-label"
+             style="font-size:var(--text-sm);">Time (HH:MM)</label>
+      <input type="text"
+             name="anchor_time"
+             class="form-control mono"
+             pattern="[0-2][0-9]:[0-5][0-9]"
+             placeholder="HH:MM"
+             style="max-width:100px;"
+             value=""
+             autocomplete="off">
+      <span class="form-hint" style="font-size:var(--text-xs);">24-hour format</span>
+    </div>
+
+    {# Offset input #}
+    <div class="form-group" style="flex:0 0 auto;min-width:140px;">
+      <label class="form-label"
+             style="font-size:var(--text-sm);">Offset (min)</label>
+      <input type="number"
+             name="anchor_offset"
+             class="form-control mono"
+             style="max-width:100px;"
+             step="1"
+             placeholder="0"
+             value="">
+      <span class="form-hint" style="font-size:var(--text-xs);">&plusmn; minutes from the anchor. Blank = 0.</span>
+    </div>
+
+    {# Enabled checkbox — value set by JS to "new:<index>" at clone time #}
+    <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+      <label style="display:flex;align-items:center;gap:var(--sp-1);
+                    cursor:pointer;font-size:var(--text-sm);">
+        <input type="checkbox"
+               name="anchor_enabled"
+               value=""
+               checked
+               style="accent-color:var(--color-accent);width:15px;height:15px;">
+        Enabled
+      </label>
+    </div>
+
+    {# Remove button #}
+    <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+      <button type="button"
+              class="btn btn-ghost btn-sm"
+              aria-label="Remove this capture time"
+              onclick="tlmExactTimeRemoveRow(this);">
+        &times; Remove
+      </button>
+    </div>
+
+  </div>
+</template>
+
+{# ── Inline controller ────────────────────────────────────────────────────────
+   Mirrors the inline-script pattern in capture_schedule_fields.html:
+   functions exposed on window so inline onchange=/onclick= can reach them.
+
+   tlmExactTimeAddRow():
+     - Counts existing .exact-time-row elements to build the "new:<idx>" value.
+     - Clones #exact-time-row-template, stamps the checkbox value, appends
+       to #exact-time-rows, and hides the empty-state paragraph.
+     - Assigns unique id/for pairs to all labelled inputs in the new row.
+
+   tlmExactTimeKindChange(selectEl):
+     - Finds the sibling time-input <div> and toggles its [hidden] attribute.
+     - When kind = solar_noon, clears anchor_time to "" so it POSTs blank
+       (keeping lists aligned). When switching back to clock, the field is
+       unhidden but left blank for the user to fill.
+
+   tlmExactTimeRemoveRow(buttonEl):
+     - Removes the nearest .exact-time-row ancestor.
+     - Renumbers all remaining new-row checkbox values ("new:0", "new:1", …)
+       to keep them contiguous.
+     - Shows the empty-state paragraph if no rows remain.
+#}
+<script>
+(function () {
+
+  /* ── Kind reveal ─────────────────────────────────────────────────────── */
+  function tlmExactTimeKindChange(selectEl) {
+    var row       = selectEl.closest('.exact-time-row');
+    if (!row) return;
+    var timeGroup = row.querySelector('[data-time-group]');
+    var timeInput = row.querySelector('input[name="anchor_time"]');
+    if (!timeGroup || !timeInput) return;
+    var isSolar = (selectEl.value === 'solar_noon'
+                   || selectEl.value === 'sunrise'
+                   || selectEl.value === 'sunset');
+    timeGroup.hidden = isSolar;
+    if (isSolar) { timeInput.value = ''; }
+  }
+
+  /* ── Add row ─────────────────────────────────────────────────────────── */
+  function tlmExactTimeAddRow() {
+    var container = document.getElementById('exact-time-rows');
+    var template  = document.getElementById('exact-time-row-template');
+    var emptyMsg  = document.getElementById('exact-time-empty-state');
+    if (!container || !template) return;
+
+    /* Count all rows (existing + previously added) for the index. */
+    var existingRows = container.querySelectorAll('.exact-time-row');
+    var newIdx = existingRows.length;
+
+    /* Clone the template content (DocumentFragment → first element child). */
+    var fragment = template.content.cloneNode(true);
+    var row      = fragment.querySelector('.exact-time-row');
+
+    /* Stamp the checkbox value with "new:<index>". */
+    var chk = row.querySelector('input[name="anchor_enabled"]');
+    if (chk) { chk.value = 'new:' + newIdx; }
+
+    /* Assign unique id/for pairs so labels are correctly associated. */
+    var uid = 'anchor-row-new-' + newIdx;
+    var kindSelect  = row.querySelector('select[name="anchor_kind"]');
+    var timeInput   = row.querySelector('input[name="anchor_time"]');
+    var offsetInput = row.querySelector('input[name="anchor_offset"]');
+
+    if (kindSelect)  { kindSelect.id  = uid + '-kind';   }
+    if (timeInput)   { timeInput.id   = uid + '-time';   }
+    if (offsetInput) { offsetInput.id = uid + '-offset'; }
+
+    /* Update for= on labels to match the new ids. */
+    row.querySelectorAll('label.form-label').forEach(function (lbl) {
+      var ctrl = lbl.closest('.form-group').querySelector('[id]');
+      if (ctrl) { lbl.setAttribute('for', ctrl.id); }
+    });
+
+    container.appendChild(fragment);
+
+    /* Hide the empty-state message once we have at least one row. */
+    if (emptyMsg) { emptyMsg.hidden = true; }
+  }
+
+  /* ── Remove row ──────────────────────────────────────────────────────── */
+  function tlmExactTimeRemoveRow(buttonEl) {
+    var row       = buttonEl.closest('.exact-time-row');
+    var container = document.getElementById('exact-time-rows');
+    var emptyMsg  = document.getElementById('exact-time-empty-state');
+    if (!row || !container) return;
+
+    container.removeChild(row);
+
+    /* Renumber checkbox values for all remaining new-row entries so indices
+       stay contiguous and predictable for the server. Existing rows (whose
+       checkbox value is a numeric DB id) are left untouched. */
+    var newRowIdx = 0;
+    container.querySelectorAll('.exact-time-row').forEach(function (r) {
+      var chk = r.querySelector('input[name="anchor_enabled"]');
+      if (chk && chk.value.indexOf('new:') === 0) {
+        chk.value = 'new:' + newRowIdx;
+        newRowIdx++;
+      }
+    });
+
+    /* Show the empty-state message when no rows remain. */
+    var remaining = container.querySelectorAll('.exact-time-row');
+    if (emptyMsg && remaining.length === 0) { emptyMsg.hidden = false; }
+  }
+
+  /* Expose on window so inline onchange=/onclick= handlers can reach them. */
+  window.tlmExactTimeKindChange = tlmExactTimeKindChange;
+  window.tlmExactTimeAddRow     = tlmExactTimeAddRow;
+  window.tlmExactTimeRemoveRow  = tlmExactTimeRemoveRow;
+
+}());
+</script>

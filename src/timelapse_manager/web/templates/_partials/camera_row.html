@@ -1,0 +1,75 @@
+{#
+  Partial: camera_row.html
+  Context: camera — {id, name, protocol, address, geolocation}
+           current_user — {username, role}
+           csrf_token — str
+
+  NOTE: camera.address is shown as-is from the server; the server must
+  never include credentials in the address string passed to templates.
+  Geolocation is optional; may be None/null.
+#}
+<tr id="camera-row-{{ camera.id }}">
+  <td>
+    <div style="font-weight:500;">{{ camera.name }}</div>
+  </td>
+  <td>
+    <span class="status-badge" style="font-size:0.7rem;background:var(--color-surface-2);color:var(--color-text-muted);border-color:var(--color-border);">
+      {{ camera.protocol | upper }}
+    </span>
+  </td>
+  <td class="mono" style="color:var(--color-text-muted);">
+    {# Address shown without credentials — server enforces this #}
+    {{ camera.address }}
+  </td>
+  <td>
+    {% if camera.geolocation %}
+      <span class="mono text-muted" style="font-size:0.75rem;">
+        {{ camera.geolocation.lat | round(4) }}, {{ camera.geolocation.lon | round(4) }}
+      </span>
+      {# Provenance: where the coordinates came from #}
+      {% if camera.geolocation.source == 'manual' %}
+        <span class="badge-manual" title="Set manually">manual</span>
+      {% else %}
+        <span class="badge-device" title="Reported by the camera device">
+          <svg class="icon" aria-hidden="true"><use href="#icon-device"></use></svg>device
+        </span>
+      {% endif %}
+    {% else %}
+      <span style="color:var(--color-text-dim);">&mdash;</span>
+    {% endif %}
+  </td>
+  <td style="text-align:right;">
+    {% if can_operate %}
+    <div class="row-actions-menu">
+      <button type="button" class="btn btn-ghost btn-sm row-actions-trigger"
+              aria-haspopup="menu" aria-label="Actions for {{ camera.name }}">&#8943;</button>
+      <div class="row-actions-popover" role="menu">
+        <button type="button" role="menuitem"
+                hx-get="/cameras/{{ camera.id }}/edit-form"
+                hx-target="#camera-row-{{ camera.id }}"
+                hx-swap="outerHTML">Edit</button>
+
+        <form method="post" action="/cameras/{{ camera.id }}/validate" style="margin:0;"
+              hx-post="/cameras/{{ camera.id }}/validate"
+              hx-target="#camera-test-result-{{ camera.id }}"
+              hx-swap="innerHTML">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem">Test connection</button>
+        </form>
+
+        <form method="post" action="/cameras/{{ camera.id }}" style="margin:0;"
+              hx-delete="/cameras/{{ camera.id }}"
+              hx-target="#camera-row-{{ camera.id }}"
+              hx-swap="outerHTML"
+              hx-confirm="Delete camera '{{ camera.name }}'? This cannot be undone.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" role="menuitem" class="danger">Delete</button>
+        </form>
+      </div>
+    </div>
+    {% endif %}
+    <div id="camera-test-result-{{ camera.id }}"
+         style="font-size:0.75rem;margin-top:var(--sp-1);color:var(--color-text-muted);">
+    </div>
+  </td>
+</tr>

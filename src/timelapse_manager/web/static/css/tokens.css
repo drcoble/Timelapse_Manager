@@ -1,0 +1,280 @@
+/* ==========================================================================
+   Timelapse Manager — Application Stylesheet
+   Stack: Jinja2 + HTMX, FastAPI backend
+   Design: Information-dense operational dashboard — warm light / indigo dark
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Design Tokens
+   -------------------------------------------------------------------------- */
+:root {
+  /* Light palette (default) — warm linen */
+  --color-bg:           #f5f4f0;
+  --color-surface:      #ffffff;
+  --color-surface-2:    #f0ede8;
+  --color-surface-3:    #e5e0d8;
+  --color-border:       #ccc6bc;
+  --color-border-2:     #b0a898;
+
+  /* Text */
+  --color-text:         #1e1c18;
+  --color-text-muted:   #5a5248;
+  --color-text-dim:     #6a6258;
+  --color-text-inverse: #ffffff;
+
+  /* Button/icon text on saturated accent backgrounds */
+  --color-on-accent:    #161310;
+
+  /* Brand accent — amber-bronze */
+  --color-accent:       #a07830;
+  --color-accent-dim:   #f5e8c8;
+  --color-accent-hover: #8a6020;
+  /* Deeper accent for text/links (passes AA on the light background) */
+  --color-accent-text:  #7a5a20;
+
+  /* Status colors */
+  --color-running:      #2e8b57;
+  --color-running-bg:   #e3f3ea;
+  --color-paused:       #b8860b;
+  --color-paused-bg:    #f8efd2;
+  --color-stopped:      #6b7280;
+  --color-stopped-bg:   #eceef2;
+  --color-error:        #c0392b;
+  --color-error-bg:     #fbe6e3;
+  /* Distinct orange: system-initiated low-disk pause */
+  --color-lowdisk:      #c2570c;
+  --color-lowdisk-bg:   #fbe8d6;
+
+  /* Admin role accent */
+  --color-admin-only:   #7c3aed;
+  --color-admin-bg:     #ede9fe;
+  --color-admin-border: #7c3aed;
+
+  /* Auth / kind badge tokens */
+  --color-auth-ldap-border: #2e8b57;
+
+  /* Semantic */
+  --color-success:      #2e8b57;
+  --color-warning:      #b8860b;
+  --color-danger:       #c0392b;
+  --color-info:         #2a6f9e;
+
+  /* Info background (toast/alert) */
+  --color-info-bg:      #e3eef6;
+
+  /* Alert description text */
+  --color-warning-desc: #7a5a10;
+  --color-error-desc:   #8a2a20;
+  --color-info-desc:    #1f5476;
+  --color-success-desc: #1f5e3c;
+
+  /* Device-reported value badge (resolves per theme via the running tokens) */
+  --color-device-bg:     var(--color-running-bg);
+  --color-device-text:   var(--color-running);
+  --color-device-border: var(--color-running);
+
+  /* Time-ribbon washes (semi-transparent; layered over the ribbon track) */
+  --color-ribbon-day:    #c8a96e22;
+  --color-ribbon-night:  #3a3f6022;
+  --color-ribbon-golden: #c8a96e55;
+  --color-ribbon-gap:    #e05c5c44;
+  --color-ribbon-render: #5cc88244;
+
+  /* Select arrow (full data-URI per theme) */
+  --color-select-arrow-url: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%235a5248' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+
+  /* Spacing scale (4px base) */
+  --sp-1:  4px;
+  --sp-2:  8px;
+  --sp-3:  12px;
+  --sp-4:  16px;
+  --sp-5:  20px;
+  --sp-6:  24px;
+  --sp-8:  32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-14: 56px;
+  --sp-16: 64px;
+
+  /* Type scale */
+  --text-2xs: 11px;
+  --text-xs:  12px;
+  --text-sm:  13px;
+  --text-md:  14px;
+  --text-lg:  16px;
+  --text-xl:  20px;
+  --text-2xl: 24px;
+
+  /* Typography — self-hosted Geist (see fonts.css) */
+  --font-sans: "Geist", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  /* Layout */
+  --nav-width:      200px;
+  --nav-width-icon:  56px;
+  --header-height:   52px;
+  --radius-sm:        3px;
+  --radius-md:        5px;
+  --radius-lg:        8px;
+  --radius-xl:       12px;
+
+  /* Transitions */
+  --transition-fast: 120ms ease;
+  --transition-mid:  200ms ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark palette — indigo dusk */
+    --color-bg:           #0c0d14;
+    --color-surface:      #141620;
+    --color-surface-2:    #1c1f2e;
+    --color-surface-3:    #242840;
+    --color-border:       #2a2e4a;
+    --color-border-2:     #3a3f60;
+
+    --color-text:         #e8e9f0;
+    --color-text-muted:   #8a8faa;
+    --color-text-dim:     #84899f;
+    --color-text-inverse: #0c0d14;
+    --color-on-accent:    #0c0d14;
+
+    --color-accent:       #c8a96e;
+    --color-accent-dim:   #2a2210;
+    --color-accent-hover: #dbbf80;
+    --color-accent-text:  #c8a96e;
+
+    --color-running:      #5cc882;
+    --color-running-bg:   #0a2018;
+    --color-paused:       #d4a017;
+    --color-paused-bg:    #211800;
+    --color-stopped:      #606478;
+    --color-stopped-bg:   #181a28;
+    --color-error:        #e05c5c;
+    --color-error-bg:     #280d0d;
+    --color-lowdisk:      #f0783c;
+    --color-lowdisk-bg:   #221008;
+
+    --color-admin-only:   #b07cf0;
+    --color-admin-bg:     #1e1630;
+    --color-admin-border: #9966cc;
+
+    --color-auth-ldap-border: #5cc882;
+
+    --color-success:      #5cc882;
+    --color-warning:      #d4a017;
+    --color-danger:       #e05c5c;
+    --color-info:         #38bdf8;
+
+    --color-info-bg:      #0d2233;
+
+    --color-warning-desc: #c8a96e;
+    --color-error-desc:   #d98080;
+    --color-info-desc:    #7aa6c0;
+    --color-success-desc: #6fb68a;
+
+    --color-select-arrow-url: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238a8faa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  }
+}
+
+[data-theme="light"] {
+  --color-bg:           #f5f4f0;
+  --color-surface:      #ffffff;
+  --color-surface-2:    #f0ede8;
+  --color-surface-3:    #e5e0d8;
+  --color-border:       #ccc6bc;
+  --color-border-2:     #b0a898;
+
+  --color-text:         #1e1c18;
+  --color-text-muted:   #5a5248;
+  --color-text-dim:     #6a6258;
+  --color-text-inverse: #ffffff;
+  --color-on-accent:    #161310;
+
+  --color-accent:       #a07830;
+  --color-accent-dim:   #f5e8c8;
+  --color-accent-hover: #8a6020;
+  --color-accent-text:  #7a5a20;
+
+  --color-running:      #2e8b57;
+  --color-running-bg:   #e3f3ea;
+  --color-paused:       #b8860b;
+  --color-paused-bg:    #f8efd2;
+  --color-stopped:      #6b7280;
+  --color-stopped-bg:   #eceef2;
+  --color-error:        #c0392b;
+  --color-error-bg:     #fbe6e3;
+  --color-lowdisk:      #c2570c;
+  --color-lowdisk-bg:   #fbe8d6;
+
+  --color-admin-only:   #7c3aed;
+  --color-admin-bg:     #ede9fe;
+  --color-admin-border: #7c3aed;
+
+  --color-auth-ldap-border: #2e8b57;
+
+  --color-success:      #2e8b57;
+  --color-warning:      #b8860b;
+  --color-danger:       #c0392b;
+  --color-info:         #2a6f9e;
+
+  --color-info-bg:      #e3eef6;
+
+  --color-warning-desc: #7a5a10;
+  --color-error-desc:   #8a2a20;
+  --color-info-desc:    #1f5476;
+  --color-success-desc: #1f5e3c;
+
+  --color-select-arrow-url: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%235a5248' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+}
+
+[data-theme="dark"] {
+  --color-bg:           #0c0d14;
+  --color-surface:      #141620;
+  --color-surface-2:    #1c1f2e;
+  --color-surface-3:    #242840;
+  --color-border:       #2a2e4a;
+  --color-border-2:     #3a3f60;
+
+  --color-text:         #e8e9f0;
+  --color-text-muted:   #8a8faa;
+  --color-text-dim:     #84899f;
+  --color-text-inverse: #0c0d14;
+  --color-on-accent:    #0c0d14;
+
+  --color-accent:       #c8a96e;
+  --color-accent-dim:   #2a2210;
+  --color-accent-hover: #dbbf80;
+  --color-accent-text:  #c8a96e;
+
+  --color-running:      #5cc882;
+  --color-running-bg:   #0a2018;
+  --color-paused:       #d4a017;
+  --color-paused-bg:    #211800;
+  --color-stopped:      #606478;
+  --color-stopped-bg:   #181a28;
+  --color-error:        #e05c5c;
+  --color-error-bg:     #280d0d;
+  --color-lowdisk:      #f0783c;
+  --color-lowdisk-bg:   #221008;
+
+  --color-admin-only:   #b07cf0;
+  --color-admin-bg:     #1e1630;
+  --color-admin-border: #9966cc;
+
+  --color-auth-ldap-border: #5cc882;
+
+  --color-success:      #5cc882;
+  --color-warning:      #d4a017;
+  --color-danger:       #e05c5c;
+  --color-info:         #38bdf8;
+
+  --color-info-bg:      #0d2233;
+
+  --color-warning-desc: #c8a96e;
+  --color-error-desc:   #d98080;
+  --color-info-desc:    #7aa6c0;
+  --color-success-desc: #6fb68a;
+
+  --color-select-arrow-url: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238a8faa' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+}

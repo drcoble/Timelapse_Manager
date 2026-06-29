@@ -1,0 +1,40 @@
+
+/* --------------------------------------------------------------------------
+   Thumbnail / Frame Placeholder
+   -------------------------------------------------------------------------- */
+.frame-thumb {
+  background: var(--color-surface-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-dim);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.frame-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.frame-thumb-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  text-align: center;
+}
+
+.frame-thumb-icon { font-size: 1.5rem; opacity: 0.5; }
+
+/* Sizes */
+.thumb-project  { width: 120px; height: 68px; }
+.thumb-preview  { width: 100%; aspect-ratio: 16/9; max-height: 360px; }
+.thumb-viewer   { width: 100%; aspect-ratio: 16/9; }
+.thumb-strip    { width: 80px; height: 45px; }
+.thumb-grid     { width: 100%; aspect-ratio: 16/9; }

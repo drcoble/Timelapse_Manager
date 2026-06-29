@@ -1,0 +1,271 @@
+{# Capture schedule fieldset — shared partial.
+   Include this inside an existing <form>; it must not contain a <form> tag.
+
+   Context vars consumed (all optional — safe defaults apply):
+     timezones       : list[str]  — IANA timezone names for the <select>.
+     current_schedule: dict|None  — persisted schedule with keys:
+                         preset (str), timezone (str),
+                         window_start (str "HH:MM"), window_end (str "HH:MM"),
+                         days (list[str] of "mon"|"tue"|…|"sun"),
+                         sun_offset_start_min (int), sun_offset_end_min (int).
+                       Pass None or {} for a new project (defaults to preset=always).
+
+   Field-name contract (what the backend parses from the POST body):
+     capture_schedule_preset    — one of: always | business | sun | noon | custom
+     capture_schedule_timezone  — IANA name
+     capture_window_start       — "HH:MM" (30-min steps); custom preset only
+     capture_window_end         — "HH:MM" (30-min steps); custom preset only
+     capture_days               — repeated checkbox value(s): mon tue wed thu fri sat sun
+     sun_offset_start_min       — integer (may be negative); sun preset only
+     sun_offset_end_min         — integer (may be negative); sun preset only
+
+   All conditional fields are always present in the DOM and always POST.
+   The backend uses capture_schedule_preset to decide which fields are active
+   and ignores the others. No field carries `required` because the form is
+   novalidate and a hidden field must not fail browser validation.
+#}
+
+{# Normalise the schedule dict so template code can use .get() safely. #}
+{% set sched = current_schedule if current_schedule else {} %}
+{% set _preset     = sched.get('preset', 'always') %}
+{% set _tz         = sched.get('timezone', 'UTC') %}
+{% set _win_start  = sched.get('window_start', '09:00') %}
+{% set _win_end    = sched.get('window_end', '17:00') %}
+{% set _days       = sched.get('days', ['mon','tue','wed','thu','fri','sat','sun']) %}
+{% set _sun_start  = sched.get('sun_offset_start_min', 0) %}
+{% set _sun_end    = sched.get('sun_offset_end_min', 0) %}
+
+{# Whether to start with the sub-panels visible or hidden. #}
+{% set _show_custom = (_preset == 'custom') %}
+{% set _show_sun    = (_preset == 'sun') %}
+
+<fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+  <legend style="padding:0 var(--sp-2);font-weight:600;">Capture schedule</legend>
+  <p class="form-hint" style="margin-top:0;">
+    When during the day capture is allowed. The capture interval controls
+    how often frames are taken while the window is open.
+  </p>
+
+  {# ── Preset selector ────────────────────────────────────────────────────── #}
+  <div class="form-group" style="margin-bottom:var(--sp-3);">
+    <span class="form-label" id="schedule-preset-label">Schedule preset</span>
+
+    <div role="radiogroup" aria-labelledby="schedule-preset-label"
+         style="display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-1);">
+
+      <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+        <input type="radio" name="capture_schedule_preset" value="always"
+               {% if _preset == 'always' %}checked{% endif %}
+               onchange="tlmSchedReveal('always');"
+               style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
+        <span>
+          <span style="font-weight:500;">Always</span>
+          <span class="form-hint" style="display:block;">Capture 24&#8239;/&#8239;7 — no time restrictions.</span>
+        </span>
+      </label>
+
+      <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+        <input type="radio" name="capture_schedule_preset" value="business"
+               {% if _preset == 'business' %}checked{% endif %}
+               onchange="tlmSchedReveal('business');"
+               style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
+        <span>
+          <span style="font-weight:500;">Business hours</span>
+          <span class="form-hint" style="display:block;">09:00&#8239;&ndash;&#8239;17:00 Mon&#8239;&ndash;&#8239;Fri in the selected timezone.</span>
+        </span>
+      </label>
+
+      <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+        <input type="radio" name="capture_schedule_preset" value="sun"
+               {% if _preset == 'sun' %}checked{% endif %}
+               onchange="tlmSchedReveal('sun');"
+               style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
+        <span>
+          <span style="font-weight:500;">Sunrise to sunset</span>
+          <span class="form-hint" style="display:block;">Gate follows daylight hours. Requires camera latitude &amp; longitude to be configured.</span>
+        </span>
+      </label>
+
+      <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+        <input type="radio" name="capture_schedule_preset" value="noon"
+               {% if _preset == 'noon' %}checked{% endif %}
+               onchange="tlmSchedReveal('noon');"
+               style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
+        <span>
+          <span style="font-weight:500;">Midday snapshot</span>
+          <span class="form-hint" style="display:block;">12:00&#8239;&ndash;&#8239;12:30 daily — one frame per day at midday.</span>
+        </span>
+      </label>
+
+      <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+        <input type="radio" name="capture_schedule_preset" value="custom"
+               {% if _preset == 'custom' %}checked{% endif %}
+               onchange="tlmSchedReveal('custom');"
+               style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
+        <span>
+          <span style="font-weight:500;">Custom</span>
+          <span class="form-hint" style="display:block;">Pick your own capture window and active days.</span>
+        </span>
+      </label>
+
+    </div>{# /radiogroup #}
+  </div>{# /preset form-group #}
+
+  {# ── Timezone ────────────────────────────────────────────────────────────── #}
+  <div class="form-group" style="margin-bottom:var(--sp-3);">
+    <label class="form-label" for="capture_schedule_timezone">Timezone</label>
+    <select id="capture_schedule_timezone"
+            name="capture_schedule_timezone"
+            class="form-control"
+            aria-describedby="sched-tz-hint">
+      {% for tz in (timezones or ['UTC']) %}
+      <option value="{{ tz }}"{% if tz == _tz %} selected{% endif %}>{{ tz }}</option>
+      {% endfor %}
+    </select>
+    <span class="form-hint" id="sched-tz-hint">
+      All windows and day boundaries are evaluated in this timezone.
+    </span>
+  </div>
+
+  {# ── Sun-preset controls (revealed when preset = sun) ───────────────────── #}
+  <div id="sched-sun-panel" {% if not _show_sun %}hidden{% endif %}>
+    <div class="form-hint" style="margin-bottom:var(--sp-3);
+         padding:var(--sp-2) var(--sp-3);
+         background:var(--color-surface-2);
+         border-radius:var(--radius-md);
+         border:1px solid var(--color-border);">
+      <svg class="icon" aria-hidden="true" style="vertical-align:-2px;margin-right:var(--sp-1);">
+        <use href="#icon-info"></use>
+      </svg>
+      Sunrise and sunset times are computed from the camera&rsquo;s latitude and
+      longitude. Set the camera&rsquo;s geolocation under <em>Cameras</em> first.
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="sun_offset_start_min">
+          Sunrise offset (minutes)
+        </label>
+        <input type="number"
+               id="sun_offset_start_min"
+               name="sun_offset_start_min"
+               class="form-control"
+               style="max-width:140px;"
+               step="1"
+               placeholder="0"
+               value="{{ _sun_start }}"
+               aria-describedby="sun-start-hint">
+        <span class="form-hint" id="sun-start-hint">
+          Negative = before sunrise, positive = after. Default 0 (at sunrise).
+        </span>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="sun_offset_end_min">
+          Sunset offset (minutes)
+        </label>
+        <input type="number"
+               id="sun_offset_end_min"
+               name="sun_offset_end_min"
+               class="form-control"
+               style="max-width:140px;"
+               step="1"
+               placeholder="0"
+               value="{{ _sun_end }}"
+               aria-describedby="sun-end-hint">
+        <span class="form-hint" id="sun-end-hint">
+          Negative = before sunset, positive = after. Default 0 (at sunset).
+        </span>
+      </div>
+    </div>
+  </div>{# /sched-sun-panel #}
+
+  {# ── Custom-preset controls (revealed when preset = custom) ─────────────── #}
+  <div id="sched-custom-panel" {% if not _show_custom %}hidden{% endif %}>
+
+    <div class="form-row" style="margin-bottom:var(--sp-3);">
+
+      <div class="form-group">
+        <label class="form-label" for="capture_window_start">Window opens</label>
+        <select id="capture_window_start"
+                name="capture_window_start"
+                class="form-control mono"
+                aria-describedby="window-hint">
+          {% for h in range(24) %}
+            {% for m in [0, 30] %}
+              {% set slot = "%02d:%02d"|format(h, m) %}
+              <option value="{{ slot }}"
+                      {% if slot == _win_start %}selected{% endif %}>
+                {{- slot -}}
+              </option>
+            {% endfor %}
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="capture_window_end">Window closes</label>
+        <select id="capture_window_end"
+                name="capture_window_end"
+                class="form-control mono"
+                aria-describedby="window-hint">
+          {% for h in range(24) %}
+            {% for m in [0, 30] %}
+              {% set slot = "%02d:%02d"|format(h, m) %}
+              <option value="{{ slot }}"
+                      {% if slot == _win_end %}selected{% endif %}>
+                {{- slot -}}
+              </option>
+            {% endfor %}
+          {% endfor %}
+        </select>
+      </div>
+
+    </div>{# /form-row #}
+    <span class="form-hint" id="window-hint" style="margin-top:calc(-1 * var(--sp-2));">
+      Times are in the timezone above. A window that wraps midnight
+      (e.g.&nbsp;22:00&#8239;&ndash;&#8239;06:00) is supported.
+    </span>
+
+    <div class="form-group" style="margin-top:var(--sp-3);">
+      <span class="form-label" id="capture-days-label">Active days</span>
+      <div role="group" aria-labelledby="capture-days-label"
+           style="display:flex;flex-wrap:wrap;gap:var(--sp-3);margin-top:var(--sp-1);">
+        {% for day_val, day_label in [
+             ('mon','Mon'), ('tue','Tue'), ('wed','Wed'),
+             ('thu','Thu'), ('fri','Fri'),
+             ('sat','Sat'), ('sun','Sun')
+           ] %}
+        <label style="display:flex;align-items:center;gap:var(--sp-1);cursor:pointer;">
+          <input type="checkbox"
+                 name="capture_days"
+                 value="{{ day_val }}"
+                 {% if day_val in _days %}checked{% endif %}
+                 style="accent-color:var(--color-accent);width:15px;height:15px;">
+          <span style="font-size:var(--text-sm);font-weight:500;">{{ day_label }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      <span class="form-hint">Days on which capture is allowed. Leave all unchecked for every day.</span>
+    </div>
+
+  </div>{# /sched-custom-panel #}
+
+</fieldset>{# /capture schedule #}
+
+{# Inline controller — reveals/hides the sun and custom sub-panels
+   when a preset radio is selected. Falls back gracefully: without JS the
+   server-rendered `hidden` attribute on each panel already reflects the
+   correct initial state, and all fields POST regardless of visibility. #}
+<script>
+(function () {
+  function tlmSchedReveal(preset) {
+    var sunPanel    = document.getElementById('sched-sun-panel');
+    var customPanel = document.getElementById('sched-custom-panel');
+    if (sunPanel)    sunPanel.hidden    = (preset !== 'sun');
+    if (customPanel) customPanel.hidden = (preset !== 'custom');
+  }
+  /* Expose globally so the inline onchange= handlers can reach it. */
+  window.tlmSchedReveal = tlmSchedReveal;
+}());
+</script>

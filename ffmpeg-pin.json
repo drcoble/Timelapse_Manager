@@ -1,0 +1,14 @@
+{
+  "version": "n8.1",
+  "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
+  "sha256": "f6f07ebf4d4049cbbec85ebbbf051d9262437b2ea9b2309b14d8bf0590139ff9",
+  "license": "GPL-3.0",
+  "binaries": {
+    "ffmpeg": "ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg",
+    "ffprobe": "ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffprobe"
+  },
+  "mirror_urls": [
+    "https://git.2cbn.com/api/packages/drew.coble/generic/ffmpeg-static/n8.1/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz"
+  ]
+}

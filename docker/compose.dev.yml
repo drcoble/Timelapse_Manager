@@ -1,0 +1,68 @@
+# Development overrides for the published single-service stack.
+#
+# Layers live source mounting + auto-reload onto the app, and adds a
+# mock-cameras service so adapters have something to talk to without real
+# hardware:
+#
+#   docker compose -f docker/docker-compose.yml -f docker/compose.dev.yml up
+#
+# This intentionally trades image fidelity for fast feedback; use the base file
+# alone to exercise the image as it would ship.
+
+services:
+  app:
+    environment:
+      # Surface tracebacks and verbose logging during development.
+      TLM_ENV: "development"
+      TLM_LOG_LEVEL: "debug"
+      # Point camera adapters at the mock-cameras service.
+      TLM_MOCK_RTSP_URL: "rtsp://mock-cameras:8554/testsrc"
+      TLM_MOCK_SNAPSHOT_URL: "http://mock-cameras:8555/snapshot.jpg"
+    volumes:
+      # Bind-mount the source over the image copy for live editing.
+      - ../src:/app/src:ro
+    command:
+      - uvicorn
+      - timelapse_manager.app:create_app
+      - --factory
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --reload
+      - --reload-dir
+      - /app/src
+    depends_on:
+      mock-cameras:
+        condition: service_started
+
+  mock-cameras:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      platforms:
+        - linux/amd64
+    image: timelapse-manager:latest
+    # Reuse the application image (it already bundles FFmpeg + Python). mediamtx
+    # is fetched at start so the base image stays lean.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        MTX_VERSION=v1.9.3
+        ARCH=linux_amd64
+        cd /tmp
+        curl -fsSL -o mediamtx.tar.gz \
+          "https://github.com/bluenviron/mediamtx/releases/download/$${MTX_VERSION}/mediamtx_$${MTX_VERSION}_$${ARCH}.tar.gz"
+        tar -xzf mediamtx.tar.gz mediamtx
+        install -m 0755 mediamtx /usr/local/bin/mediamtx
+        exec python /app/dev/mock_cameras/run.py
+    working_dir: /app
+    user: root
+    volumes:
+      # Mount the mock-camera sources and sample frames into the image.
+      - ../dev:/app/dev:ro
+    ports:
+      - "8554:8554"  # RTSP
+      - "8555:8555"  # HTTP snapshot
+    restart: unless-stopped

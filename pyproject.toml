@@ -1,0 +1,150 @@
+[project]
+name = "timelapse-manager"
+version = "0.1.0"
+description = "Capture stills from network IP cameras and assemble timelapse videos."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Drew Coble" }]
+# Camera/ONVIF support is intentionally lean: WS-Discovery runs over the stdlib
+# `socket` module, ONVIF SOAP requests reuse the existing `httpx` client, and
+# all XML is parsed with the stdlib `xml.etree`. No heavyweight ONVIF/WSDL
+# client (e.g. onvif-zeep, wsdiscovery) is added, keeping the install small and
+# friendly to low-power hardware. RTSP frame grabs shell out to a bundled
+# ffmpeg binary rather than pulling in a native decoder.
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.34,<1.0",
+    "jinja2>=3.1,<4.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.14,<2.0",
+    "httpx>=0.28,<1.0",
+    "pyyaml>=6.0,<7.0",
+    "astral>=3.2,<4.0",
+    # Offline coordinate -> IANA timezone lookup (timezone data is compiled into
+    # the wheel, so no network and no separate data files; resolves a camera's
+    # local timezone from its geographic coordinates for solar capture times).
+    "tzfpy>=1.3,<2",
+    "argon2-cffi>=23.1,<24.0",
+    # Secret protection: `cryptography` provides the Fernet AEAD used to encrypt
+    # stored credentials at rest (and the preferred TLS-cert generation path);
+    # `keyring` stores the encryption key in the host OS secret store (macOS
+    # Keychain, Windows Credential Manager, Linux Secret Service) with a
+    # restricted-permission key file as the headless/Docker fallback.
+    "cryptography>=46.0.5,<47.0",
+    "keyring>=25.0,<26.0",
+    # Timezone database for zoneinfo on Windows (stdlib zoneinfo uses the OS
+    # tz database on macOS/Linux but needs this package on Windows).
+    "tzdata>=2024.1",
+    # Pure-Python LDAP/Active Directory client for the directory-auth connector.
+    # Chosen over python-ldap (which needs system OpenLDAP/C libraries) because it
+    # has no C/system dependencies, freezes cleanly with PyInstaller, ships a
+    # ServerPool for ordered multi-server failover, and includes an in-process
+    # mock server (MOCK_SYNC) so the connector is unit-testable without a live
+    # directory.
+    "ldap3>=2.9,<3.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9,<1.0",
+    "mypy>=1.14,<2.0",
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.25,<1.0",
+    "coverage>=7.6,<8.0",
+    "pre-commit>=4.0,<5.0",
+    "types-PyYAML>=6.0,<7.0",
+    # Packaging toolchain (release/bundle/SBOM). PyInstaller freezes the app +
+    # bundled FFmpeg into a relocatable one-dir bundle; cyclonedx-bom emits the
+    # CycloneDX SBOM from the locked environment.
+    "pyinstaller>=6.10,<7.0",
+    "cyclonedx-bom>=4.6,<6.0",
+    "pytest-xdist>=3.6,<4.0",
+    # Browser E2E testing.  pytest-playwright provides the Playwright
+    # integration; playwright is the underlying sync/async browser-control
+    # library.  Both are optional at runtime: the test suite auto-skips any
+    # test marked ``ui`` when the browser binary is absent, so the default
+    # ``pytest -n auto`` run stays green without a browser install.
+    "playwright>=1.49,<2.0",
+    "pytest-playwright>=0.6,<1.0",
+    # Auto-rerun for the inherently timing-sensitive browser-e2e job.
+    "pytest-rerunfailures>=14.0,<16.0",
+    # Per-test timeout so a hung browser test is killed and named rather than
+    # wedging the whole job (the Gitea Actions runner does not enforce the
+    # workflow-level timeout-minutes).
+    "pytest-timeout>=2.3,<3.0",
+]
+
+[project.scripts]
+timelapse = "timelapse_manager.cli:main"
+timelapse-daemon = "timelapse_manager.service:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/timelapse_manager"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+# A sensible, not-overbearing rule set: pycodestyle, pyflakes, isort,
+# pyupgrade, bugbear, comprehensions, and a few correctness-oriented sets.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["timelapse_manager"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+# Strict-leaning configuration. Kept explicit rather than `strict = true`
+# so individual knobs are visible and tunable as the codebase grows.
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_decorators = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+extra_checks = true
+
+# ldap3 ships no type stubs (and there is no maintained types-ldap3 package), so
+# treat its imports as untyped rather than failing the strict-leaning run.
+[[tool.mypy.overrides]]
+module = ["ldap3.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "ui: marks tests that require a real browser via Playwright (auto-skipped when browsers are not installed; run with -m ui)",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true

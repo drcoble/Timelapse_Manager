@@ -1,0 +1,56 @@
+{#
+  Partial: frames_import_result.html — batch frame-import result fragment.
+
+  Swapped into the import control's #frames-import-result container after a
+  multipart upload to POST /projects/{id}/frames/import. Reports how many files
+  were imported and, when any were rejected, lists each skipped file with its
+  reason. Skip-not-raise: a batch can both import some files and skip others.
+
+  Context:
+    result — storage ImportResult-shaped object with:
+               imported_count : int
+               skipped_count  : int
+               skipped        : list of per-file records, each with
+                                  .name (str) and .reason (str | None)
+    error  — an error string to show instead of a result, or None. Used for an
+             over-size batch or an empty selection (returned at HTTP 200 so HTMX
+             still swaps the fragment in).
+#}
+<div id="frames-import-result">
+  {% if error %}
+    <div class="alert error" role="alert" style="margin-top:var(--sp-3);">
+      <span class="alert-icon" aria-hidden="true">&#9888;</span>
+      <div class="alert-body">
+        <div class="alert-title">Import failed</div>
+        <div class="alert-desc">{{ error }}</div>
+      </div>
+    </div>
+  {% else %}
+    {% set state = 'warning' if result.skipped_count else 'success' %}
+    <div class="alert {{ state }}" role="status" aria-live="polite"
+         style="margin-top:var(--sp-3);">
+      <span class="alert-icon" aria-hidden="true">&#10003;</span>
+      <div class="alert-body">
+        <div class="alert-title">
+          <span class="mono">{{ result.imported_count }}</span> imported
+          {%- if result.skipped_count %} &middot;
+            <span class="mono">{{ result.skipped_count }}</span> skipped
+          {%- endif %}
+        </div>
+        {% if result.skipped_count %}
+          <div class="alert-desc">
+            <ul class="form-hint" style="margin:var(--sp-2) 0 0;
+                                         padding-left:var(--sp-4);">
+              {% for item in result.skipped %}
+                <li>
+                  <span class="mono">{{ item.name }}</span>
+                  &mdash; {{ item.reason or 'skipped' }}
+                </li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  {% endif %}
+</div>

@@ -1,0 +1,19 @@
+{# Inline confirmation row for a destructive action, swapped into a slot in
+   place of a native confirm() dialog. Expects: confirm_message, confirm_action
+   (POST target), confirm_label, confirm_cancel (GET that clears the slot),
+   confirm_danger (bool), csrf_token. #}
+<div class="inline-confirm" role="group" aria-label="{{ confirm_message }}">
+  <span class="inline-confirm__msg">{{ confirm_message }}</span>
+  <span class="inline-confirm__spacer"></span>
+  <form method="post" action="{{ confirm_action }}" style="margin:0;display:inline;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit"
+            class="btn btn-sm {{ 'btn-danger' if confirm_danger else 'btn-secondary' }}">
+      {{ confirm_label }}
+    </button>
+  </form>
+  <button type="button" class="btn btn-sm btn-ghost"
+          hx-get="{{ confirm_cancel }}" hx-target="#confirm-slot" hx-swap="innerHTML">
+    Cancel
+  </button>
+</div>

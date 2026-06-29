@@ -1,0 +1,20 @@
+{#
+  In-grid capture-gap band. Rendered at the top of the grid when a jump lands at
+  a capture lapse, so the gap is legible in the frame stream (not only on the
+  ribbon). The frame just below it is the last one captured before the gap.
+
+  Context: gap — {start, end, duration_seconds, frame_count} (aware datetimes).
+#}
+{% set _d = gap.duration_seconds %}
+{% set _days = _d // 86400 %}
+{% set _hrs = (_d % 86400) // 3600 %}
+{% set _mins = (_d % 3600) // 60 %}
+<div class="frames-gap-band" role="note"
+     aria-label="Capture gap with no frames">
+  <span class="frames-gap-band-icon" aria-hidden="true">&#9888;</span>
+  <span class="frames-gap-band-text">
+    Capture gap &mdash;
+    {{ gap.start | localdt }} to {{ gap.end | localdt }}
+    ({% if _days %}{{ _days }}d {% endif %}{% if _hrs or _days %}{{ _hrs }}h {% endif %}{{ _mins }}m, no frames)
+  </span>
+</div>

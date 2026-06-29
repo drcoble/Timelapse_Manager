@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+
+{% block title %}Users — Timelapse Manager{% endblock %}
+{% block page_title_short %}Users{% endblock %}
+
+{% block content %}
+
+{#
+  Users page is admin-only, enforced server-side.
+  Role options available: Admin | Operator | Viewer.
+#}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Users</h1>
+    <div class="subtitle">{{ users | length }} user(s)</div>
+  </div>
+  <div class="page-actions">
+    <a href="/users/new" class="btn btn-primary"
+       data-drawer-open="#drawer-main" hx-get="/drawers/new-user"
+       hx-target="#drawer-main .drawer-body" hx-swap="innerHTML"
+       data-drawer-title="New User">
+      <svg class="icon" aria-hidden="true"><use href="#icon-users"></use></svg> Add User
+    </a>
+  </div>
+</div>
+
+{# Inline form container — populated by HTMX #}
+<div id="user-form-container" style="margin-bottom:var(--sp-6);"></div>
+
+<!-- Static add-user form (fallback / non-HTMX; also pre-built for accessibility) -->
+<div id="add-user-form-static" style="display:none;" aria-hidden="true">
+  <div class="card mb-6">
+    <div class="card-header">
+      <div class="card-title">Add User</div>
+    </div>
+    <div class="card-body">
+      <form method="post" action="/users" novalidate>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-stack">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="new_username">
+                Username<span class="required" aria-hidden="true">*</span>
+              </label>
+              <input type="text" id="new_username" name="username"
+                     class="form-control" required autocomplete="off">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="new_role">
+                Role<span class="required" aria-hidden="true">*</span>
+              </label>
+              {# Operator role is not available — only Admin and Viewer #}
+              <select id="new_role" name="role" class="form-control" required>
+                <option value="viewer" selected>Viewer</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="new_password">
+                Password<span class="required" aria-hidden="true">*</span>
+              </label>
+              <input type="password" id="new_password" name="password"
+                     class="form-control" required autocomplete="new-password"
+                     aria-describedby="new-pw-hint">
+              <span class="form-hint" id="new-pw-hint">Minimum 12 characters recommended.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="new_password_confirm">
+                Confirm password<span class="required" aria-hidden="true">*</span>
+              </label>
+              <input type="password" id="new_password_confirm" name="password_confirm"
+                     class="form-control" required autocomplete="new-password">
+            </div>
+          </div>
+          <div style="display:flex;gap:var(--sp-3);">
+            <button type="submit" class="btn btn-primary">Create User</button>
+            <button type="button" class="btn btn-ghost"
+                    onclick="document.getElementById('add-user-form-static').style.display='none';">
+              Cancel
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- User list -->
+{% if users %}
+<div class="card">
+  <div class="card-header">
+    <div class="card-title">User Accounts</div>
+  </div>
+  <div style="overflow-x:auto;">
+    <table class="data-table" aria-label="User accounts">
+      <thead>
+        <tr>
+          <th scope="col">Username</th>
+          <th scope="col">Role</th>
+          <th scope="col">Auth Source</th>
+          <th scope="col">Status</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody id="users-tbody">
+        {% for user in users %}
+          {% include '_partials/user_row.html' %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <div class="empty-state">
+    <div class="empty-state-icon" aria-hidden="true">
+      <svg class="icon" style="width:32px;height:32px;"><use href="#icon-users"></use></svg>
+    </div>
+    <div class="empty-state-title">No users</div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,17 @@
+{#
+  Partial: toast.html
+  Context variable: msg — {type: "success"|"error"|"info"|"warning", message: str}
+  Used by base.html to render flash messages and can be returned standalone
+  by endpoints that want to push a notification via HTMX OOB swap.
+#}
+<div class="toast {{ msg.type }}" role="alert" aria-live="assertive">
+  <div class="toast-body">
+    <div class="toast-message">{{ msg.message }}</div>
+  </div>
+  <button
+    class="toast-close"
+    aria-label="Dismiss notification"
+    onclick="this.closest('.toast').remove()">
+    &#215;
+  </button>
+</div>

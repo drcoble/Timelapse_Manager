@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — Timelapse Manager{% endblock %}
+{% block page_title_short %}Dashboard{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Projects</h1>
+    <div class="subtitle">
+      {{ projects | selectattr('lifecycle_state', 'equalto', 'active') | list | length }} active project(s)
+    </div>
+  </div>
+  {% if can_operate %}
+  <div class="page-actions">
+    <a href="/projects/new" class="btn btn-primary" data-drawer-open="#drawer-main" hx-get="/drawers/new-project" hx-target="#drawer-main .drawer-body" hx-swap="innerHTML" data-drawer-title="New Project">&#43; New Project</a>
+  </div>
+  {% endif %}
+</div>
+
+{#
+  ===== ACTIVE PROJECTS =====
+  Polled every 30 s via HTMX (innerHTML swap).
+
+  Engineer B — GET /partials/projects must return the *full inner content*
+  of this div: i.e. the `<div class="project-grid">…</div>` wrapper (or the
+  empty-state branch). Do NOT return bare cards — the grid layout CSS class
+  must be present in the response or the card layout collapses after the
+  first swap.
+#}
+<div id="projects-grid"
+     hx-get="/partials/projects"
+     hx-trigger="every 30s"
+     hx-swap="innerHTML">
+
+  {% set active_projects = projects | selectattr('lifecycle_state', 'equalto', 'active') | list %}
+
+  {% if active_projects %}
+    <div class="project-grid">
+      {% for project in active_projects %}
+        {% include '_partials/project_status_card.html' %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <div class="empty-state-icon" aria-hidden="true">&#127909;</div>
+      <div class="empty-state-title">No active projects</div>
+      <div class="empty-state-desc">
+        {% if can_operate %}
+          Create a project to start capturing timelapse frames.
+        {% else %}
+          No projects have been created yet. Contact your administrator.
+        {% endif %}
+      </div>
+      {% if can_operate %}
+        <a href="/projects/new" class="btn btn-primary" data-drawer-open="#drawer-main" hx-get="/drawers/new-project" hx-target="#drawer-main .drawer-body" hx-swap="innerHTML" data-drawer-title="New Project">&#43; New Project</a>
+      {% endif %}
+    </div>
+  {% endif %}
+
+</div>{# /projects-grid #}
+
+{# ===== ARCHIVED PROJECTS (collapsed by default) ===== #}
+{% set archived_projects = projects | selectattr('lifecycle_state', 'equalto', 'archived') | list %}
+{% if archived_projects %}
+<div style="margin-top:var(--sp-8);">
+
+  <details>
+    <summary class="archived-section-header" style="list-style:none;-webkit-appearance:none;">
+      <span class="lifecycle-badge archived">&#128190; Archived</span>
+      <span style="font-size:0.875rem;font-weight:600;color:var(--color-text-muted);">
+        Archived Projects
+      </span>
+      <span style="font-size:0.75rem;color:var(--color-text-dim);">
+        {{ archived_projects | length }} project(s)
+      </span>
+      <span style="flex:1;"></span>
+      <span style="font-size:0.75rem;color:var(--color-text-dim);">&#9660;</span>
+    </summary>
+
+    <div class="project-grid" style="margin-top:var(--sp-4);">
+      {% for project in archived_projects %}
+        {% include '_partials/project_status_card.html' %}
+      {% endfor %}
+    </div>
+  </details>
+
+</div>
+{% endif %}
+
+{% endblock %}

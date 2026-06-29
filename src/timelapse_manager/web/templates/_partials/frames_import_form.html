@@ -1,0 +1,90 @@
+{#
+  Partial: frames_import_form.html — import still images into the current project.
+
+  Included inside a <details class="frames-import-disclosure"> in frames.html;
+  always rendered into the DOM but hidden by the parent <details> until opened.
+
+  Context (from frames.html):
+    project        — the single Project object (id, name). Always in scope when
+                     this partial is included (gated by {% if not all_projects %}).
+    csrf_token     — str, per-session token injected by base_context for
+                     no-JS plain-submit degradation.
+
+  HTMX enhanced path:
+    hx-post             → POST /projects/{{ project.id }}/frames/import
+    hx-encoding         → multipart/form-data  (required for file upload)
+    hx-target           → #frames-import-result
+    hx-swap             → outerHTML
+    hx-disabled-elt     → disables the submit button while uploading
+
+  No-JS path:
+    A real <form method="post" enctype="multipart/form-data"> submits to the
+    same route, producing a full-page response. The csrf_token hidden field
+    covers the no-JS submission (the HTMX path instead reads the value from the
+    page-level hx-headers on <body>).
+
+  Result target:
+    An empty <div id="frames-import-result"> lives as a SIBLING of the
+    enclosing <details> in frames.html, not inside this form. The route returns
+    a fragment whose root carries id="frames-import-result", replacing the target
+    via outerHTML. This means the form is not swapped away, so repeated imports
+    work and the result persists after the disclosure is collapsed.
+#}
+{# Suppress the native disclosure triangle on the <summary> that renders as a
+   button. list-style:none covers standard engines; ::-webkit-details-marker
+   covers older WebKit. Scoped here because this pseudo-element cannot be
+   targeted from an inline style attribute. #}
+<style>
+.frames-import-disclosure > summary { list-style: none; }
+.frames-import-disclosure > summary::-webkit-details-marker { display: none; }
+</style>
+<form method="post"
+      enctype="multipart/form-data"
+      action="/projects/{{ project.id }}/frames/import"
+      novalidate
+      hx-post="/projects/{{ project.id }}/frames/import"
+      hx-encoding="multipart/form-data"
+      hx-target="#frames-import-result"
+      hx-swap="outerHTML"
+      hx-disabled-elt="[data-import-submit]">
+
+  {# Hidden field for the no-JS plain-submit path. HTMX reads the CSRF token
+     from the page-level X-CSRF-Token header on <body> so this is redundant
+     for the enhanced path — harmless either way. #}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <div class="form-stack" style="margin-top:var(--sp-4);">
+
+    <div class="form-group">
+      <label class="form-label" for="frames-import-files">Images</label>
+      <input type="file"
+             id="frames-import-files"
+             name="files"
+             class="form-control"
+             multiple
+             accept="image/jpeg,image/png"
+             required>
+      <span class="form-hint" style="color:var(--color-text-dim);">
+        JPEG or PNG. Capture time is read from each image&#8217;s EXIF data;
+        if missing, the upload time is used and flagged so you can adjust it
+        later.
+      </span>
+    </div>
+
+    <div style="display:flex;gap:var(--sp-3);align-items:center;">
+      <button type="submit"
+              class="btn btn-primary btn-sm"
+              data-import-submit>
+        Import
+      </button>
+      {# Cancel collapses the parent <details> without a server round-trip.
+         Works in no-JS too: the <details> simply stays open (acceptable). #}
+      <button type="button"
+              class="btn btn-ghost btn-sm"
+              onclick="this.closest('details').removeAttribute('open');">
+        Cancel
+      </button>
+    </div>
+
+  </div>
+</form>

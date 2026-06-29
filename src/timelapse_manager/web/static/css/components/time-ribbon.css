@@ -1,0 +1,197 @@
+/* --------------------------------------------------------------------------
+   Time ribbon — a horizontal band visualising a capture campaign over time.
+   The SVG is generated server-side (web/ribbon.py); colours live here so they
+   are theme-aware (SVG presentation attributes can't resolve CSS variables).
+   -------------------------------------------------------------------------- */
+.time-ribbon {
+  display: block;
+  width: 100%;
+  height: 20px;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.time-ribbon--detail {
+  height: 36px;
+}
+.time-ribbon--compact {
+  height: 12px;
+  border-radius: 2px;
+}
+
+.time-ribbon-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* SVG layer colours (the night background is the track's own surface). */
+.ribbon-day {
+  fill: var(--color-ribbon-day);
+}
+.ribbon-render {
+  fill: var(--color-ribbon-render);
+}
+.ribbon-tick {
+  stroke: var(--color-ribbon-golden);
+  stroke-width: 1;
+}
+.ribbon-gap {
+  fill: var(--color-ribbon-gap);
+}
+.ribbon-now {
+  stroke: var(--color-accent);
+  stroke-width: 1.5;
+}
+
+.time-ribbon-svg--interactive {
+  cursor: pointer;
+}
+
+/* Zoom strip — a finer ribbon of the loaded window, magnifying a long campaign.
+   Rendered into the sibling .frame-zoom-strip below the overview ribbon. A
+   dashed top divider + inset frame visually distinguish "you are looking at a
+   slice" from the full-span overview above. Taller ticks read clearer at this
+   density. */
+.frame-zoom-strip {
+  position: relative;
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px dashed var(--color-border-2);
+}
+.frame-zoom-strip .time-ribbon {
+  position: relative;
+  cursor: pointer;
+  border-color: var(--color-border-2);
+}
+.time-ribbon--zoom .ribbon-tick {
+  stroke-width: 1.5;
+}
+
+/* Scroll-position cursor — a 1px accent line the frames page moves to the
+   newest on-screen tile's capture time, so the ribbon reflects scroll position.
+   The ribbon wrap must be a positioning context for the overlaid line. */
+.frame-ribbon .time-ribbon {
+  position: relative;
+}
+.ribbon-scroll-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-accent);
+  opacity: 0.7;
+  pointer-events: none;
+  transition: left 120ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ribbon-scroll-cursor {
+    transition: none;
+  }
+}
+
+/* Scrubber panel — the sticky container for the date-jump + ribbon. It sits
+   below the selection/result action bar in the sticky stack (the action bar is
+   z-60 at top:0; this is z-55 just under it) so the two never overlap-fight. */
+.scrubber-panel {
+  position: sticky;
+  top: 0;
+  z-index: 55;
+  background: var(--color-surface-2);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--sp-3) 0;
+  margin-bottom: var(--sp-4);
+}
+
+/* The ribbon wrapper is the positioning context for the drag tooltip, which is
+   rendered ABOVE the ribbon. It must hang off the wrapper (not the inner
+   .time-ribbon, which is overflow:hidden to clip the SVG reveal wipe and would
+   clip the tooltip). Wrapper and inner share a width, so pixel mapping is
+   unchanged. */
+.frame-ribbon {
+  position: relative;
+}
+
+/* Slider focus ring — the ribbon wrapper is a real control (role=slider), so it
+   takes the standard accent focus outline (no box-shadow substitute). */
+.frame-ribbon:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* Viewport-indicator rect — "you are here": the epoch span of the tiles
+   currently loaded in the grid, drawn over the ribbon. Driven purely from the
+   DOM (scroll reflects, never round-trips), so it carries no pointer events. */
+.ribbon-viewport-rect {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--color-accent);
+  opacity: 0.18;
+  border-left: 1px solid var(--color-accent);
+  border-right: 1px solid var(--color-accent);
+  pointer-events: none;
+  transition:
+    left 120ms ease-out,
+    width 120ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ribbon-viewport-rect {
+    transition: none;
+  }
+}
+
+/* Drag-select span — the shaded band over the time range the user is dragging
+   (or has just confirmed). Painted directly from the pointer epoch, so it must
+   not animate (a transition would lag the pointer). It is purely a reflection of
+   the gesture, so it takes no pointer events. The fill deepens once the
+   selection is confirmed (pointerup). */
+.ribbon-drag-span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--color-accent);
+  opacity: 0.25;
+  pointer-events: none;
+}
+.ribbon-drag-span[data-confirmed="true"] {
+  opacity: 0.35;
+}
+
+/* Drag tooltip — previews the timestamp under the pointer during a scrubber
+   drag. Monospace so the digits don't jitter as the pointer moves. */
+.scrubber-tooltip {
+  position: absolute;
+  bottom: 100%;
+  transform: translateX(-50%);
+  margin-bottom: var(--sp-1);
+  padding: 2px var(--sp-2);
+  background: var(--color-surface-3);
+  border: 1px solid var(--color-border-2);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Draw-on reveal: wipe in left→right on first paint (one moment of delight). */
+@keyframes ribbon-reveal {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+.time-ribbon-svg[data-draw="1"] {
+  animation: ribbon-reveal 400ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .time-ribbon-svg[data-draw="1"] {
+    animation: none;
+  }
+}

@@ -1,0 +1,320 @@
+{#
+  Partial: camera_form.html — inline add/edit camera form fragment.
+
+  Context:
+    camera — None for the create form; the camera view
+             {id, name, protocol, address, credentials_inherit_default,
+             snapshot_uri, stream_uri, geolocation} for the edit form.
+    camera_username — str, the stored credential username for edit prefill
+                      (empty in create mode). The password is NEVER prefilled.
+    default_username — str, the active global default-credentials username, shown
+                       as info when "use default credentials" is ticked. Empty
+                       when no default is configured/enabled. Never a password.
+    csrf_token — str, required on every mutating form.
+    flash_messages — optional list of {type, message} shown as inline errors.
+
+  Two structurally distinct shapes by mode, because the two callers swap the
+  fragment into different containers:
+
+  * Create mode renders a <div class="card"> loaded into the page's
+    ``#camera-form-container`` div; it is a normal <form> posting to
+    ``POST /cameras`` (a 303 redirect).
+  * Edit mode renders a <tr id="camera-row-{id}"> that REPLACES the camera's
+    display row (the Edit button does ``hx-swap="outerHTML"`` on that row). The
+    fragment must keep the same row id so the apply's ``hx-target`` still
+    resolves; the form ``hx-post``s to ``POST /cameras/{id}/edit`` and swaps the
+    refreshed display row back in.
+#}
+{% set editing = camera is not none %}
+
+{% macro fields(editing, camera, camera_username, default_username) %}
+  {# Ticked by default on add; on edit it reflects the stored flag. #}
+  {% set inherit = camera.credentials_inherit_default if editing else true %}
+  {# A unique suffix so the create and edit fragments never collide on element
+     ids when both could exist in the DOM. #}
+  {% set uid = ('cam-' ~ camera.id) if editing else 'cam-new' %}
+  {% for flash in flash_messages %}
+    <div class="alert error" role="alert" style="margin-bottom:var(--sp-3);">
+      {{ flash.message }}
+    </div>
+  {% endfor %}
+  <div class="form-stack">
+    {# Address-first: the golden path starts with the address and a single Query
+       that proposes protocol / hostname / location, then name and protocol. #}
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-address">Address</label>
+        <input type="text" id="{{ uid }}-address" name="address"
+               class="form-control"
+               value="{{ camera.address or '' if editing else '' }}"
+               placeholder="host, IP, or URL" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-hostname">Hostname</label>
+        {# The camera's network hostname. Filled by Query camera, or set by hand.
+           A hidden source field records whether the value came from the camera
+           ("camera") or was typed ("manual"); typing here resets it to manual. #}
+        <input type="text" id="{{ uid }}-hostname" name="device_hostname"
+               class="form-control"
+               value="{{ camera.device_hostname or '' if editing else '' }}"
+               placeholder="optional; set by Query"
+               autocomplete="off"
+               oninput="var s=this.form.querySelector(
+                        '[name=&quot;device_hostname_source&quot;]');
+                        if (s) { s.value = 'manual'; }">
+        <input type="hidden" name="device_hostname_source"
+               value="{{ camera.device_hostname_source or 'manual'
+                         if editing else 'manual' }}">
+      </div>
+    </div>
+
+    {# Query camera: a single probe of the address that proposes the protocol(s)
+       it speaks, the network hostname it reports, and the location it reports —
+       all in one consolidated panel. hx-include sends the surrounding form's
+       fields (address + any credentials; the credential inputs are disabled while
+       inheriting, so they drop out and the server falls back to the global
+       default). The result fragment fills protocol / snapshot_uri / stream_uri /
+       hostname / latitude / longitude (some of them inside Advanced) for review
+       before saving. #}
+    <div class="form-group">
+      <button type="button" class="btn btn-primary"
+              hx-post="/cameras/query"
+              hx-include="closest form"
+              hx-target="#camera-query-results"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              hx-indicator="#{{ uid }}-query-spinner">
+        <span id="{{ uid }}-query-spinner" class="spinner htmx-indicator"
+              aria-hidden="true"></span>
+        Query camera
+      </button>
+      <span class="form-hint">
+        Probe the address and propose its protocol(s), hostname, and location.
+      </span>
+      <div id="camera-query-results" aria-live="polite"></div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="camera_name">
+          Name<span class="required" aria-hidden="true">*</span>
+        </label>
+        <input type="text" id="camera_name" name="name" class="form-control"
+               value="{{ camera.name if editing else '' }}"
+               required autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="camera_protocol">Protocol</label>
+        {% set current_protocol = camera.protocol if editing else '' %}
+        <select id="camera_protocol" name="protocol" class="form-control">
+          <option value="" {{ 'selected' if not current_protocol else '' }}>
+            (none)
+          </option>
+          {% for proto in ('vapix', 'rtsp', 'onvif', 'http') %}
+            <option value="{{ proto }}"
+                    {{ 'selected' if current_protocol == proto else '' }}>
+              {{ proto | upper }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    {# Credentials: either inherit the global default, or set per-camera ones. #}
+    <div class="form-group">
+      <label class="form-check" style="display:flex;gap:var(--sp-2);
+             align-items:center;">
+        <input type="checkbox" name="credentials_inherit_default"
+               id="{{ uid }}-inherit"
+               {{ 'checked' if inherit else '' }}
+               onchange="var c=document.getElementById('{{ uid }}-creds');
+                         c.hidden=this.checked;
+                         document.getElementById('{{ uid }}-username').disabled=
+                         this.checked;
+                         document.getElementById('{{ uid }}-password').disabled=
+                         this.checked;
+                         document.getElementById('{{ uid }}-default-info').hidden=
+                         !this.checked;">
+        <span>Use default credentials</span>
+      </label>
+      <span class="form-hint">
+        When ticked, this camera uses the global default credentials configured
+        in Settings.
+      </span>
+    </div>
+
+    {# Shown only while inheriting: which default login will be used. #}
+    <div id="{{ uid }}-default-info" class="form-hint"
+         {{ '' if inherit else 'hidden' }}>
+      {% if default_username %}
+        Using default credentials (username:
+        <span class="mono">{{ default_username }}</span>).
+      {% else %}
+        No default credentials are configured. Set them in Settings, or untick
+        to enter credentials for this camera.
+      {% endif %}
+    </div>
+
+    {# Per-camera credentials: hidden while inheriting the default. #}
+    <div class="form-row" id="{{ uid }}-creds" {{ 'hidden' if inherit else '' }}>
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-username">Username</label>
+        <input type="text" id="{{ uid }}-username" name="username"
+               class="form-control"
+               value="{{ camera_username if editing else '' }}"
+               autocomplete="off" {{ 'disabled' if inherit else '' }}>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-password">Password</label>
+        {# Never prefilled. In edit mode a blank value preserves the stored
+           credentials; only a new value replaces them. #}
+        <input type="password" id="{{ uid }}-password" name="password"
+               class="form-control" autocomplete="new-password"
+               aria-describedby="{{ uid }}-pw-hint"
+               {{ 'disabled' if inherit else '' }}>
+        {% if editing %}
+          <span class="form-hint" id="{{ uid }}-pw-hint">
+            Leave blank to keep the current password.
+          </span>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ------------------------------------------------------------------ #}
+    {# ADVANCED disclosure — less-common fields, collapsed by default:    #}
+    {#   snapshot/stream URIs and the Location block. The form's name= and  #}
+    {#   the Query "Accept all" wiring reach these by name even while the   #}
+    {#   <details> is collapsed (setting .value on a hidden input works).   #}
+    {# ------------------------------------------------------------------ #}
+    <details class="form-advanced" id="{{ uid }}-advanced">
+      <summary class="form-label" style="cursor:pointer;font-weight:600;">
+        Advanced
+      </summary>
+      <div class="form-stack" style="margin-top:var(--sp-3);">
+
+    {# Snapshot / stream URIs: filled by Detect, or set by hand. A successful
+       ONVIF/VAPIX detection populates these for review before saving. #}
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-snapshot-uri">
+          Snapshot URI
+        </label>
+        <input type="text" id="{{ uid }}-snapshot-uri" name="snapshot_uri"
+               class="form-control"
+               value="{{ camera.snapshot_uri or '' if editing else '' }}"
+               placeholder="optional; set by Detect" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-stream-uri">Stream URI</label>
+        <input type="text" id="{{ uid }}-stream-uri" name="stream_uri"
+               class="form-control"
+               value="{{ camera.stream_uri or '' if editing else '' }}"
+               placeholder="optional; set by Detect" autocomplete="off">
+      </div>
+    </div>
+
+    {# ------------------------------------------------------------------ #}
+    {# LOCATION block — latitude / longitude / source, with optional poll #}
+    {# ------------------------------------------------------------------ #}
+    {% set geo = camera.geolocation if editing else none %}
+    {% set src = geo.source if geo else 'manual' %}
+    <div class="form-group">
+      <div class="form-label" style="font-weight:600;margin-bottom:var(--sp-2);">
+        Location
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="{{ uid }}-latitude">Latitude</label>
+          <input type="number" step="any" min="-90" max="90"
+                 id="{{ uid }}-latitude" name="latitude" class="form-control"
+                 value="{{ geo.lat if geo else '' }}"
+                 autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="{{ uid }}-longitude">Longitude</label>
+          <input type="number" step="any" min="-180" max="180"
+                 id="{{ uid }}-longitude" name="longitude" class="form-control"
+                 value="{{ geo.lon if geo else '' }}"
+                 autocomplete="off">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-geo-source">Source</label>
+        <select id="{{ uid }}-geo-source" name="geo_source" class="form-control"
+                style="max-width:18rem;">
+          <option value="manual" {{ 'selected' if src == 'manual' else '' }}>
+            Manual
+          </option>
+          <option value="camera" {{ 'selected' if src == 'camera' else '' }}>
+            Camera-reported
+          </option>
+        </select>
+      </div>
+      {% if editing %}
+        <div style="display:flex;align-items:center;gap:var(--sp-3);
+                    flex-wrap:wrap;margin-top:var(--sp-1);">
+          <button type="button" class="btn btn-ghost"
+                  hx-get="/cameras/{{ camera.id }}/geolocation"
+                  hx-target="#{{ uid }}-geo-poll-result"
+                  hx-swap="innerHTML"
+                  aria-controls="{{ uid }}-geo-poll-result">
+            &#8635; Poll camera
+          </button>
+        </div>
+        <div id="{{ uid }}-geo-poll-result"
+             role="status" aria-live="polite"
+             style="margin-top:var(--sp-2);">
+        </div>
+      {% endif %}
+      <span class="form-hint">
+        Manual coordinates override what the camera reports.
+      </span>
+    </div>
+      </div>{# /form-stack #}
+    </details>
+
+    <div style="display:flex;gap:var(--sp-3);">
+      <button type="submit" class="btn btn-primary">
+        {{ 'Save Changes' if editing else 'Create Camera' }}
+      </button>
+      {% if editing %}
+        {# Cancel reloads the cameras page, restoring the unchanged row. #}
+        <a href="/cameras" class="btn btn-ghost">Cancel</a>
+      {% else %}
+        <button type="button" class="btn btn-ghost"
+                onclick="document.getElementById('camera-form-card').remove();">
+          Cancel
+        </button>
+      {% endif %}
+    </div>
+  </div>
+{% endmacro %}
+
+{% if editing %}
+  {# Replaces the display <tr>; keeps the row id so the apply target survives. #}
+  <tr id="camera-row-{{ camera.id }}">
+    <td colspan="5">
+      <form novalidate
+            method="post"
+            action="/cameras/{{ camera.id }}/edit"
+            hx-post="/cameras/{{ camera.id }}/edit"
+            hx-target="#camera-row-{{ camera.id }}"
+            hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ fields(editing, camera, camera_username, default_username) }}
+      </form>
+    </td>
+  </tr>
+{% else %}
+  <div class="card mb-6" id="camera-form-card">
+    <div class="card-header">
+      <div class="card-title">Add Camera</div>
+    </div>
+    <div class="card-body">
+      <form novalidate method="post" action="/cameras">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {{ fields(editing, camera, camera_username, default_username) }}
+      </form>
+    </div>
+  </div>
+{% endif %}

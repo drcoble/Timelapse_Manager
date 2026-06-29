@@ -1,0 +1,46 @@
+{#
+  Partial: audit_batch.html — one continuous-scroll batch of audit/security
+  rows plus a fresh sentinel row (or the end-cap). Returned by GET /audit/batch
+  and also included for the initial tbody in audit.html. The mirror of
+  events_batch.html, but the cursor links target the admin-only audit batch
+  route and the rows are audit/security records only.
+
+  Context: events — list[_EventView]; next_before — int | None (the event-id
+           cursor for the next/older batch, None at the start of the log);
+           filter_qs — URL-encoded active filter (q).
+
+  The sentinel is a <tr> (table-valid) carrying hx-trigger="revealed" +
+  hx-swap="outerHTML": as it scrolls into view it fetches the next batch and
+  replaces itself with [older rows + a new sentinel]. Its <a> is the no-JS
+  pagination fallback. Events are newest-first, so the oldest item is
+  ``events[-1]`` and the newest ``events[0]``.
+#}
+{% for event in events %}{% include '_partials/event_row.html' %}{% endfor %}
+{% if next_before is not none %}
+<tr class="log-sentinel"
+    {% if events %}
+    data-batch-count="{{ events | length }}"
+    data-newest-id="{{ events[0].id }}"
+    data-newest-timestamp="{{ events[0].timestamp_raw | localdt if events[0].timestamp_raw else (events[0].timestamp or '') }}"
+    data-oldest-timestamp="{{ events[-1].timestamp_raw | localdt if events[-1].timestamp_raw else (events[-1].timestamp or '') }}"
+    {% else %}
+    data-batch-count="0"
+    {% endif %}
+    hx-get="/audit/batch?before={{ next_before }}{% if filter_qs %}&{{ filter_qs }}{% endif %}"
+    hx-trigger="revealed"
+    hx-swap="outerHTML">
+  <td colspan="5">
+    <a href="/events/audit?before={{ next_before }}{% if filter_qs %}&{{ filter_qs }}{% endif %}">Load older records</a>
+  </td>
+</tr>
+{% else %}
+<tr class="log-end-cap"
+    {% if events %}
+    data-batch-count="{{ events | length }}"
+    data-newest-id="{{ events[0].id }}"
+    data-newest-timestamp="{{ events[0].timestamp_raw | localdt if events[0].timestamp_raw else (events[0].timestamp or '') }}"
+    data-oldest-timestamp="{{ events[-1].timestamp_raw | localdt if events[-1].timestamp_raw else (events[-1].timestamp or '') }}"
+    {% else %}
+    data-batch-count="0"
+    {% endif %}><td colspan="5">Beginning of the log</td></tr>
+{% endif %}

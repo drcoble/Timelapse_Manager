@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}About — Timelapse Manager{% endblock %}
+{% block page_title_short %}About{% endblock %}
+
+{% block content %}
+
+{#
+  About page. Visible to any authenticated user: the version, build, and license
+  shown here are not sensitive. The values are supplied by the route -- the app
+  version from the single version source, the build number from the generated
+  build-info module (or "unknown" in a dev checkout), and the ffmpeg version from
+  the value cached at startup.
+#}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>About Timelapse Manager</h1>
+    <div class="subtitle">Version &middot; Build &middot; Components &middot; License</div>
+  </div>
+</div>
+
+<section class="card form-section">
+  <div class="form-section-title">Application</div>
+  <dl class="about-list">
+    <dt>Version</dt>
+    <dd class="mono">{{ app_version }}</dd>
+
+    <dt>Build</dt>
+    <dd class="mono">{{ build_info.sha }} &middot; {{ build_info.date }}</dd>
+
+    <dt>FFmpeg</dt>
+    <dd class="mono">{{ ffmpeg_version }}</dd>
+  </dl>
+  <span class="form-hint">
+    The build number is the source commit and the date the release was packaged.
+    A development checkout reports <code>unknown</code> until a packaged build is
+    produced.
+  </span>
+</section>
+
+<section class="card form-section">
+  <div class="form-section-title">License</div>
+  <p>
+    Timelapse Manager is distributed under the
+    <strong>{{ license_name }}</strong> license.
+  </p>
+  {# Full license text is readable inline via a disclosure — no separate page. #}
+  <details class="about-license-disclosure">
+    <summary>View license text</summary>
+    <pre class="about-license mono" aria-label="License text"
+         style="max-height:24rem;overflow:auto;white-space:pre-wrap;">{{ license_text }}</pre>
+  </details>
+</section>
+
+{% endblock %}

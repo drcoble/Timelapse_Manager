@@ -1,0 +1,492 @@
+{# Project settings form, shared by the standalone edit page and the in-page
+   settings tab so the two cannot drift. The "automatic renders" section also
+   holds the render-schedule settings (there is no separate schedule surface —
+   this is one saved form). Posts to /projects/{id}/settings. #}
+<form method="post" action="/projects/{{ project.id }}/settings" novalidate>
+  {# CSRF token — required on every mutating form #}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <div class="form-stack">
+
+    <div class="form-group">
+      <label class="form-label" for="name">
+        Project name<span class="required" aria-hidden="true">*</span>
+      </label>
+      <input
+        id="name"
+        type="text"
+        name="name"
+        class="form-control"
+        value="{{ project.name }}"
+        required
+        aria-required="true"
+        autofocus
+      >
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="camera_id">
+        Camera<span class="required" aria-hidden="true">*</span>
+      </label>
+      <select
+        id="camera_id"
+        name="camera_id"
+        class="form-control"
+        required
+        aria-required="true"
+        hx-get="/cameras/stream-profiles"
+        hx-trigger="change"
+        hx-target="#stream-profile-container"
+        hx-swap="innerHTML"
+        hx-include="[name='camera_id']"
+      >
+        {% for camera in cameras %}
+        <option value="{{ camera.id }}"{% if camera.id == project.camera_id %} selected{% endif %}>
+          {{- camera.name -}}
+          {%- if not camera.protocol %} (not capture-ready){% endif %}
+        </option>
+        {% endfor %}
+      </select>
+      <span class="form-hint">Only cameras with a configured protocol can capture frames.</span>
+    </div>
+
+    {# Stream-profile picker. Server-rendered for the saved camera so the
+       current selection shows preselected; the camera select's hx-get
+       replaces it when a different camera is chosen. #}
+    <div id="stream-profile-container" aria-live="polite">
+      {% with profiles = stream_profiles,
+              profiles_ok = stream_profiles_ok,
+              selected_stream_id = stream_selected_id %}
+        {% include "_partials/stream_profile_select.html" %}
+      {% endwith %}
+    </div>
+
+    {# PTZ preset / position picker. Server-rendered for the saved camera. #}
+    <div
+      id="ptz-preset-container"
+      aria-live="polite"
+      hx-get="/cameras/ptz-presets"
+      hx-trigger="change from:#camera_id"
+      hx-include="[name='camera_id']"
+      hx-swap="innerHTML"
+    >
+      {% with presets = ptz_presets,
+              presets_ok = ptz_presets_ok,
+              ptz_supported = ptz_supported,
+              selected_preset_id = ptz_selected_preset_id,
+              ptz_pan = ptz_pan,
+              ptz_tilt = ptz_tilt,
+              ptz_zoom = ptz_zoom %}
+        {% include "_partials/ptz_preset_select.html" %}
+      {% endwith %}
+    </div>
+
+    {# Capture mode: continuous interval vs. solar / scheduled-times only. The
+       latter has no recurring interval and captures purely from the exact-time /
+       solar anchors below. #}
+    {% set _is_solar_mode = (capture_mode == 'solar') %}
+    <div class="form-group">
+      <span class="form-label" id="capture-mode-label">Capture mode</span>
+      <div role="radiogroup" aria-labelledby="capture-mode-label"
+           style="display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-1);">
+        <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+          <input type="radio" name="capture_mode" value="interval"
+                 {% if not _is_solar_mode %}checked{% endif %}
+                 onchange="tlmCaptureModeChange(this);"
+                 style="accent-color:var(--color-accent);margin-top:3px;">
+          <span>
+            <strong>Continuous (interval)</strong>
+            <span class="form-hint" style="display:block;">Capture a frame every set interval during the active window.</span>
+          </span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
+          <input type="radio" name="capture_mode" value="solar"
+                 {% if _is_solar_mode %}checked{% endif %}
+                 onchange="tlmCaptureModeChange(this);"
+                 style="accent-color:var(--color-accent);margin-top:3px;">
+          <span>
+            <strong>Solar / scheduled times only</strong>
+            <span class="form-hint" style="display:block;">No continuous capture &mdash; capture only at the times set under <em>Exact-time captures</em> below (solar noon, sunrise, sunset, or exact clock times).</span>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <div class="form-group interval-only-field"{% if _is_solar_mode %} hidden{% endif %}>
+      <label class="form-label" id="interval-label" for="capture_interval_value">
+        Capture interval<span class="required" aria-hidden="true">*</span>
+      </label>
+      <div class="input-group" role="group" aria-labelledby="interval-label">
+        <input
+          id="capture_interval_value"
+          type="number"
+          name="capture_interval_value"
+          class="form-control"
+          min="1"
+          step="1"
+          value="{{ project.interval_value }}"
+          required
+          aria-required="true"
+          aria-describedby="interval-hint"
+          {% if _is_solar_mode %}disabled{% endif %}
+        >
+        <select
+          name="capture_interval_unit"
+          class="form-control"
+          aria-label="Interval unit"
+        >
+          {% for unit in ["seconds", "minutes", "hours", "days", "weeks", "months"] %}
+          <option value="{{ unit }}"{% if unit == project.interval_unit %} selected{% endif %}>{{ unit }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <span class="form-hint" id="interval-hint">How often to capture a frame. Minimum 1 second.</span>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="storage_path">
+        Storage path
+      </label>
+      <input
+        id="storage_path"
+        type="text"
+        name="storage_path"
+        class="form-control mono"
+        value="{{ project.storage_path or '' }}"
+        aria-describedby="storage-hint"
+      >
+      <span class="form-hint" id="storage-hint">Leave blank to use the default per-project directory.</span>
+    </div>
+
+    {# Capture schedule — window, days, timezone, presets. Only gates interval
+       capture, so it is hidden in solar / scheduled-times-only mode. #}
+    <div class="interval-only-field"{% if _is_solar_mode %} hidden{% endif %}>
+      {% include "_partials/capture_schedule_fields.html" %}
+    </div>
+
+    {# Exact-time captures — once-per-day single-shot anchors. In solar mode these
+       ARE the capture times; in interval mode they are optional extras. #}
+    {% include "_partials/_exact_time_fieldset.html" %}
+
+    {# Event-triggered captures — one-shot capture on camera event. #}
+    {% include "_partials/_event_triggers_fieldset.html" %}
+
+    <details style="margin-top:var(--sp-2);">
+      <summary style="cursor:pointer;font-weight:600;">
+        Automatic renders &amp; post-render actions
+      </summary>
+      <div class="form-stack" style="margin-top:var(--sp-3);">
+
+        <fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+          <legend style="padding:0 var(--sp-2);font-weight:600;">Render settings</legend>
+          <p class="form-hint" style="margin-top:0;">
+            How automatic and manual renders encode this project's frames.
+            These choices apply to both the scheduled renders below and the
+            manual "Render now" action.
+          </p>
+
+          {# Combo warning target: the encoder/container selects post here on
+             change, and the save handler enforces the same rule server-side. #}
+          <div id="render-combo-warning" aria-live="polite"></div>
+
+          <div class="form-group">
+            <label class="form-label" for="render_enabled" style="display:flex;align-items:center;gap:var(--sp-2);">
+              <input
+                id="render_enabled"
+                type="checkbox"
+                name="render_enabled"
+                {% if project.render_settings.enabled %}checked{% endif %}
+              >
+              Enable scheduled renders
+            </label>
+            <span class="form-hint">When on, a render is produced automatically on the frequency below.</span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="render_frequency">Render frequency</label>
+            <select id="render_frequency" name="render_frequency" class="form-control">
+              <option value="3600"{% if project.render_settings.interval_seconds == 3600 %} selected{% endif %}>Every hour</option>
+              <option value="21600"{% if project.render_settings.interval_seconds == 21600 %} selected{% endif %}>Every 6 hours</option>
+              <option value="43200"{% if project.render_settings.interval_seconds == 43200 %} selected{% endif %}>Every 12 hours</option>
+              <option value="86400"{% if project.render_settings.interval_seconds == 86400 %} selected{% endif %}>Daily</option>
+              <option value="604800"{% if project.render_settings.interval_seconds == 604800 %} selected{% endif %}>Weekly</option>
+            </select>
+            <span class="form-hint">How often a scheduled render runs.</span>
+          </div>
+
+          {# Auto-prune. The hidden marker is always submitted so the save
+             handler can tell a deliberate "off" (checkbox absent, marker
+             present) apart from a form that carries no auto-prune control. #}
+          <div class="form-group">
+            <input type="hidden" name="render_autoprune_present" value="1">
+            <label class="form-label" for="render_autoprune" style="display:flex;align-items:center;gap:var(--sp-2);">
+              <input
+                id="render_autoprune"
+                type="checkbox"
+                name="render_autoprune"
+                {% if project.render_settings.autoprune %}checked{% endif %}
+              >
+              Automatically delete previous renders from scheduled and archive runs
+            </label>
+            <span class="form-hint">
+              When enabled, only the most recent scheduled render and most
+              recent archive render are kept. Older automatic renders are
+              deleted after each new one completes. Manual renders are never
+              affected.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="auto_chapters">Auto chapter markers</label>
+            <select id="auto_chapters" name="auto_chapters" class="form-control"
+                    aria-describedby="auto-chapters-hint">
+              <option value="none"{% if (current_render_settings or {}).get('auto_chapters', 'none') == 'none' %} selected{% endif %}>None — no chapter markers</option>
+              <option value="weekly"{% if (current_render_settings or {}).get('auto_chapters') == 'weekly' %} selected{% endif %}>Weekly — add a chapter at each week boundary</option>
+              <option value="monthly"{% if (current_render_settings or {}).get('auto_chapters') == 'monthly' %} selected{% endif %}>Monthly — add a chapter at each month boundary</option>
+            </select>
+            <span class="form-hint" id="auto-chapters-hint">
+              Insert a chapter marker at each week or month boundary in the
+              timelapse. Applies to MP4 and MKV outputs only; ignored for WebM.
+            </span>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="render_encoder">Encoder</label>
+              <select
+                id="render_encoder"
+                name="render_encoder"
+                class="form-control"
+                hx-get="/renders/combo-check"
+                hx-trigger="change, load"
+                hx-target="#render-combo-warning"
+                hx-swap="innerHTML"
+                hx-include="[name^='render_']"
+              >
+                <option value="libx264"{% if project.render_settings.encoder == 'libx264' %} selected{% endif %}>H.264 (libx264)</option>
+                <option value="libx265"{% if project.render_settings.encoder == 'libx265' %} selected{% endif %}>H.265 (libx265)</option>
+                <option value="libsvtav1"{% if project.render_settings.encoder == 'libsvtav1' %} selected{% endif %}>AV1 (libsvtav1)</option>
+                <option value="libvpx-vp9"{% if project.render_settings.encoder == 'libvpx-vp9' %} selected{% endif %}>VP9 (libvpx-vp9)</option>
+              </select>
+              <span class="form-hint">The video codec.</span>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="render_container">Container</label>
+              <select
+                id="render_container"
+                name="render_container"
+                class="form-control"
+                hx-get="/renders/combo-check"
+                hx-trigger="change"
+                hx-target="#render-combo-warning"
+                hx-swap="innerHTML"
+                hx-include="[name^='render_']"
+              >
+                <option value="mp4"{% if project.render_settings.container == 'mp4' %} selected{% endif %}>MP4 (mp4)</option>
+                <option value="mkv"{% if project.render_settings.container == 'mkv' %} selected{% endif %}>MKV (mkv)</option>
+                <option value="webm"{% if project.render_settings.container == 'webm' %} selected{% endif %}>WebM (webm)</option>
+              </select>
+              <span class="form-hint">The output file format.</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group" role="group" aria-label="Frame rate">
+              <label class="form-label" for="render_fps">Frame rate</label>
+              <input
+                type="number"
+                id="render_fps"
+                name="render_fps"
+                class="form-control"
+                style="max-width:160px;"
+                min="1"
+                max="240"
+                step="1"
+                value="{{ project.render_settings.fps }}"
+                aria-describedby="render-fps-hint"
+              >
+              {% if project.fps_suggestions %}
+                <div style="display:flex;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-2);">
+                  {% for fps in project.fps_suggestions %}
+                    <button type="button" class="btn btn-sm btn-secondary"
+                            onclick="tlmSetRenderFps({{ fps }});">
+                      {{ fps }} fps
+                    </button>
+                  {% endfor %}
+                </div>
+              {% endif %}
+              <span class="form-hint" id="render-fps-hint">
+                Playback frame rate of the timelapse. The suggestions above are
+                sensible rates for this project's capture interval; any whole
+                number from 1 to 240 is allowed.
+              </span>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="render_resolution">Resolution</label>
+              <select id="render_resolution" name="render_resolution" class="form-control">
+                <option value="1280x720"{% if project.render_settings.resolution == '1280x720' %} selected{% endif %}>1280 x 720 (720p)</option>
+                <option value="1920x1080"{% if project.render_settings.resolution == '1920x1080' %} selected{% endif %}>1920 x 1080 (1080p)</option>
+                <option value="2560x1440"{% if project.render_settings.resolution == '2560x1440' %} selected{% endif %}>2560 x 1440 (1440p)</option>
+                <option value="3840x2160"{% if project.render_settings.resolution == '3840x2160' %} selected{% endif %}>3840 x 2160 (2160p / 4K)</option>
+                <option value="source"{% if project.render_settings.resolution == 'source' %} selected{% endif %}>Source (no scaling)</option>
+              </select>
+              <span class="form-hint">Output size; "source" keeps the captured size.</span>
+            </div>
+          </div>
+        </fieldset>
+
+        {# Suggestion chips set the frame-rate input to a sensible rate. #}
+        <script>
+          function tlmSetRenderFps(value) {
+            var input = document.getElementById('render_fps');
+            if (input) { input.value = value; }
+          }
+        </script>
+
+        <div class="form-group">
+          <label class="form-label" for="archive_schedule">Archive schedule (JSON)</label>
+          <textarea
+            id="archive_schedule"
+            name="archive_schedule"
+            class="form-control mono"
+            rows="4"
+            spellcheck="false"
+            aria-describedby="archive-schedule-hint"
+            placeholder='{"enabled": true, "interval_seconds": 86400}'
+          >{{ project.archive_schedule_json }}</textarea>
+          <span class="form-hint" id="archive-schedule-hint">
+            Long-term archive renders. Same shape as the render schedule.
+          </span>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="post_render_actions">Post-render actions (JSON)</label>
+          <textarea
+            id="post_render_actions"
+            name="post_render_actions"
+            class="form-control mono"
+            rows="4"
+            spellcheck="false"
+            aria-describedby="post-actions-hint"
+            placeholder='[{"type": "export", "destination": "/path"}]'
+          >{{ project.post_render_actions_json }}</textarea>
+          <span class="form-hint" id="post-actions-hint">
+            A JSON list of actions, each an object with a <code>type</code>
+            (export, prune, external_trigger). Leave blank for none.
+          </span>
+        </div>
+
+      </div>
+    </details>
+
+    {# Campaign bounds (optional) — kept last because it is optional; most
+       projects leave it open-ended. #}
+    <fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+      <legend style="padding:0 var(--sp-2);font-weight:600;">Campaign bounds (optional)</legend>
+      <p class="form-hint" style="margin-top:0;">
+        These bound the campaign as a whole and are separate from any daily
+        capture-window schedule. Leave blank for an open-ended campaign.
+        Dates are interpreted as UTC.
+      </p>
+
+      <div class="form-group">
+        <label class="form-label" for="start_date">Start date</label>
+        <input
+          id="start_date"
+          type="datetime-local"
+          name="start_date"
+          class="form-control"
+          value="{{ project.start_date_input }}"
+          aria-describedby="start-date-hint"
+        >
+        <span class="form-hint" id="start-date-hint">Capture does not run before this instant. Leave blank to start immediately.</span>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="end_date">End date</label>
+        <input
+          id="end_date"
+          type="datetime-local"
+          name="end_date"
+          class="form-control"
+          value="{{ project.end_date_input }}"
+          aria-describedby="end-date-hint"
+        >
+        <span class="form-hint" id="end-date-hint">At this instant capture stops and the project is archived. Must be after the start date.</span>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="max_frame_count">Maximum frames</label>
+        <input
+          id="max_frame_count"
+          type="number"
+          name="max_frame_count"
+          class="form-control"
+          style="max-width:160px;"
+          min="1"
+          step="1"
+          value="{{ project.max_frame_count if project.max_frame_count is not none else '' }}"
+          aria-describedby="max-frames-hint"
+        >
+        <span class="form-hint" id="max-frames-hint">Capture stops once this many frames have been captured, then the project is archived. Leave blank for no cap.</span>
+      </div>
+    </fieldset>
+
+    <div style="display:flex;gap:var(--sp-3);padding-top:var(--sp-2);">
+      <button type="submit" class="btn btn-primary">Save changes</button>
+      <a href="/projects/{{ project.id }}" class="btn btn-ghost">Cancel</a>
+    </div>
+
+  </div>
+
+  {# Capture-mode toggle: show/hide interval + schedule-window fields vs the
+     solar/exact-time anchors, and disable the (required) interval input when it
+     is hidden so it neither validates nor submits in solar mode. Mirrors the
+     inline-script pattern used by the fieldsets above. #}
+  <script>
+  (function () {
+    function tlmCaptureModeSync() {
+      var checked = document.querySelector('input[name="capture_mode"]:checked');
+      var solar = !!(checked && checked.value === 'solar');
+      document.querySelectorAll('.interval-only-field').forEach(function (el) {
+        el.hidden = solar;
+      });
+      var intervalInput = document.getElementById('capture_interval_value');
+      if (intervalInput) { intervalInput.disabled = solar; }
+      var unit = document.querySelector('select[name="capture_interval_unit"]');
+      if (unit) { unit.disabled = solar; }
+    }
+    function tlmCaptureModeChange() {
+      tlmCaptureModeSync();
+      var checked = document.querySelector('input[name="capture_mode"]:checked');
+      if (checked && checked.value === 'solar') {
+        // A solar project needs at least one capture time; seed one if empty so
+        // the operator starts from a valid, ready-to-edit row. Default it to a
+        // solar-noon anchor (the headline use case) when the camera has a
+        // location; otherwise leave the fieldset's clock default.
+        var rows = document.querySelectorAll('#exact-time-rows .exact-time-row');
+        if (rows.length === 0 && typeof window.tlmExactTimeAddRow === 'function') {
+          window.tlmExactTimeAddRow();
+          var added = document.querySelectorAll('#exact-time-rows .exact-time-row');
+          var newRow = added[added.length - 1];
+          var kind = newRow && newRow.querySelector('select[name="anchor_kind"]');
+          var solarOpt = kind && kind.querySelector('option[value="solar_noon"]');
+          if (kind && solarOpt && !solarOpt.disabled) {
+            kind.value = 'solar_noon';
+            if (typeof window.tlmExactTimeKindChange === 'function') {
+              window.tlmExactTimeKindChange(kind);  // hide the clock time field
+            }
+          }
+        }
+      }
+    }
+    window.tlmCaptureModeChange = tlmCaptureModeChange;
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tlmCaptureModeSync);
+    }
+    tlmCaptureModeSync();  // also run now (covers HTMX-swapped fragment loads)
+  }());
+  </script>
+</form>

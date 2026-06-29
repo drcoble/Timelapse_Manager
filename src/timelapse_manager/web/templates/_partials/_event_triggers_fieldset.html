@@ -1,0 +1,403 @@
+{# Event-triggered captures fieldset — shared partial.
+   Include this inside an existing <form>; it must not contain a <form> tag.
+   Include only on the settings/edit screen, NOT the create screen.
+
+   Context vars consumed:
+     discovered_events       : list[dict] — each dict has keys:
+                                 topic_id (str), label (str), category (str),
+                                 stateful (bool), protocol (str),
+                                 requires_app (bool).
+                               Used to populate the topic <select>.
+     events_discovery_ok     : bool — False triggers the degraded-mode render.
+     events_discovery_message: str|None — shown as an informational note in
+                               degraded mode (e.g. "camera unreachable").
+     current_triggers        : list[dict] — each dict has keys:
+                                 id (int|str), topic_id (str), label (str),
+                                 enabled (bool), cooldown_seconds (int).
+                               Rendered one row each in both normal and degraded
+                               mode so a save never silently drops saved triggers.
+
+   Field-name contract (one set per row, lists are index-zipped server-side):
+     event_triggers_present  — ONE hidden marker emitted whenever the fieldset
+                               renders; lets the server distinguish "absent
+                               fieldset" from "fieldset present but empty".
+     trigger_id[]            — hidden; stable DB id for existing rows, blank for
+                               new rows.
+     trigger_topic[]         — the canonical event topic id. In normal mode this
+                               is a <select>; in degraded mode it is a hidden
+                               input (topic round-trips) alongside a read-only
+                               display. A blank value causes the server to skip
+                               the row.
+     trigger_cooldown[]      — number input, integer seconds, min 0, default 10.
+     trigger_enabled[]       — checkbox whose value is trigger.id for existing
+                               rows or "new:<zero-based-index>" (among new rows
+                               only) for rows added in this session. Checked =
+                               enabled. An unchecked box does not POST.
+
+   Both modes:
+     - existing rows always rendered so a save never silently drops them.
+     - remove still works in degraded mode (no new: rows to renumber there).
+   Normal mode only:
+     - Add button + <template> for blank rows.
+     - Unknown topics (camera changed) appear as a selected option with
+       " (unavailable)" so the stored value round-trips.
+#}
+
+{# ── Presence marker — always emitted ──────────────────────────────────────── #}
+<input type="hidden" name="event_triggers_present" value="1">
+
+{# ── Determine normal vs degraded mode ─────────────────────────────────────── #}
+{% set _normal_mode = events_discovery_ok and discovered_events %}
+
+{# Precompute the set of known topic_ids for unknown-topic detection in
+   normal mode. Jinja2 has no set literal so we build a list to test with `in`. #}
+{% if _normal_mode %}
+  {% set _known_topics = discovered_events | map(attribute='topic_id') | list %}
+{% else %}
+  {% set _known_topics = [] %}
+{% endif %}
+
+<fieldset style="border:1px solid var(--color-border);border-radius:var(--radius-2);padding:var(--sp-4);">
+  <legend style="padding:0 var(--sp-2);font-weight:600;">Event-triggered captures</legend>
+  <p class="form-hint" style="margin-top:0;margin-bottom:var(--sp-3);">
+    Capture a frame when the camera reports an event. Fires regardless of
+    the daily schedule. The cooldown is the minimum seconds between captures
+    for that event.
+  </p>
+
+  {# ── Degraded-mode informational note ─────────────────────────────────────── #}
+  {% if not _normal_mode %}
+  <div class="alert" role="status"
+       style="margin-bottom:var(--sp-3);padding:var(--sp-2) var(--sp-3);
+              background:var(--color-info-bg);
+              border:1px solid var(--color-info);
+              border-radius:var(--radius-md);
+              color:var(--color-text);">
+    <svg class="icon" aria-hidden="true" style="vertical-align:-2px;margin-right:var(--sp-1);">
+      <use href="#icon-info"></use>
+    </svg>
+    Event list unavailable
+    {%- if events_discovery_message %} &mdash; {{ events_discovery_message }}{% endif %}.
+    Existing triggers are preserved.
+  </div>
+  {% endif %}
+
+  {# ── Row list ──────────────────────────────────────────────────────────────── #}
+  <div id="event-trigger-rows" aria-label="Event trigger list">
+
+    {# Empty state — shown when there are no saved triggers at all. #}
+    {% if not current_triggers %}
+    <p id="event-trigger-empty-state"
+       class="form-hint"
+       style="color:var(--color-text-dim);font-style:italic;
+              padding:var(--sp-3) 0;margin:0;">
+      No event triggers configured.
+      {% if _normal_mode %}Click &ldquo;Add event trigger&rdquo; to add one.{% endif %}
+    </p>
+    {% endif %}
+
+    {% for trigger in current_triggers %}
+      {% set _loop_idx = loop.index0 %}
+      {% set _id       = trigger.get('id', '') %}
+      {% set _topic_id = trigger.get('topic_id', '') %}
+      {% set _label    = trigger.get('label', _topic_id) %}
+      {% set _enabled  = trigger.get('enabled', True) %}
+      {% set _cooldown = trigger.get('cooldown_seconds', 10) %}
+      {% set _chk_val  = _id | string %}
+      {% set _row_uid  = 'trigger-row-' ~ _loop_idx %}
+      {# Unknown topic: saved topic not in the discovered list (camera changed). #}
+      {% set _unknown_topic = _normal_mode and (_topic_id not in _known_topics) %}
+
+      <div class="form-row event-trigger-row"
+           style="align-items:flex-start;gap:var(--sp-3);
+                  padding:var(--sp-3) 0;
+                  border-top:1px solid var(--color-border);"
+           id="{{ _row_uid }}">
+
+        {# Hidden id field (blank value for new rows) #}
+        <input type="hidden" name="trigger_id" value="{{ _id }}">
+
+        {# ── Topic field ─────────────────────────────────────────────────────── #}
+        {% if _normal_mode %}
+          {# Normal mode: editable <select> #}
+          <div class="form-group" style="flex:1 1 auto;min-width:220px;">
+            <label class="form-label"
+                   for="{{ _row_uid }}-topic"
+                   style="font-size:var(--text-sm);">Event</label>
+            <select id="{{ _row_uid }}-topic"
+                    name="trigger_topic"
+                    class="form-control">
+              <option value="">— select an event —</option>
+              {# If the stored topic is not in the current discovery list,
+                 inject it first as a selected option so the value round-trips
+                 and the user can see it is unavailable. #}
+              {% if _unknown_topic %}
+              <option value="{{ _topic_id }}" selected>{{ _label }} (unavailable)</option>
+              {% endif %}
+              {% for e in discovered_events %}
+              <option value="{{ e.topic_id }}"
+                      {% if e.topic_id == _topic_id and not _unknown_topic %}selected{% endif %}>
+                {{- e.label }} &mdash; {{ e.category -}}
+                {%- if e.requires_app %} (needs camera app){% endif %}
+              </option>
+              {% endfor %}
+            </select>
+          </div>
+        {% else %}
+          {# Degraded mode: hidden input + read-only display so topic round-trips. #}
+          <input type="hidden" name="trigger_topic" value="{{ _topic_id }}">
+          <div class="form-group" style="flex:1 1 auto;min-width:220px;">
+            <label class="form-label"
+                   for="{{ _row_uid }}-topic-display"
+                   style="font-size:var(--text-sm);">Event</label>
+            <div id="{{ _row_uid }}-topic-display"
+                 class="form-control"
+                 style="background:var(--color-surface-2);
+                        color:var(--color-text-muted);
+                        cursor:default;
+                        user-select:text;"
+                 aria-readonly="true"
+                 tabindex="0">{{ _label }}</div>
+            <span class="form-hint"
+                  style="font-size:var(--text-xs);color:var(--color-text-dim);">
+              Event list unavailable; topic preserved.
+            </span>
+          </div>
+        {% endif %}
+
+        {# Cooldown input #}
+        <div class="form-group" style="flex:0 0 auto;min-width:130px;">
+          <label class="form-label"
+                 for="{{ _row_uid }}-cooldown"
+                 style="font-size:var(--text-sm);">Cooldown (s)</label>
+          <input type="number"
+                 id="{{ _row_uid }}-cooldown"
+                 name="trigger_cooldown"
+                 class="form-control mono"
+                 style="max-width:100px;"
+                 min="0"
+                 step="1"
+                 value="{{ _cooldown }}"
+                 aria-describedby="{{ _row_uid }}-cooldown-hint">
+          <span class="form-hint" id="{{ _row_uid }}-cooldown-hint"
+                style="font-size:var(--text-xs);">
+            Minimum seconds between captures for this event.
+          </span>
+        </div>
+
+        {# Enabled checkbox #}
+        <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+          <label style="display:flex;align-items:center;gap:var(--sp-1);
+                        cursor:pointer;font-size:var(--text-sm);">
+            <input type="checkbox"
+                   name="trigger_enabled"
+                   value="{{ _chk_val }}"
+                   {% if _enabled %}checked{% endif %}
+                   style="accent-color:var(--color-accent);width:15px;height:15px;">
+            Enabled
+          </label>
+        </div>
+
+        {# Remove row button #}
+        <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+          <button type="button"
+                  class="btn btn-ghost btn-sm"
+                  aria-label="Remove this event trigger"
+                  onclick="tlmEventTriggerRemoveRow(this);">
+            &times; Remove
+          </button>
+        </div>
+
+      </div>{# /event-trigger-row #}
+    {% endfor %}
+
+  </div>{# /event-trigger-rows #}
+
+  {# Add button — only in normal mode (no events to select in degraded state) #}
+  {% if _normal_mode %}
+  <div style="margin-top:var(--sp-3);">
+    <button type="button"
+            class="btn btn-secondary btn-sm"
+            onclick="tlmEventTriggerAddRow();">
+      &#43; Add event trigger
+    </button>
+  </div>
+  {% endif %}
+
+</fieldset>
+
+{# ── Hidden template row — only needed in normal mode ────────────────────────
+   Cloned by tlmEventTriggerAddRow(). All name attributes present so the server
+   receives them in the POST. trigger_id is blank (new row). trigger_enabled
+   value is stamped by JS as "new:<index>" at clone time, counted among new rows
+   only (not total rows) so the first added row is always "new:0" regardless of
+   how many existing triggers are already rendered.
+   The <template> element is inert and never submitted itself. #}
+{% if _normal_mode %}
+<template id="event-trigger-row-template">
+  <div class="form-row event-trigger-row"
+       style="align-items:flex-start;gap:var(--sp-3);
+              padding:var(--sp-3) 0;
+              border-top:1px solid var(--color-border);">
+
+    {# Blank id for new rows #}
+    <input type="hidden" name="trigger_id" value="">
+
+    {# Topic select #}
+    <div class="form-group" style="flex:1 1 auto;min-width:220px;">
+      <label class="form-label"
+             style="font-size:var(--text-sm);">Event</label>
+      <select name="trigger_topic"
+              class="form-control"
+              aria-label="Event topic">
+        <option value="">— select an event —</option>
+        {% for e in discovered_events %}
+        <option value="{{ e.topic_id }}">
+          {{- e.label }} &mdash; {{ e.category -}}
+          {%- if e.requires_app %} (needs camera app){% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    {# Cooldown input #}
+    <div class="form-group" style="flex:0 0 auto;min-width:130px;">
+      <label class="form-label"
+             style="font-size:var(--text-sm);">Cooldown (s)</label>
+      <input type="number"
+             name="trigger_cooldown"
+             class="form-control mono"
+             style="max-width:100px;"
+             min="0"
+             step="1"
+             value="10"
+             aria-label="Cooldown in seconds">
+      <span class="form-hint" style="font-size:var(--text-xs);">
+        Minimum seconds between captures for this event.
+      </span>
+    </div>
+
+    {# Enabled checkbox — value set by JS to "new:<index>" at clone time #}
+    <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+      <label style="display:flex;align-items:center;gap:var(--sp-1);
+                    cursor:pointer;font-size:var(--text-sm);">
+        <input type="checkbox"
+               name="trigger_enabled"
+               value=""
+               checked
+               style="accent-color:var(--color-accent);width:15px;height:15px;">
+        Enabled
+      </label>
+    </div>
+
+    {# Remove button #}
+    <div class="form-group" style="flex:0 0 auto;padding-top:var(--sp-5);">
+      <button type="button"
+              class="btn btn-ghost btn-sm"
+              aria-label="Remove this event trigger"
+              onclick="tlmEventTriggerRemoveRow(this);">
+        &times; Remove
+      </button>
+    </div>
+
+  </div>
+</template>
+{% endif %}
+
+{# ── Inline controller ─────────────────────────────────────────────────────────
+   Same IIFE pattern as _exact_time_fieldset.html: functions exposed on window
+   so inline onclick= handlers can reach them.
+
+   tlmEventTriggerAddRow():
+     - Counts only existing new-row checkboxes (value starts with "new:") —
+       NOT total rows — to determine the "new:<index>" stamp. This ensures the
+       first row added to a project that already has saved triggers is "new:0",
+       which is what the server's zero-based among-new indexing expects.
+     - Clones #event-trigger-row-template, stamps the checkbox value, assigns
+       unique id/for pairs to labelled inputs, appends to #event-trigger-rows,
+       hides the empty-state paragraph.
+
+   tlmEventTriggerRemoveRow(buttonEl):
+     - Removes the nearest .event-trigger-row ancestor.
+     - Renumbers all remaining new-row checkbox values ("new:0", "new:1", …)
+       contiguously, leaving existing-row checkboxes (numeric DB ids) untouched.
+     - Shows the empty-state paragraph if no rows remain.
+#}
+<script>
+(function () {
+
+  /* ── Add row ─────────────────────────────────────────────────────────── */
+  function tlmEventTriggerAddRow() {
+    var container = document.getElementById('event-trigger-rows');
+    var template  = document.getElementById('event-trigger-row-template');
+    var emptyMsg  = document.getElementById('event-trigger-empty-state');
+    if (!container || !template) return;
+
+    /* Count only new-row checkboxes (value="new:…") — not total rows — so
+       the first added row on an existing project with saved triggers is
+       "new:0" rather than "new:<N>" where N is the count of existing rows. */
+    var newRows = container.querySelectorAll(
+      'input[name="trigger_enabled"][value^="new:"]'
+    );
+    var newIdx = newRows.length;
+
+    /* Clone the template content (DocumentFragment → first element child). */
+    var fragment = template.content.cloneNode(true);
+    var row      = fragment.querySelector('.event-trigger-row');
+
+    /* Stamp the checkbox value with "new:<index>". */
+    var chk = row.querySelector('input[name="trigger_enabled"]');
+    if (chk) { chk.value = 'new:' + newIdx; }
+
+    /* Assign unique id/for pairs so labels are correctly associated. */
+    var uid        = 'trigger-row-new-' + newIdx;
+    var topicSelect  = row.querySelector('select[name="trigger_topic"]');
+    var cooldownInput = row.querySelector('input[name="trigger_cooldown"]');
+
+    if (topicSelect)   { topicSelect.id   = uid + '-topic';    }
+    if (cooldownInput) { cooldownInput.id = uid + '-cooldown'; }
+
+    /* Update for= on labels to match the new ids. */
+    row.querySelectorAll('label.form-label').forEach(function (lbl) {
+      var ctrl = lbl.closest('.form-group').querySelector('[id]');
+      if (ctrl) { lbl.setAttribute('for', ctrl.id); }
+    });
+
+    container.appendChild(fragment);
+
+    /* Hide the empty-state message once we have at least one row. */
+    if (emptyMsg) { emptyMsg.hidden = true; }
+  }
+
+  /* ── Remove row ──────────────────────────────────────────────────────── */
+  function tlmEventTriggerRemoveRow(buttonEl) {
+    var row       = buttonEl.closest('.event-trigger-row');
+    var container = document.getElementById('event-trigger-rows');
+    var emptyMsg  = document.getElementById('event-trigger-empty-state');
+    if (!row || !container) return;
+
+    container.removeChild(row);
+
+    /* Renumber checkbox values for all remaining new-row entries so indices
+       stay contiguous and predictable for the server. Existing rows (whose
+       checkbox value is a numeric DB id) are left untouched. */
+    var newRowIdx = 0;
+    container.querySelectorAll('.event-trigger-row').forEach(function (r) {
+      var chk = r.querySelector('input[name="trigger_enabled"]');
+      if (chk && chk.value.indexOf('new:') === 0) {
+        chk.value = 'new:' + newRowIdx;
+        newRowIdx++;
+      }
+    });
+
+    /* Show the empty-state message when no rows remain. */
+    var remaining = container.querySelectorAll('.event-trigger-row');
+    if (emptyMsg && remaining.length === 0) { emptyMsg.hidden = false; }
+  }
+
+  /* Expose on window so inline onclick= handlers can reach them. */
+  window.tlmEventTriggerAddRow    = tlmEventTriggerAddRow;
+  window.tlmEventTriggerRemoveRow = tlmEventTriggerRemoveRow;
+
+}());
+</script>
