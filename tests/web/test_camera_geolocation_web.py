@@ -1,9 +1,9 @@
 """Web tests for the camera geolocation feature (F1).
 
 Covers:
-- GET /cameras/{id}/geolocation — the three outcomes (success, unreachable,
-  no_location).  Every camera-side failure renders at HTTP 200 (HTMX fragment);
-  only the role gate returns a non-200.
+- GET /cameras/{id}/geolocation — the four outcomes (success, unreachable,
+  no_location, access_denied).  Every camera-side failure renders at HTTP 200
+  (HTMX fragment); only the role gate returns a non-200.
 - POST /cameras (create) persists latitude/longitude/geo_source.
 - POST /cameras/{id}/edit updates geo fields; blank values clear them.
 
@@ -21,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of
-from timelapse_manager.cameras.base import GeoLocation
+from timelapse_manager.cameras.base import GeoLocation, GeolocationAccessDenied
 from timelapse_manager.db.models import Camera
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
@@ -159,6 +159,39 @@ class TestCameraGeolocationRoute:
         assert "alert info" in html
         assert "Camera did not report a location" in html
         assert "Camera reports:" not in html
+        # A clean "no location" offers no admin read: the account was accepted.
+        assert "Read with admin account" not in html
+
+    def test_access_denied_renders_role_warning(self, admin_client: TestClient) -> None:
+        """A refused read names the role and offers the one-time admin read."""
+        camera_id = _seed_camera(name="geo-denied")
+        adapter = MagicMock()
+        adapter.get_geolocation = AsyncMock(
+            side_effect=GeolocationAccessDenied("vapix", "Administrator", 401)
+        )
+        adapter.close = AsyncMock()
+        guard, builder = _geo_patches(adapter)
+        with guard, builder:
+            resp = admin_client.get(f"/cameras/{camera_id}/geolocation")
+        assert resp.status_code == 200
+        html = resp.text
+        assert "alert warning" in html
+        assert "Administrator" in html
+        assert "did not report a location" not in html
+        assert "Could not reach" not in html
+        assert "Read with admin account" in html
+        assert f"/cameras/{camera_id}/geolocation/admin-read" in html
+        # The one-time inputs never share the camera credential field names, and
+        # are detached from the camera form so its Save cannot submit them.
+        assert 'name="geo_admin_username"' in html
+        assert 'name="geo_admin_password"' in html
+        assert 'name="username"' not in html
+        assert 'name="password"' not in html
+        assert f'form="cam-{camera_id}-geo-admin-detached"' in html
+        assert 'autocomplete="new-password"' in html
+        assert 'hx-params="geo_admin_username,geo_admin_password"' in html
+        assert "not saved" in html
+        adapter.close.assert_awaited_once()
 
     def test_forbidden_for_viewer(self, viewer_client: TestClient) -> None:
         """Viewers cannot poll geolocation; the role gate returns 403."""
@@ -337,3 +370,64 @@ class TestEditCameraGeo:
         assert lat == pytest.approx(10.0)
         assert lon == pytest.approx(20.0)
         assert source == "camera"
+
+
+# ---------------------------------------------------------------------------
+# WP-69-T (CAM-S6): non-finite coordinates are refused on create and edit
+# ---------------------------------------------------------------------------
+
+_NON_FINITE = [("nan", "2.0"), ("2.0", "nan"), ("inf", "2.0"), ("2.0", "-inf")]
+
+
+class TestNonFiniteCoordinatesRefused:
+    @pytest.mark.parametrize(("lat", "lon"), _NON_FINITE)
+    def test_create_refuses_non_finite(
+        self, admin_client: TestClient, lat: str, lon: str
+    ) -> None:
+        name = f"Geo NonFinite Create {lat} {lon}"
+        csrf = csrf_of(admin_client, "/cameras")
+        resp = admin_client.post(
+            "/cameras",
+            data={
+                "name": name,
+                "address": _ALLOWED_ADDRESS,
+                "protocol": "vapix",
+                "latitude": lat,
+                "longitude": lon,
+                "geo_source": "manual",
+                "csrf_token": csrf,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 400, resp.text
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            assert db.query(Camera).filter(Camera.name == name).one_or_none() is None
+
+    @pytest.mark.parametrize(("lat", "lon"), _NON_FINITE)
+    def test_edit_refuses_non_finite(
+        self, admin_client: TestClient, lat: str, lon: str
+    ) -> None:
+        name = f"Geo NonFinite Edit {lat} {lon}"
+        camera_id = _seed_camera(
+            name=name, latitude=10.0, longitude=20.0, geo_source="manual"
+        )
+        csrf = csrf_of(admin_client, "/cameras")
+        resp = admin_client.post(
+            f"/cameras/{camera_id}/edit",
+            data={
+                "name": name,
+                "address": _ALLOWED_ADDRESS,
+                "protocol": "vapix",
+                "latitude": lat,
+                "longitude": lon,
+                "geo_source": "manual",
+                "csrf_token": csrf,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        # The edit form re-renders inline at 200 with the error message.
+        assert resp.status_code == 200, resp.text
+        assert "must be between" in resp.text
+        assert _camera_geo(camera_id) == (10.0, 20.0, "manual")

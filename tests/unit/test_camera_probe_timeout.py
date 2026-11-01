@@ -46,7 +46,12 @@ class _SlowAdapter:
 def _patched_probe(monkeypatch: pytest.MonkeyPatch) -> _SlowAdapter:
     """Wire the probe helpers to a slow adapter with a tiny timeout bound."""
     adapter = _SlowAdapter()
-    supervisor = SimpleNamespace(http_client=object(), ffmpeg_binary="ffmpeg")
+    client = object()
+    supervisor = SimpleNamespace(
+        http_client=client,
+        client_for=lambda _purpose, _pin=None: client,
+        ffmpeg_binary="ffmpeg",
+    )
 
     monkeypatch.setattr(_shared, "_CAMERA_PROBE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(
@@ -63,7 +68,7 @@ def _patched_probe(monkeypatch: pytest.MonkeyPatch) -> _SlowAdapter:
 
 def _camera() -> SimpleNamespace:
     # No address -> the SSRF resolve is skipped, isolating the probe-timeout path.
-    return SimpleNamespace(address=None)
+    return SimpleNamespace(address=None, tls_pinned_cert_pem=None)
 
 
 async def test_event_topics_probe_times_out_fast(_patched_probe: _SlowAdapter) -> None:

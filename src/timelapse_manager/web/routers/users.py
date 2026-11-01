@@ -1,5 +1,16 @@
 """User-administration routes: list, add, edit, password reset, session
-revocation, enable/disable, and deletion."""
+revocation, enable/disable, and deletion.
+
+These handlers are thin adapters over :mod:`timelapse_manager.services.users`:
+they parse their form input, call the service (which validates, enforces the
+account-security invariants, mutates, and flushes), and render the result. A
+service-raised :class:`~timelapse_manager.services.errors.AppError` is caught and
+turned back into the exact response the endpoint returned before the service
+existed -- a bare ``404``/``400`` for a missing user or a rejected create, or an
+inline form/row fragment re-render at ``200`` (rolled back first so the normal
+return does not commit a partial mutation). The request-scoped session commits on
+a clean return; user writes have no post-commit effect to run.
+"""
 
 from __future__ import annotations
 
@@ -11,14 +22,15 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session as DbSession
 
 from ...db.models import User
-from ...security import (
-    hash_password,
-    revoke_all_user_sessions,
-)
+from ...security.sessions import invalidate_request_session
+from ...services import users as user_service
+from ...services._base import Actor
+from ...services.errors import AppError, ConflictError, NotFoundError
+from ...services.users import UserSpec
 from .. import dependencies as deps
 from ..dependencies import (
     AdminUser,
@@ -26,14 +38,23 @@ from ..dependencies import (
     FormDep,
     templates,
 )
-from ._shared import (
-    _audit,
-    _settings,
-)
+from ._shared import _settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _forget_own_session(request: Request, actor: User, target_id: int) -> None:
+    """Drop the request's cached session when the admin acted on their own account.
+
+    Revoking, disabling, demoting or deleting yourself changes the session this
+    request authenticated with. The request's cached resolution (#67 R3) would
+    otherwise still call it live for the rest of the request, for example when the
+    row fragment renders its CSRF token (#208).
+    """
+    if target_id == actor.id:
+        invalidate_request_session(request)
 
 
 @router.get("/users", response_class=HTMLResponse)
@@ -71,44 +92,30 @@ def create_user(
     request: Request, db: DbDep, user: AdminUser, form: FormDep
 ) -> Response:
     """Create a local Admin, Operator, or Viewer account."""
-    settings = _settings()
-    username = form.get("username", "")
-    password = form.get("password", "")
-    role = form.get("role", "viewer")
-    password_confirm = form.get("password_confirm")
-    if not username or not password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="username and password are required",
-        )
-    if role not in (deps.ADMIN_ROLE, deps.OPERATOR_ROLE, deps.VIEWER_ROLE):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role"
-        )
-    if password_confirm is not None and password != password_confirm:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="passwords do not match"
-        )
-    if len(password) < settings.auth.password_min_length:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="password too short"
-        )
-    new_user = User(
-        username=username,
-        auth_source="local",
-        password_hash=hash_password(password, settings.auth),
-        role=role,
-        enabled=True,
+    spec = UserSpec(
+        username=form.get("username", ""),
+        password=form.get("password", ""),
+        role=form.get("role", "viewer"),
+        password_confirm=form.get("password_confirm"),
     )
-    db.add(new_user)
-    db.flush()
-    _audit(
-        db,
-        scope="system",
-        scope_id=None,
-        actor_user_id=user.id,
-        message=f"user {new_user.username!r} ({role}) created",
-    )
+    try:
+        user_service.create_user(db, Actor.of(user), spec, settings=_settings())
+    except ConflictError as exc:
+        # A duplicate username surfaces as a 409 (the service turns the UNIQUE-race
+        # IntegrityError into a ConflictError). Roll back the partial insert so the
+        # request's session does not commit it.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=exc.detail
+        ) from exc
+    except AppError as exc:
+        # Every other create failure (missing field, bad role, mismatch, weak
+        # password) has always surfaced as a bare 400 -- the create form is a
+        # normal, redirecting submit, not an HTMX swap -- so preserve that.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=exc.detail
+        ) from exc
     return RedirectResponse(url="/users", status_code=303)
 
 
@@ -172,52 +179,6 @@ def user_edit_form(
     )
 
 
-def _real_admin_count(db: DbSession) -> int:
-    """Count real administrator accounts (excluding the password-less sentinel).
-
-    The seeded sentinel admin has a NULL password hash and cannot sign in, so it
-    is not a real admin for lockout purposes -- mirroring the users-page filter.
-    """
-    return db.execute(
-        select(func.count())
-        .select_from(User)
-        .where(User.role == deps.ADMIN_ROLE)
-        .where(User.password_hash.is_not(None))
-    ).scalar_one()
-
-
-def _enabled_admin_count(db: DbSession) -> int:
-    """Count real administrators that can actually sign in (enabled, with a hash).
-
-    This is the lockout basis for *disable* and *delete*: an account that is
-    disabled or sentinel cannot administer the system, so only enabled real admins
-    keep the system reachable.
-    """
-    return db.execute(
-        select(func.count())
-        .select_from(User)
-        .where(User.role == deps.ADMIN_ROLE)
-        .where(User.password_hash.is_not(None))
-        .where(User.enabled.is_(True))
-    ).scalar_one()
-
-
-def _is_last_enabled_admin(db: DbSession, target: User) -> bool:
-    """Return True if ``target`` is the only enabled real administrator left.
-
-    Used to refuse a disable/delete that would leave the system with no
-    administrator who can sign in. A non-admin, sentinel, or already-disabled
-    target is never the last enabled admin.
-    """
-    if (
-        target.role != deps.ADMIN_ROLE
-        or target.password_hash is None
-        or not target.enabled
-    ):
-        return False
-    return _enabled_admin_count(db) <= 1
-
-
 def _user_form_error(
     request: Request,
     db: DbSession,
@@ -256,39 +217,21 @@ def edit_user(
     cannot demote themselves into lockout. The username is immutable here; the
     edit form renders it read-only.
     """
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-
     role = form.get("role", "")
-    if role not in (deps.ADMIN_ROLE, deps.OPERATOR_ROLE, deps.VIEWER_ROLE):
-        return _user_form_error(request, db, user, target, "Invalid role.")
-
-    # Any change *away* from admin is a demotion for lockout purposes -- whether
-    # to operator or viewer, the account stops counting as a real administrator.
-    demoting_admin = target.role == deps.ADMIN_ROLE and role != deps.ADMIN_ROLE
-    if demoting_admin and _real_admin_count(db) <= 1:
-        # This is the last real admin (and, when self-editing, also the
-        # self-demotion-into-lockout case): refuse so the system keeps an admin.
-        return _user_form_error(
-            request,
-            db,
-            user,
-            target,
-            "Cannot demote the last remaining administrator.",
-        )
-
-    if role != target.role:
-        target.role = role
-        db.flush()
-        _audit(
-            db,
-            scope="system",
-            scope_id=None,
-            actor_user_id=user.id,
-            message=f"role for user {target.username!r} changed to {role}",
-        )
-    return _user_row_response(request, db, user, target)
+    try:
+        result = user_service.edit_user_role(db, Actor.of(user), user_id, role=role)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    except AppError as exc:
+        # Invalid role / last-admin refusal: roll back and re-render the edit form
+        # with an inline error at 200 (HTMX skips 4xx), exactly as before.
+        db.rollback()
+        target = db.get(User, user_id)
+        return _user_form_error(request, db, user, target, exc.detail)
+    _forget_own_session(request, user, user_id)
+    return _user_row_response(request, db, user, result.value)
 
 
 @router.post("/users/{user_id}/reset-password", response_class=HTMLResponse)
@@ -303,59 +246,28 @@ def reset_user_password(
     account is refused -- its credential is managed externally and is not stored
     here, so it is never mutated. The row fragment is returned for the HTMX swap.
     """
-    settings = _settings()
-    password = form.get("password")
-    password_confirm = form.get("password_confirm")
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    # A directory account carries no local password; never mutate it. Returned at
-    # 200 so HTMX swaps the row and surfaces the inline error (it skips 4xx).
-    if target.auth_source != "local":
-        return _user_row_response(
-            request,
+    try:
+        result = user_service.reset_user_password(
             db,
-            user,
-            target,
-            error=(
-                "This account is managed by the directory; its password "
-                "cannot be set here."
-            ),
+            Actor.of(user),
+            user_id,
+            password=form.get("password"),
+            password_confirm=form.get("password_confirm"),
+            settings=_settings(),
         )
-    if password:
-        if password_confirm is not None and password != password_confirm:
-            return _user_row_response(
-                request, db, user, target, error="Passwords do not match."
-            )
-        if len(password) < settings.auth.password_min_length:
-            return _user_row_response(
-                request,
-                db,
-                user,
-                target,
-                error=(
-                    "Password must be at least "
-                    f"{settings.auth.password_min_length} characters."
-                ),
-            )
-        target.password_hash = hash_password(password, settings.auth)
-        db.flush()
-        password_set = True
-    else:
-        password_set = False
-    revoke_all_user_sessions(db, target.id)
-    _audit(
-        db,
-        scope="system",
-        scope_id=None,
-        actor_user_id=user.id,
-        message=(
-            f"password set for user {target.username!r} by {user.username!r}"
-            if password_set
-            else f"sessions revoked for user {target.username!r} by {user.username!r}"
-        ),
-    )
-    return _user_row_response(request, db, user, target)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    except AppError as exc:
+        # Directory account / confirmation / length problem: roll back and surface
+        # the message on the row at 200 so HTMX still swaps it.
+        db.rollback()
+        target = db.get(User, user_id)
+        assert target is not None  # past the service's not-found check
+        return _user_row_response(request, db, user, target, error=exc.detail)
+    _forget_own_session(request, user, user_id)
+    return _user_row_response(request, db, user, result.value)
 
 
 @router.post("/users/{user_id}/revoke-sessions", response_class=HTMLResponse)
@@ -363,18 +275,14 @@ def revoke_user_sessions(
     request: Request, db: DbDep, user: AdminUser, user_id: int
 ) -> Response:
     """Revoke all of a user's sessions and re-render their row."""
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    revoke_all_user_sessions(db, target.id)
-    _audit(
-        db,
-        scope="system",
-        scope_id=None,
-        actor_user_id=user.id,
-        message=f"sessions revoked for user {target.username!r}",
-    )
-    return _user_row_response(request, db, user, target)
+    try:
+        result = user_service.revoke_user_sessions(db, Actor.of(user), user_id)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    _forget_own_session(request, user, user_id)
+    return _user_row_response(request, db, user, result.value)
 
 
 @router.post("/users/{user_id:int}/disable", response_class=HTMLResponse)
@@ -387,48 +295,31 @@ def disable_user(
     with no one who can sign in. Disabling revokes the target's live sessions so
     the lock-out takes effect immediately, not just at next login.
     """
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if _is_last_enabled_admin(db, target):
-        return _user_row_response(
-            request,
-            db,
-            user,
-            target,
-            error="Cannot disable the last remaining administrator.",
-        )
-    if target.enabled:
-        target.enabled = False
-        db.flush()
-        revoke_all_user_sessions(db, target.id)
-        _audit(
-            db,
-            scope="system",
-            scope_id=None,
-            actor_user_id=user.id,
-            message=f"user {target.username!r} disabled",
-        )
-    return _user_row_response(request, db, user, target)
+    try:
+        result = user_service.disable_user(db, Actor.of(user), user_id)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    except AppError as exc:
+        db.rollback()
+        target = db.get(User, user_id)
+        assert target is not None  # past the service's not-found check
+        return _user_row_response(request, db, user, target, error=exc.detail)
+    _forget_own_session(request, user, user_id)
+    return _user_row_response(request, db, user, result.value)
 
 
 @router.post("/users/{user_id:int}/enable", response_class=HTMLResponse)
 def enable_user(request: Request, db: DbDep, user: AdminUser, user_id: int) -> Response:
     """Re-enable a disabled account and re-render its row."""
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if not target.enabled:
-        target.enabled = True
-        db.flush()
-        _audit(
-            db,
-            scope="system",
-            scope_id=None,
-            actor_user_id=user.id,
-            message=f"user {target.username!r} enabled",
-        )
-    return _user_row_response(request, db, user, target)
+    try:
+        result = user_service.enable_user(db, Actor.of(user), user_id)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    return _user_row_response(request, db, user, result.value)
 
 
 @router.post("/users/{user_id:int}/delete")
@@ -438,11 +329,17 @@ def delete_user(request: Request, db: DbDep, user: AdminUser, user_id: int) -> R
     Refuses to remove the last enabled administrator. The target's sessions are
     revoked before the row is deleted so no live token outlives the account.
     """
-    target = db.get(User, user_id)
-    if target is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if _is_last_enabled_admin(db, target):
-        # Re-render the table with an inline error rather than deleting.
+    try:
+        user_service.delete_user(db, Actor.of(user), user_id)
+        _forget_own_session(request, user, user_id)
+    except NotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from exc
+    except AppError as exc:
+        # Last-admin refusal: re-render the table with an inline error at 400
+        # rather than deleting, exactly as before.
+        db.rollback()
         users = (
             db.execute(
                 select(User)
@@ -460,26 +357,10 @@ def delete_user(request: Request, db: DbDep, user: AdminUser, user_id: int) -> R
                 db,
                 user,
                 users=users,
-                flash_messages=[
-                    {
-                        "type": "error",
-                        "message": "Cannot remove the last remaining administrator.",
-                    }
-                ],
+                flash_messages=[{"type": "error", "message": exc.detail}],
             ),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    username = target.username
-    revoke_all_user_sessions(db, target.id)
-    db.delete(target)
-    db.flush()
-    _audit(
-        db,
-        scope="system",
-        scope_id=None,
-        actor_user_id=user.id,
-        message=f"user {username!r} removed",
-    )
     return RedirectResponse(url="/users", status_code=303)
 
 

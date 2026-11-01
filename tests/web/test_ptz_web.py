@@ -9,8 +9,8 @@ Covers:
 - GET /projects/{id}/settings (edit form) renders the saved preset preselected
   in the <select> when the adapter returns matching presets.
 
-Adapter stubbing mirrors test_stream_profile_select.py: patch
-``timelapse_manager.cameras.resolve_camera_host`` (pass-through) and
+Adapter stubbing mirrors test_stream_profile_select.py: patch the probes' async
+SSRF guard ``_shared._resolve_camera_host_async`` (allow) and
 ``timelapse_manager.cameras.build_adapter`` to return a mock adapter.
 """
 
@@ -33,7 +33,7 @@ _ALLOWED_ADDRESS = "192.168.1.60"
 _TWO_PRESETS = PTZPresetsResult(
     presets=[
         PTZPreset(id="home", label="Home"),
-        PTZPreset(id="door", label="Front Door"),
+        PTZPreset(id="door", label="Front Gate"),
     ],
     ptz_supported=True,
     ok=True,
@@ -124,8 +124,8 @@ def _ptz_adapter(result: PTZPresetsResult) -> MagicMock:
 def _ptz_patches(result: PTZPresetsResult):
     return (
         patch(
-            "timelapse_manager.cameras.resolve_camera_host",
-            side_effect=lambda a: a,
+            "timelapse_manager.web.routers._shared._resolve_camera_host_async",
+            new=AsyncMock(return_value=None),
         ),
         patch(
             "timelapse_manager.cameras.build_adapter",
@@ -154,7 +154,7 @@ class TestPtzPresetsRoute:
         assert 'value="home"' in html
         assert "Home" in html
         assert 'value="door"' in html
-        assert "Front Door" in html
+        assert "Front Gate" in html
 
     def test_reachable_no_ptz_renders_nothing(self, admin_client: TestClient) -> None:
         """A reachable non-PTZ camera renders nothing (no select, no hint)."""
@@ -404,7 +404,7 @@ class TestEditProjectFormPtzPreselect:
         html = resp.text
         # The saved preset "door" must appear selected.
         assert 'value="door"' in html
-        assert "Front Door" in html
+        assert "Front Gate" in html
         # The select must be present.
         assert 'name="ptz_preset_id"' in html
 

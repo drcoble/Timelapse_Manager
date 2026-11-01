@@ -17,14 +17,20 @@ def _fake_row(secret: str | None) -> object:
 
 
 class TestIssueCsrf:
-    def test_returns_secret_unchanged_when_passed_a_string(self) -> None:
+    def test_masks_the_secret_when_passed_a_string(self) -> None:
+        # Masked per response (#70 F-S4): never the secret, always verifies.
         secret = secrets.token_urlsafe(32)
-        assert issue_csrf(secret) == secret
+        token = issue_csrf(secret)
+        assert token != secret
+        assert secret not in token
+        assert verify_csrf(secret, token) is True
 
-    def test_returns_session_csrf_secret_when_passed_a_row(self) -> None:
+    def test_masks_the_session_csrf_secret_when_passed_a_row(self) -> None:
         secret = secrets.token_urlsafe(32)
         row = _fake_row(secret)
-        assert issue_csrf(row) == secret  # type: ignore[arg-type]
+        token = issue_csrf(row)  # type: ignore[arg-type]
+        assert token != secret
+        assert verify_csrf(secret, token) is True
 
     def test_raises_when_session_row_has_no_csrf_secret(self) -> None:
         row = _fake_row(None)
@@ -34,8 +40,12 @@ class TestIssueCsrf:
 
 class TestVerifyCsrf:
     def test_matching_tokens_return_true(self) -> None:
-        token = secrets.token_urlsafe(32)
-        assert verify_csrf(token, token) is True
+        secret = secrets.token_urlsafe(32)
+        assert verify_csrf(secret, issue_csrf(secret)) is True
+
+    def test_bare_secret_is_refused(self) -> None:
+        secret = secrets.token_urlsafe(32)
+        assert verify_csrf(secret, secret) is False
 
     def test_mismatched_tokens_return_false(self) -> None:
         expected = secrets.token_urlsafe(32)
@@ -54,6 +64,12 @@ class TestVerifyCsrf:
     def test_both_none_returns_false(self) -> None:
         assert verify_csrf(None, None) is False
 
+    def test_non_ascii_presented_returns_false_not_typeerror(self) -> None:
+        # compare_digest raises TypeError on a non-ASCII str (#115).
+        expected = secrets.token_urlsafe(32)
+        assert verify_csrf(expected, expected[:-1] + "\u00e9") is False
+        assert verify_csrf(expected, "\ud800") is False
+
     def test_empty_expected_returns_false(self) -> None:
         assert verify_csrf("", "some-token") is False
 
@@ -67,4 +83,4 @@ class TestVerifyCsrf:
         secret = "a" * 64
         wrong = "a" * 63 + "b"
         assert verify_csrf(secret, wrong) is False
-        assert verify_csrf(secret, secret) is True
+        assert verify_csrf(secret, issue_csrf(secret)) is True

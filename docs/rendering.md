@@ -85,10 +85,10 @@ enabled overlays share a single `placement` corner.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `timestamp_enabled` | bool | `false` | Burn the frame's real capture time into each output frame |
-| `timestamp_format` | string | `"%Y-%m-%d %H:%M:%S"` | strftime pattern for the timestamp text |
+| `timestamp_format` | string | `"%Y-%m-%d %H:%M:%S"` | strftime pattern for the timestamp text: at most 64 characters, using letters, digits, space, `_ . / : -` and the directives `%a %A %b %B %d %H %I %j %m %M %p %S %y %Y %z %Z %%`. Anything else is rejected with 422. A stored render schedule with an invalid format renders with the default `%Y-%m-%d %H:%M:%S` and logs a warning |
 | `timestamp_timezone` | string | `"UTC"` | IANA time-zone name used to localise the displayed timestamp |
 | `text_enabled` | bool | `false` | Burn a fixed text caption into every output frame |
-| `text_content` | string | `""` | The caption text (ignored when `text_enabled` is false) |
+| `text_content` | string | `""` | The caption text (ignored when `text_enabled` is false). At most 1,000 characters; a longer value is rejected with 422 by the render API and by project `render_schedule` saves. A longer caption that was stored earlier is not changed and still renders |
 | `image_enabled` | bool | `false` | Composite a watermark or logo image into every output frame |
 | `image_path` | string or null | null | Path to the watermark image; must be inside the project's render directory |
 | `placement` | string | `"top_left"` | Corner for all enabled overlays: `top_left`, `top_right`, `bottom_left`, `bottom_right` |
@@ -132,13 +132,63 @@ at validation.
 
 ## Browser-streamable detection
 
-After encoding, the render engine records whether the output can play natively
-in a browser `<video>` element without plugins. The only combination currently
-flagged as browser-streamable is **H.264 in MP4**. All other codec/container
-combinations — H.265, VP9, AV1, MKV, WebM — are treated as download-only.
-The `stream` endpoint uses this flag to decide between inline byte-range
-streaming and a file download response. In particular, AV1 and VP9 renders
-are always download-only regardless of container.
+**The browser decides.** The server serves every finished render inline, with
+`Range` support and its real MIME type, and each viewer's browser reports
+whether it can play it.
+
+1. **At encode time** the render worker probes the finished file with `ffprobe`
+   (installed beside the pinned ffmpeg; 10 s timeout) and stores two columns
+   on the render job:
+   - `codec_string`: the RFC 6381 codec string, built from ffprobe's
+     `codec_name`, `profile`, `level`, `pix_fmt` and `codec_tag_string`
+     (`encode/codec_string.py`). Examples: `avc1.64001F` (H.264 High 3.1),
+     `hvc1.1.6.L93.B0` (H.265 Main 3.1), `vp09.00.10.08` (VP9 profile 0; libvpx
+     signals no level, so level 1.0 is used), `av01.0.05M.08` (AV1 Main,
+     `seq_level_idx` 5).
+   - `mime_type`: `video/mp4`, `video/webm` or `video/x-matroska`.
+
+   A failed probe leaves both `NULL` and logs a warning; it never fails the
+   render. Renders made before these columns existed are probed once by a
+   background task shortly after startup, one at a time, skipping missing
+   files.
+2. **In the page**, `static/js/playability.js` asks the browser about each
+   render: `navigator.mediaCapabilities.decodingInfo()` with the codec string,
+   size, frame rate and bitrate, falling back to
+   `HTMLMediaElement.canPlayType()`. With no codec string recorded it checks the
+   MIME type alone. The answer is cached per codec and size for the browser
+   session. A render that passes shows the player; one that fails shows
+   "This browser can't play <codec>" and the download link.
+3. **Without JavaScript**, the page shows the player only for renders flagged
+   `browser_streamable` (H.264 in MP4, the one combination every browser
+   plays); every render keeps its download link. `browser_streamable` is kept
+   for this and is otherwise informational.
+
+**Encode flags for playback.** MP4 outputs are written with
+`-movflags +faststart` (the `moov` index before the media, so playback and
+seeking start without fetching the end of the file), and H.265 in MP4 is tagged
+`-tag:v hvc1` (ffmpeg defaults to `hev1`, which Safari refuses) for every HEVC
+encoder, software or hardware.
+
+**What plays where:**
+
+| Render | Plays in |
+|---|---|
+| H.264 / MP4 | every browser |
+| AV1 / MP4 | Chrome, Edge, Firefox and Opera (software decode). **Safari only with an AV1 hardware decoder**: an M3 Mac or later, iPhone 15 Pro or later, M4 / A17 Pro iPads. Older Apple devices get the download. |
+| H.265 / MP4 | Safari; Chrome and Edge where the device has a hardware HEVC decoder |
+| VP9 / WebM | Chrome, Edge, Firefox, recent Safari |
+| any / MKV | rarely: most browsers answer no for `video/x-matroska`, so MKV renders mostly show the download |
+
+The probe is per device, so the page shows what is true for each viewer.
+
+**Latest Frame player.** On a project's page, the Latest Frame links to the
+project's newest finished render (exports excluded, file on disk). A click, or
+Enter / Space, runs the same browser check and plays the render in place
+(muted, with controls); Close or the end of the video brings the frame back.
+If this browser can't play the codec, a note offers the download instead; it
+does not fall back to an older render. Without JavaScript the link opens the
+video file. With no finished render the frame is a plain image marked
+"No render yet". Viewers can play renders too.
 
 ---
 
@@ -162,7 +212,37 @@ queue of pending jobs. Key design points:
 - **Cancellation.** A `pending` job can be cancelled before it starts; an
   `encoding` job's FFmpeg process is killed, any partial output file is
   removed, and the job is recorded as `failed`. Cancellation is complete
-  before the cancel API call returns.
+  before the cancel API call returns. A frame export (`kind` `export`, a zip
+  built in a worker thread) cannot be interrupted mid-file; cancel waits for
+  its thread, which sees the job `failed` before its final rename and discards
+  the partial archive. An export that is still queued behind other long jobs is
+  cancelled at once: the call returns without waiting, and the zip is never
+  built.
+- **Frame exports.** Exports have their own slot, `render.max_concurrent_exports`
+  (default 1), so an export never holds a render's slot (`render.max_concurrent`)
+  and a long export cannot delay a render. The zip stores JPEG, PNG and WebP
+  files without deflating them (a JSON manifest is still deflated). It checks free
+  disk space before it starts (the sum of the file sizes plus 1%; the export fails
+  with `insufficient disk space`) and again every 200 files, and it never leaves a
+  `.part` file: one is removed on any failure, and stale `export-*.zip.part` files
+  are swept when the queue starts. Finished exports are deleted after
+  `render.export_ttl_days` (default 7) by the hourly housekeeping, zip and row
+  together; `0` keeps them. Each deletion writes an info event naming the TTL.
+- **Frame window.** When the worker starts a job it records what goes into it:
+  `frame_count`, `first_frame_at` and `last_frame_at` (naive UTC) and the
+  computed chapters. An export records the frames it actually bundled. Jobs
+  that ran before these were stored (migration 026) have none of them; the
+  render card shows "not recorded".
+- **Deletion.** `DELETE /api/v1/renders/{id}` (or **Delete** on the render
+  card) removes the job row and its output file. The file is unlinked only when
+  it resolves inside the project's render root; a file that is already gone is
+  not an error. A `pending` or `encoding` job is cancelled first (as above) and
+  deleted only once it has stopped, so no FFmpeg process is ever left writing a
+  file whose row is gone. Each delete writes the audit event `render N deleted
+  by <user>` with the file name and size. Unlike the automatic prune, a manual
+  delete also removes `archive` renders. Job ids are never reused (the table uses
+  SQLite `AUTOINCREMENT`, migration 028), so "render N" in the audit log
+  always means one job.
 - **Startup recovery.** Any job left in `encoding` at startup (from a prior
   crash or unclean shutdown) is immediately swept to `failed` so the project
   is available for a fresh render.
@@ -196,9 +276,25 @@ means the schedule is off. The scheduler checks against the database (not in-
 memory state), so downtime does not reset the clock — the last job's creation
 timestamp is the cadence anchor.
 
+`fps` may also be the string `"auto"` (the schedule form's *Auto (suggested)*
+option): each time the render starts, the frame rate is worked out from the
+project's frames as described under *Suggested frame rate*. Schedules that
+stored a number are unchanged.
+
 `encoder`, `container`, `fps`, `resolution`, and `auto_prune` control the
 output format of automatic renders. Schedules that predate these fields default
 to H.264/MP4/24 fps/1080p with `auto_prune` enabled.
+
+`overlay_config` (optional) holds the overlay fields listed under
+[Render-time overlays](#render-time-overlays). Its `timestamp_format` follows
+the same rules as the manual render API: an strftime pattern of at most 64
+characters, using letters, digits, space, `_ . / : -` and the directives
+`%a %A %b %B %d %H %I %j %m %M %p %S %y %Y %z %Z %%`. Anything else is rejected
+with 422 on `PATCH /api/v1/projects/{id}`, even while the schedule is disabled,
+and so is a `text_content` over 1,000 characters.
+A stored schedule with an invalid format renders with the default
+`%Y-%m-%d %H:%M:%S` and logs a warning, once per project per process and only
+while the timestamp overlay is on; cloning a project resets it.
 
 **Encoder/container combinations for project render settings.** The available
 encoders are `libx264` (H.264), `libx265` (H.265), `libvpx-vp9` (VP9), and
@@ -213,8 +309,39 @@ encoders are `libx264` (H.264), `libx265` (H.265), `libvpx-vp9` (VP9), and
 **Frame rate.** `fps` must be a whole number between 1 and 240 (inclusive).
 The project settings UI derives a short list of suggested frame rates from the
 project's capture interval — slower cadences lean toward lower suggestions —
-but any integer in range is accepted on save. This is distinct from the manual
-render API `fps` field, which accepts any float.
+but any integer in range is accepted on save.
+
+**Suggested frame rate.** The *Render now* panel pre-fills `fps` with a suggestion
+and labels it with the expected video length. A typed value from 1 to 240 is still
+accepted, and *Use suggested* restores the suggestion. The suggestion is based on
+the **median gap between consecutive frames** of the frames the render would use
+(so outages, restarts and weekday masks do not skew it). The gap is interpolated
+linearly in log(interval) between these anchors, then snapped to the nearest of
+8, 10, 12, 15, 20, 24 or 30 fps (a tie goes to the higher rate), so the result is
+always 8 to 30:
+
+| Interval between frames | Suggested fps |
+|---|---|
+| 1 minute or less, up to 10 minutes | 30 |
+| 1 hour | 24 |
+| 6 hours | 15 |
+| 1 day | 12 |
+| 1 week or more | 8 |
+
+With fewer than two frames there is no suggestion. `GET
+/api/v1/projects/{project_id}/renders/suggested-fps` (bearer) returns it, for the
+project's frames or an optional `start` to `end` range (a bound without a zone is
+UTC; `start` after `end` is a 422):
+
+```json
+{"fps": 12, "interval_seconds": 86400.0, "frame_count": 40, "expected_duration_seconds": 3.33}
+```
+
+`fps` and `interval_seconds` are `null` when there is no suggestion. The endpoint
+only informs the caller: a render triggered through the API without `fps` still
+uses `render.default_fps`. This is distinct from the manual
+render API `fps` field, which accepts any float between 0.1 and 240 (out of
+range, or `NaN`/`Infinity`, is a 422).
 
 **Double-enqueue guard.** If a job of the same kind is already in `pending` or
 `encoding` state for the project, the scheduler skips that cycle to avoid
@@ -336,17 +463,22 @@ Two endpoints serve finished renders:
 Serves the output file as an attachment. Works for all codec/container
 combinations. Requires a bearer token.
 
+`/renders/{id}/download` and `/renders/{id}/stream` return `404` for a frame
+export; exports are downloaded from the project's Frames tab.
+
 ### Stream
 
 `GET /api/v1/renders/{id}/stream`
 
-For browser-streamable renders (H.264/MP4 only), honours HTTP `Range` headers
-and responds `206 Partial Content` with the requested byte range. This allows
-browsers to seek within the video without downloading the whole file. The
+Serves any finished render inline (no attachment disposition) with its real
+MIME type (`video/mp4`, `video/webm`, `video/x-matroska`), whatever its codec;
+whether it plays is up to the browser (see
+[Browser-streamable detection](#browser-streamable-detection)). It honours HTTP
+`Range` headers and responds `206 Partial Content` with the requested byte
+range, so browsers can seek without downloading the whole file. The
 `Accept-Ranges: bytes` and `Content-Range` headers are included in the response.
 
-For renders that are not browser-streamable, or for requests with no valid
-`Range` header, the endpoint falls back to serving the full file (`200 OK`).
+A request with no valid `Range` header gets the full file (`200 OK`).
 Requires a bearer token.
 
 ---
@@ -381,6 +513,7 @@ planned but not yet implemented).
 | `GET` | `/api/v1/projects/{project_id}/renders` | Bearer | List a project's render jobs, newest first |
 | `GET` | `/api/v1/renders/{id}` | Bearer | Get a single render job's status |
 | `POST` | `/api/v1/renders/{id}/cancel` | Admin | Cancel a pending or in-flight render |
+| `DELETE` | `/api/v1/renders/{id}` | Admin | Delete a render (or export) and its file; cancels it first if running |
 | `GET` | `/api/v1/renders/{id}/download` | Bearer | Download the output file |
 | `GET` | `/api/v1/renders/{id}/stream` | Bearer | Stream for inline playback (HTTP Range / 206) |
 
@@ -418,6 +551,10 @@ All fields are optional and default as documented above. The target is
 validated before any job row is created; an unsupported codec, container, or
 parameter returns `400 Bad Request`.
 
+If a manual render with the same output and overlay settings is still pending
+or encoding, that job is returned (201) with `X-Render-Deduplicated: true`
+instead of queuing another.
+
 Render job response object:
 ```json
 {
@@ -427,6 +564,8 @@ Render job response object:
   "status": "pending",
   "output_file_path": null,
   "browser_streamable": null,
+  "codec_string": null,
+  "mime_type": null,
   "started_at": null,
   "completed_at": null,
   "created_at": "2026-06-10T12:00:00"
@@ -435,11 +574,19 @@ Render job response object:
 
 `kind` is `"manual"`, `"scheduled"`, or `"archive"`.
 `status` is `"pending"`, `"encoding"`, `"done"`, or `"failed"`.
-`browser_streamable` is set once encoding completes.
+`browser_streamable` is set once encoding completes. `codec_string` and
+`mime_type` are probed from the output when it is written; they stay `null`
+until then, or when the probe failed.
 
 **`POST /api/v1/renders/{id}/cancel`** — cancel a pending or in-flight render.
 Returns the updated job object (status will be `"failed"`). A job already in
 a terminal state (`done` or `failed`) is returned unchanged.
+
+**`DELETE /api/v1/renders/{id}`** — delete a render job and its output file
+(see **Deletion** under [The render queue](#the-render-queue)). Returns
+`204 No Content`; `404` for an unknown id; `403` for a viewer; `409` if a
+running job could not be stopped; `503` if a running job cannot be stopped
+because the render worker is not available. Operators and admins only.
 
 ### Milestones
 
@@ -476,3 +623,17 @@ Milestone response object:
 
 **`DELETE /api/v1/projects/{project_id}/milestones/{id}`** — delete a
 milestone. Returns `204 No Content`.
+
+### System
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/system/render-activity` | Bearer | Render queue activity, for upgrade gating |
+
+**`GET /api/v1/system/render-activity`** returns:
+```json
+{"live_tasks": 0, "pending_rows": 0, "encoding_rows": 0, "orphans": 0}
+```
+
+`orphans` counts `encoding` rows with no live task; the worker fails them on
+its next cycle. An upgrade is safe when `live_tasks + pending_rows == 0`.

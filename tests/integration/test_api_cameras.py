@@ -25,6 +25,8 @@ from fastapi.testclient import TestClient
 
 from timelapse_manager.cameras.base import (
     CapturedFrame,
+    GeoLocation,
+    GeolocationAccessDenied,
     ValidationFailure,
     ValidationResult,
 )
@@ -33,6 +35,7 @@ from timelapse_manager.config.settings import Settings
 from timelapse_manager.db.engine import create_db_engine
 from timelapse_manager.db.models import Camera, Project
 from timelapse_manager.db.session import create_session_factory, session_scope
+from timelapse_manager.runtime import get_context
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -318,6 +321,82 @@ class TestCameraValidate:
         assert body["ok"] is False
         assert body["reason"] == "auth"
 
+    def _validate_with_geo(
+        self,
+        client: TestClient,
+        token: str,
+        camera_id: int,
+        **geo_mock: object,
+    ) -> dict:
+        """Validate ``camera_id`` with an OK probe and a stubbed geolocation read."""
+        mock_result = ValidationResult(ok=True, reason=None, message="connected")
+        with patch("timelapse_manager.api.cameras.build_adapter") as mock_build:
+            fake_adapter = AsyncMock()
+            fake_adapter.validate_connection = AsyncMock(return_value=mock_result)
+            fake_adapter.get_geolocation = AsyncMock(**geo_mock)
+            fake_adapter.close = AsyncMock()
+            mock_build.return_value = fake_adapter
+            resp = client.post(f"{API}/{camera_id}/validate", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    @staticmethod
+    def _stored_geo(camera_id: int) -> tuple[float | None, float | None, str | None]:
+        with session_scope(get_context().session_factory) as db:
+            cam = db.get(Camera, camera_id)
+            assert cam is not None
+            return (
+                cam.geolocation_latitude,
+                cam.geolocation_longitude,
+                cam.geolocation_source,
+            )
+
+    def test_validate_reports_geolocation_access_denied(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        """A refused geo read keeps validation OK, says why, and persists nothing."""
+        created = _create_camera(
+            migrated_client,
+            cam_auth_token,
+            name="geo-denied-cam",
+            protocol="vapix",
+            address="10.0.0.3",
+        )
+        body = self._validate_with_geo(
+            migrated_client,
+            cam_auth_token,
+            created["id"],
+            side_effect=GeolocationAccessDenied("vapix", "Administrator", 401),
+        )
+        assert body["ok"] is True
+        assert body["geolocation_status"] == "access_denied"
+        assert self._stored_geo(created["id"]) == (None, None, None)
+
+    def test_validate_reports_geolocation_none_and_ok(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        created = _create_camera(
+            migrated_client,
+            cam_auth_token,
+            name="geo-status-cam",
+            protocol="vapix",
+            address="10.0.0.4",
+        )
+        body = self._validate_with_geo(
+            migrated_client, cam_auth_token, created["id"], return_value=None
+        )
+        assert body["geolocation_status"] == "none"
+
+        body = self._validate_with_geo(
+            migrated_client,
+            cam_auth_token,
+            created["id"],
+            return_value=GeoLocation(latitude=34.1, longitude=-83.9, source="camera"),
+        )
+        assert body["geolocation_status"] == "ok"
+        lat, lon, source = self._stored_geo(created["id"])
+        assert (lat, lon, source) == (34.1, -83.9, "camera")
+
 
 # ---------------------------------------------------------------------------
 # Manual capture endpoint
@@ -363,12 +442,14 @@ class TestManualCapture:
         fake_adapter = AsyncMock()
         fake_adapter.capture = AsyncMock(return_value=fake_frame)
         fake_adapter.close = AsyncMock()
+        fake_adapter.capture_budget_seconds = None
 
         from timelapse_manager.capture.frame_writer import FrameWriter
 
         with (
             patch(
-                "timelapse_manager.api.cameras.build_adapter", return_value=fake_adapter
+                "timelapse_manager.capture.one_shot.build_adapter",
+                return_value=fake_adapter,
             ),
             patch.object(FrameWriter, "write", return_value=fake_written),
         ):
@@ -520,7 +601,7 @@ class TestDiscoverEndpoint:
                 new=AsyncMock(return_value=found),
             ),
             patch(
-                "timelapse_manager.cameras.discovery.resolve_camera_host",
+                "timelapse_manager.cameras.discovery.resolve_camera_host_async",
                 side_effect=lambda a: a,
             ),
             patch(
@@ -563,7 +644,7 @@ class TestDiscoverEndpoint:
                 new=AsyncMock(return_value=found),
             ),
             patch(
-                "timelapse_manager.cameras.discovery.resolve_camera_host",
+                "timelapse_manager.cameras.discovery.resolve_camera_host_async",
                 side_effect=lambda a: a,
             ),
             patch(
@@ -705,18 +786,22 @@ class TestDetectProtocolEndpoint:
         """A viewer authenticated via the web session is rejected with 403.
 
         The detect-protocol endpoint uses require_operator_or_admin_principal,
-        which checks the session cookie path when a cookie is present. A viewer
-        role in that cookie is rejected as 403 before the local bearer-token
-        fallback runs. This test uses the viewer_client fixture (session-cookie
-        path) to exercise the role gate on the JSON API surface.
-
-        Note: viewer_client uses web_settings (https://testserver base_url) and
-        carries no Authorization header, so the endpoint's role dependency fires
-        via the cookie branch and returns 403 for the viewer role.
+        which checks the session cookie path when a cookie is present. The API
+        is bearer-only (#261), so the viewer's cookie counts only alongside a
+        valid bearer (and its CSRF token); the viewer role is then rejected
+        as 403 before the local bearer-token fallback runs.
         """
+        from tests.conftest import csrf_of
+        from timelapse_manager.runtime import get_context
+        from timelapse_manager.security.token import ensure_local_token
+
         resp = viewer_client.post(
             DETECT,
             json={"address": "10.0.0.5"},
+            headers={
+                "Authorization": f"Bearer {ensure_local_token(get_context().settings)}",
+                "X-CSRF-Token": csrf_of(viewer_client, "/"),
+            },
         )
         assert resp.status_code == 403
 
@@ -823,3 +908,95 @@ class TestCaptureStatusEndpoint:
             headers=_auth(cam_auth_token),
         )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# WP-69-T (CAM-S6): coordinates are range- and finite-checked on the API
+# ---------------------------------------------------------------------------
+
+
+class TestApiCoordinateRange:
+    """``json.loads`` accepts ``NaN``/``Infinity``, so the body model must refuse."""
+
+    def _post_raw(self, client: TestClient, token: str, body: str):
+        return client.post(
+            API,
+            content=body.encode(),
+            headers={**_auth(token), "Content-Type": "application/json"},
+        )
+
+    def test_nan_latitude_is_rejected(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        resp = self._post_raw(
+            migrated_client,
+            cam_auth_token,
+            '{"name": "nan-cam", "geolocation_latitude": NaN,'
+            ' "geolocation_longitude": 10.0}',
+        )
+        assert resp.status_code == 422
+
+    def test_infinite_longitude_is_rejected(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        resp = self._post_raw(
+            migrated_client,
+            cam_auth_token,
+            '{"name": "inf-cam", "geolocation_latitude": 10.0,'
+            ' "geolocation_longitude": Infinity}',
+        )
+        assert resp.status_code == 422
+
+    def test_out_of_range_latitude_is_rejected(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        resp = migrated_client.post(
+            API,
+            json={
+                "name": "far-cam",
+                "geolocation_latitude": 200.0,
+                "geolocation_longitude": 10.0,
+            },
+            headers=_auth(cam_auth_token),
+        )
+        assert resp.status_code == 422
+
+    def test_in_range_coordinates_are_stored(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        body = _create_camera(
+            migrated_client,
+            cam_auth_token,
+            name="edge-cam",
+            geolocation_latitude=-90.0,
+            geolocation_longitude=180.0,
+        )
+        assert body["geolocation_latitude"] == -90.0
+        assert body["geolocation_longitude"] == 180.0
+
+    def test_persist_site_skips_an_invalid_device_value(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        from timelapse_manager.api.cameras import _persist_device_geolocation
+        from timelapse_manager.cameras.base import GeoLocation
+
+        created = _create_camera(migrated_client, cam_auth_token, name="persist-cam")
+        _persist_device_geolocation(
+            created["id"],
+            GeoLocation(latitude=float("nan"), longitude=10.0, source="camera"),
+        )
+        stored = migrated_client.get(
+            f"{API}/{created['id']}", headers=_auth(cam_auth_token)
+        ).json()
+        assert stored["geolocation_latitude"] is None
+        assert stored["geolocation_source"] is None
+
+        _persist_device_geolocation(
+            created["id"],
+            GeoLocation(latitude=34.12, longitude=-83.94, source="camera"),
+        )
+        stored = migrated_client.get(
+            f"{API}/{created['id']}", headers=_auth(cam_auth_token)
+        ).json()
+        assert stored["geolocation_latitude"] == 34.12
+        assert stored["geolocation_source"] == "camera"

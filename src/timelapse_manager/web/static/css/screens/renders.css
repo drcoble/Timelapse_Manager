@@ -43,3 +43,80 @@
   background: var(--color-accent);
   transition: width var(--transition-mid);
 }
+
+/* No real progress is recorded for a running render, so the bar is
+   indeterminate: a short fill sweeps across instead of a made-up percentage.
+   Under reduced motion it holds still as a dimmed full-width bar. */
+.progress-bar.indeterminate .progress-fill {
+  width: 40%;
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+@keyframes progress-indeterminate {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(250%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar.indeterminate .progress-fill {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
+/* Row opener ("Render #N" / "Export #N") and the project name on /renders. */
+.job-open {
+  color: var(--color-accent-text);
+  text-decoration: none;
+}
+.job-open:hover { text-decoration: underline; }
+.job-project { color: var(--color-text-muted); font-weight: 400; }
+
+.kind-badge.export {
+  background: var(--color-surface-3);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border-2);
+}
+
+/* --------------------------------------------------------------------------
+   Render / export card (job_card_modal.html + render_card / export_card)
+   -------------------------------------------------------------------------- */
+.job-card-status { margin: 0 0 var(--sp-3); }
+.job-card .alert { margin-bottom: var(--sp-3); }
+
+.job-card-fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0 0 var(--sp-4);
+  font-size: 0.875rem;
+}
+.job-card-fields dt { color: var(--color-text-muted); }
+.job-card-fields dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.job-card-chapters ol { margin: var(--sp-2) 0 0; padding-left: var(--sp-5); }
+
+.job-card-play { margin-bottom: var(--sp-3); }
+.job-card-play > summary { list-style: none; }
+.job-card-play > summary::-webkit-details-marker { display: none; }
+.job-card-play video {
+  display: block;
+  width: 100%;
+  margin-top: var(--sp-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-3);
+}
+
+.job-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+  margin-bottom: var(--sp-3);
+}
+
+.job-card-delete > summary { list-style: none; display: inline-flex; }
+.job-card-delete > summary::-webkit-details-marker { display: none; }
+.job-card-delete .inline-confirm { margin-top: var(--sp-3); }
+.job-card-delete .inline-confirm__msg p { margin: 0 0 var(--sp-2); }
+
+/* As a page (no JavaScript) the card has no dialog to close. */
+.job-card-page .drawer-close { display: none; }

@@ -51,6 +51,11 @@ CONTAINER_OPTIONS: tuple[tuple[str, str], ...] = (
 MIN_FPS = 1
 MAX_FPS = 240
 
+# Stored in a schedule's ``fps`` to mean "resolve the suggested rate from the
+# project's frames when the render fires" (#301). A schedule that never stored
+# it is unchanged.
+FPS_AUTO = "auto"
+
 # The resolutions offered in the UI, as ``(value, label)`` pairs. ``"source"``
 # keeps the captured frames' native size (no scaling).
 RESOLUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -205,6 +210,7 @@ def render_settings_view(schedule: dict[str, Any] | None) -> dict[str, Any]:
     if container not in _VALID_CONTAINERS:
         container = DEFAULT_CONTAINER
 
+    fps_auto = fps_is_auto(raw)
     fps = _coerce_int(raw.get("fps"), DEFAULT_FPS)
     if fps < MIN_FPS or fps > MAX_FPS:
         fps = DEFAULT_FPS
@@ -224,13 +230,21 @@ def render_settings_view(schedule: dict[str, Any] | None) -> dict[str, Any]:
         "interval_seconds": interval,
         "encoder": encoder,
         "container": container,
+        # The number the form shows; for an auto schedule it is the default and
+        # ``fps_auto`` says the stored choice is the suggestion.
         "fps": fps,
+        "fps_auto": fps_auto,
         "resolution": resolution,
         # Stored key (round-trips through the save path and is what
         # ``auto_prune_enabled`` reads) plus the template-facing alias.
         AUTO_PRUNE_KEY: auto_prune,
         "autoprune": auto_prune,
     }
+
+
+def fps_is_auto(schedule: dict[str, Any] | None) -> bool:
+    """Return whether a stored schedule asks for the suggested frame rate."""
+    return isinstance(schedule, dict) and schedule.get("fps") == FPS_AUTO
 
 
 def auto_prune_enabled(schedule: dict[str, Any] | None) -> bool:

@@ -1,0 +1,133 @@
+{#
+  Partial: render_card.html — the render card (GET /renders/{id}/card).
+
+  One template for both screens that list renders (project Renders tab and the
+  global Renders page). Loaded into #job-card-content of job_card_modal.html, or
+  shown inside job_card_page.html without JavaScript.
+
+  Context: card — _JobCardView; can_operate — bool; csrf_token — str.
+  Viewers can open the card, play and download; Cancel and Delete are not
+  rendered for them (the routes refuse them regardless).
+
+  Play (#25): shown for every finished render with a file once this browser's
+  check passes (_playback.html, playability.js); otherwise a "can't play" note
+  with the download link. Without JavaScript, only browser_streamable renders
+  (H.264/MP4) show the player.
+#}
+{% from '_partials/_playback.html' import playback_attrs, cant_play_note %}
+<header class="discover-modal-header">
+  <h2 class="card-title" id="job-card-title">
+    <span class="kind-badge {{ card.kind }}">{{ card.kind | capitalize }}</span>
+    Render #{{ card.id }}
+  </h2>
+  <button type="button" class="drawer-close" data-modal-close
+          aria-label="Close">&times;</button>
+</header>
+<div class="discover-modal-body job-card">
+  {% include '_partials/job_card_status.html' %}
+
+  {% if card.is_archive %}
+    <div class="alert info">
+      Archive render: automatic pruning keeps archive renders, so this file stays
+      until it is deleted here.
+    </div>
+  {% endif %}
+
+  <dl class="job-card-fields">
+    <dt>Project</dt>
+    <dd><a href="/projects/{{ card.project_id }}">{{ card.project_name }}</a></dd>
+
+    <dt>Triggered by</dt>
+    <dd>{{ card.triggered_by }}</dd>
+
+    {% include '_partials/job_card_times.html' %}
+
+    <dt>Output</dt>
+    <dd class="mono">
+      {{ card.codec }} &middot; {{ card.container }} &middot;
+      {{ card.fps_display or '?' }} fps &middot; {{ card.resolution_display }}
+    </dd>
+
+    <dt>Frames used</dt>
+    <dd>
+      {% if card.frame_count is not none %}
+        {{ card.frame_count }} frame{{ '' if card.frame_count == 1 else 's' }}
+        {% if card.first_frame_at_raw %}
+          <br>{{ card.first_frame_at_raw | localdt }}
+          &ndash; {{ card.last_frame_at_raw | localdt }}
+        {% endif %}
+      {% else %}
+        <span class="text-muted">not recorded</span>
+      {% endif %}
+    </dd>
+
+    <dt>Video length</dt>
+    <dd>{{ card.video_length_display or 'not recorded' }}</dd>
+
+    <dt>Chapters</dt>
+    <dd>
+      {% if card.chapters is none %}
+        <span class="text-muted">not recorded</span>
+      {% elif card.chapters %}
+        <details class="job-card-chapters">
+          <summary>{{ card.chapters | length }} chapter{{ '' if card.chapters | length == 1 else 's' }}</summary>
+          <ol>
+            {% for time, label in card.chapters %}
+              <li><span class="mono">{{ time }}</span> {{ label }}</li>
+            {% endfor %}
+          </ol>
+        </details>
+      {% else %}
+        None
+      {% endif %}
+    </dd>
+
+    <dt>Overlay</dt>
+    <dd>{{ card.overlay_display }}</dd>
+
+    {% include '_partials/job_card_file.html' %}
+
+    {% if card.file_name %}
+      <dt>Codec</dt>
+      <dd>
+        {% if card.codec_string %}
+          <span class="mono">{{ card.codec_string }}</span>
+        {% else %}
+          <span class="text-muted">not recorded</span>
+        {% endif %}
+      </dd>
+    {% endif %}
+  </dl>
+
+  {% if card.stream_url and card.playback %}
+    <div class="job-card-playability" {{ playback_attrs(card.playback) }}>
+      <details class="job-card-play"
+               data-play-ok{% if not card.browser_streamable %} hidden{% endif %}>
+        <summary class="btn btn-secondary btn-sm">&#9654; Play</summary>
+        <video controls preload="none" src="{{ card.stream_url }}"></video>
+      </details>
+      {{ cant_play_note(card.playback, card.download_url, tag='p', css='form-hint playability-note') }}
+    </div>
+  {% endif %}
+
+  <div class="job-card-actions">
+    {% if card.download_url %}
+      <a href="{{ card.download_url }}" class="btn btn-secondary btn-sm" download>
+        &#8659; Download
+      </a>
+    {% endif %}
+    {% if can_operate and card.cancel_url %}
+      <form method="post" action="{{ card.cancel_url }}" style="margin:0;"
+            hx-post="{{ card.cancel_url }}" hx-target="#job-card-content"
+            hx-swap="innerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-ghost btn-sm">Cancel render</button>
+      </form>
+    {% endif %}
+  </div>
+
+  {% if can_operate %}
+    {% set noun = 'render' %}
+    {% include '_partials/job_card_delete.html' %}
+  {% endif %}
+</div>

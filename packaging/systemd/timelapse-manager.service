@@ -16,7 +16,7 @@
 
 [Unit]
 Description=Timelapse Manager (IP-camera timelapse capture and rendering)
-Documentation=https://github.com/timelapse-manager/timelapse-manager
+Documentation=https://github.com/drcoble/Timelapse_Manager
 # Cameras and notifications need the network; wait for it to be fully up.
 After=network-online.target
 Wants=network-online.target
@@ -55,11 +55,19 @@ ExecStart=@INSTALL_DIR@/timelapse-manager run
 
 # Graceful restarts with backoff so a crash loop does not hammer the host.
 Restart=on-failure
+# Status 78: startup refused because the encryption key does not match the stored
+# secrets (#67 S8). Restarting cannot fix that; see `timelapse-manager secrets status`.
+RestartPreventExitStatus=78
 RestartSec=5s
 # If it fails more than 5 times within 60s, stop trying and surface the fault.
 StartLimitIntervalSec=60s
 StartLimitBurst=5
-TimeoutStopSec=30s
+# A stop drains both listeners together for server.shutdown_grace_seconds
+# (default 10 s), then the lifespan teardown cancels any render in flight
+# (killing ffmpeg, removing the partial output, recording the job) and stops
+# capture. 45 s covers that with margin; SIGKILL after it would leave a render
+# orphaned until the next start (#67 R4).
+TimeoutStopSec=45s
 KillSignal=SIGTERM
 
 # --- Hardening -----------------------------------------------------------
@@ -69,6 +77,11 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# PrivateDevices hides GPU nodes, so hardware encoding (render.hwaccel_*) cannot
+# open /dev/dri or /dev/nvidia*. Grant access only on a host that uses it, with
+# an opt-in drop-in (/etc/systemd/system/timelapse-manager.service.d/hwaccel.conf,
+# see docs/installation.md); install.sh leaves drop-ins alone. Do not relax this
+# line here.
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

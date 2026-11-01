@@ -39,12 +39,18 @@ from .geo import resolve_zoneinfo
 from .schedule import compute_solar_noon, compute_sun_times
 
 __all__ = [
+    "ANCHOR_AUTH_MAX_ATTEMPTS",
+    "ANCHOR_MAX_ATTEMPTS",
+    "ANCHOR_RETRY_BASE",
+    "ANCHOR_RETRY_GRACE_MARGIN",
     "EXACT_TIME_GRACE",
     "Anchor",
     "AnchorDecision",
     "parse_anchors",
     "serialize_anchor",
     "anchor_fire_instant",
+    "anchor_retry_delay",
+    "clock_anchor_in_dst_gap",
     "next_anchor_wake",
     "next_solar_capture_instant",
     "due_anchors",
@@ -56,6 +62,19 @@ __all__ = [
 # per-anchor config -- keeps the rule simple; the seam to make it per-anchor
 # exists in the anchor object if it is ever needed.
 EXACT_TIME_GRACE = timedelta(minutes=30)
+
+# Retry schedule for a failed anchor attempt (#69, CAM-R1). The delay after
+# attempt ``n`` is ``ANCHOR_RETRY_BASE * 2 ** (n - 1)``: 15, 30, 60, 120, 240 and
+# 480 s, so seven attempts span about 16 minutes after the instant -- long enough
+# to ride out a camera reboot or firmware housekeeping, well inside the grace.
+ANCHOR_RETRY_BASE = timedelta(seconds=15)
+ANCHOR_MAX_ATTEMPTS = 7
+# An authentication failure is retried once only: repeating a wrong password
+# seven times risks an Axis account lockout.
+ANCHOR_AUTH_MAX_ATTEMPTS = 2
+# A retry must start at least this long before the grace window closes, so the
+# attempt itself still finishes inside it.
+ANCHOR_RETRY_GRACE_MARGIN = timedelta(seconds=30)
 
 # Anchor offsets are bounded to a sane range so a fat-fingered value cannot push
 # a "noon" anchor onto a different day or wildly off the clock anchor. +/- 12h.
@@ -275,11 +294,17 @@ def anchor_fire_instant(
     offset = timedelta(minutes=anchor.offset_minutes)
 
     if anchor.kind == _KIND_CLOCK:
-        assert anchor.time is not None  # guaranteed by parse_anchors for clock
-        hhmm = _parse_hhmm(anchor.time, "anchor.time")
-        hour, minute = (int(part) for part in hhmm.split(":"))
-        local_dt = datetime.combine(on_date, time(hour, minute), tzinfo=tz)
-        return (local_dt + offset).astimezone(UTC)
+        fire_local = _clock_fire_local(anchor, on_date, tz)
+        if not _wall_time_exists(fire_local, tz):
+            # The configured wall-clock time does not exist on this date (it
+            # falls in a daylight-saving spring-forward gap, e.g. 02:30 when the
+            # clocks jump 02:00 -> 03:00). Shift forward deliberately to the
+            # first valid instant after the gap -- the moment the clocks resume
+            # -- rather than letting ``zoneinfo``'s fold default pick an
+            # undocumented instant. The caller (see ``clock_anchor_in_dst_gap``)
+            # logs the shift once per fire.
+            fire_local = _first_valid_instant_after_gap(fire_local, tz)
+        return fire_local.astimezone(UTC)
 
     # Solar anchors require a location.
     if latitude is None or longitude is None:
@@ -297,6 +322,85 @@ def anchor_fire_instant(
     if event_utc is None:
         return None
     return event_utc + offset
+
+
+def _clock_fire_local(
+    anchor: Anchor, local_date: date | datetime, tz: ZoneInfo
+) -> datetime:
+    """Return a clock anchor's offset-applied fire time as a local wall instant.
+
+    The result is an aware datetime in *tz*. It may name a *nonexistent* wall
+    time (one inside a spring-forward gap), which the caller resolves; factored
+    out so :func:`anchor_fire_instant` and :func:`clock_anchor_in_dst_gap` agree
+    on exactly which instant the gap test applies to (the configured ``HH:MM``
+    shifted by ``offset_minutes``, since that is the instant actually fired).
+    """
+    on_date = local_date.date() if isinstance(local_date, datetime) else local_date
+    assert anchor.time is not None  # guaranteed by parse_anchors for clock
+    hhmm = _parse_hhmm(anchor.time, "anchor.time")
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    local_dt = datetime.combine(on_date, time(hour, minute), tzinfo=tz)
+    return local_dt + timedelta(minutes=anchor.offset_minutes)
+
+
+def _wall_time_exists(dt: datetime, tz: ZoneInfo) -> bool:
+    """Whether the aware local *dt* names a real instant in *tz*.
+
+    A wall-clock time inside a spring-forward gap does not exist: localising it
+    and round-tripping through UTC yields a *different* wall time. An ambiguous
+    fall-back time (one that occurs twice) *does* exist -- it round-trips -- so
+    this flags only the nonexistent (gap) case and leaves fall-back alone.
+    """
+    return dt == dt.astimezone(UTC).astimezone(tz)
+
+
+def _first_valid_instant_after_gap(dt: datetime, tz: ZoneInfo) -> datetime:
+    """Return the first valid local instant on or after a spring-forward gap.
+
+    *dt* is a nonexistent local wall time (inside the gap). PEP 495's two folds
+    bracket the transition: ``fold=1`` localises with the pre-gap offset (an
+    instant just before the clocks jump) and ``fold=0`` with the post-gap offset
+    (just after). A bisection between those two UTC instants converges on the
+    exact transition -- the moment the clocks resume -- which is the first valid
+    local time after the gap. The search runs over integer POSIX seconds because
+    zone transitions land on whole-second boundaries, so the result is exact
+    (a float bisection would leave a sub-second residual). Returned as an aware
+    datetime in *tz*. Pure: no I/O, no wall clock.
+    """
+    before = dt.replace(fold=1).astimezone(UTC)
+    after = dt.replace(fold=0).astimezone(UTC)
+    post_offset = after.astimezone(tz).utcoffset()
+    # ``lo`` floors to a second still on the pre-gap side; ``hi`` floors to one
+    # already on the post-gap side. The smallest second with the post-gap offset
+    # is the transition instant itself.
+    lo = int(before.timestamp())
+    hi = int(after.timestamp())
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if datetime.fromtimestamp(mid, UTC).astimezone(tz).utcoffset() == post_offset:
+            hi = mid
+        else:
+            lo = mid
+    return datetime.fromtimestamp(hi, UTC).astimezone(tz)
+
+
+def clock_anchor_in_dst_gap(
+    anchor: Anchor, local_date: date | datetime, tz: ZoneInfo
+) -> bool:
+    """Whether a clock anchor's fire time on *local_date* falls in a DST gap.
+
+    Returns ``True`` only when *anchor* is a clock anchor whose configured time
+    (shifted by ``offset_minutes``) is a *nonexistent* wall-clock instant on
+    *local_date* in *tz* -- the daylight-saving spring-forward gap that
+    :func:`anchor_fire_instant` deliberately resolves by shifting forward to the
+    first valid instant after the gap. Returns ``False`` for solar anchors and
+    for clock times that exist normally, so a caller can log the deliberate
+    shift only when one actually happened. Pure (no clock, no I/O).
+    """
+    if anchor.kind != _KIND_CLOCK or anchor.time is None:
+        return False
+    fire_local = _clock_fire_local(anchor, local_date, tz)
+    return not _wall_time_exists(fire_local, tz)
 
 
 def _effective_tz(anchor: Anchor, tz: ZoneInfo, solar_tz: ZoneInfo | None) -> ZoneInfo:
@@ -418,6 +522,33 @@ def due_anchors(
             )
         )
     return decisions
+
+
+def anchor_retry_delay(
+    attempts: int, remaining: timedelta, *, auth: bool = False
+) -> timedelta | None:
+    """Return the wait before the next attempt of a failed anchor, or ``None``.
+
+    Pure: the caller supplies how many attempts have been made (``attempts``,
+    counting the one that just failed) and how much of the grace window is left
+    (``remaining = instant + grace - now``).
+
+    The delay is ``ANCHOR_RETRY_BASE * 2 ** (attempts - 1)``. ``None`` means the
+    failure is final:
+
+    * ``attempts`` has reached :data:`ANCHOR_MAX_ATTEMPTS` (or
+      :data:`ANCHOR_AUTH_MAX_ATTEMPTS` when ``auth`` is set, for an
+      authentication failure); or
+    * the retry would start later than :data:`ANCHOR_RETRY_GRACE_MARGIN` before
+      the grace window closes (``delay > remaining - margin``).
+    """
+    limit = ANCHOR_AUTH_MAX_ATTEMPTS if auth else ANCHOR_MAX_ATTEMPTS
+    if attempts < 1 or attempts >= limit:
+        return None
+    delay: timedelta = ANCHOR_RETRY_BASE * (1 << (attempts - 1))
+    if delay > remaining - ANCHOR_RETRY_GRACE_MARGIN:
+        return None
+    return delay
 
 
 def next_anchor_wake(

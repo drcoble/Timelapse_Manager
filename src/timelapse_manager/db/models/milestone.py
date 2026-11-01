@@ -18,7 +18,12 @@ class Milestone(TimestampMixin, Base):
     """
 
     __tablename__ = "milestone"
-    __table_args__ = (Index("ix_milestone_project_id", "project_id"),)
+    # AUTOINCREMENT (migration 031, #17): a deleted milestone's id is never reused,
+    # so a new milestone does not inherit the old one's audit history.
+    __table_args__ = (
+        Index("ix_milestone_project_id", "project_id"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(

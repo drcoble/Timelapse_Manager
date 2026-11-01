@@ -8,6 +8,8 @@ Covers:
 - get_camera_geolocation: adapter geo returned when no manual override
 - get_camera_geolocation: adapter geo returned when camera is None
 - get_camera_geolocation: adapter errors are suppressed, returns None
+- get_camera_geolocation: an access denial propagates; a manual override wins
+  without consulting the adapter (#68)
 
 No network access.
 """
@@ -18,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from timelapse_manager.cameras.base import GeoLocation
+from timelapse_manager.cameras.base import GeoLocation, GeolocationAccessDenied
 from timelapse_manager.cameras.geolocation import (
     get_camera_geolocation,
     manual_override,
@@ -145,3 +147,28 @@ class TestGetCameraGeolocation:
         geo = await get_camera_geolocation(adapter, camera=cam)
 
         assert geo is None
+
+    async def test_access_denied_propagates(self) -> None:
+        adapter = MagicMock()
+        adapter.get_geolocation = AsyncMock(
+            side_effect=GeolocationAccessDenied("vapix", "Administrator", 401)
+        )
+        cam = self._camera("camera")
+
+        with pytest.raises(GeolocationAccessDenied) as excinfo:
+            await get_camera_geolocation(adapter, camera=cam)
+
+        assert excinfo.value.required_role == "Administrator"
+
+    async def test_manual_override_wins_even_when_adapter_would_deny(self) -> None:
+        adapter = MagicMock()
+        adapter.get_geolocation = AsyncMock(
+            side_effect=GeolocationAccessDenied("vapix", "Administrator", 401)
+        )
+        cam = self._camera("manual", lat=51.5, lon=-0.1)
+
+        geo = await get_camera_geolocation(adapter, camera=cam)
+
+        assert geo is not None
+        assert geo.source == "manual"
+        adapter.get_geolocation.assert_not_called()

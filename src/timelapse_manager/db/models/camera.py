@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Enum, Float, Integer, String
+from sqlalchemy import JSON, Boolean, Enum, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
@@ -46,6 +46,9 @@ class Camera(TimestampMixin, Base):
     """
 
     __tablename__ = "camera"
+    # AUTOINCREMENT (migration 031, #17): a deleted camera's id is never reused,
+    # so a new camera does not inherit the old one's events and audit history.
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
@@ -62,6 +65,20 @@ class Camera(TimestampMixin, Base):
     )
     snapshot_uri: Mapped[str | None] = mapped_column(String, nullable=True)
     stream_uri: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Opt-in to HTTP Basic authentication over plain ``http://`` (#69 CAM-S1,
+    # owner decision OD-3). Basic sends the password merely base64-encoded, so
+    # by default it is refused unless the address is ``https://``; a camera that
+    # offers only Basic and cannot do TLS needs this ticked. Off for new and
+    # existing rows (migration 038).
+    allow_basic_over_http: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    # The camera's pinned TLS certificate (#69 CAM-S1, migration 039): the PEM of
+    # the exact certificate its HTTPS and event connections must present, or
+    # ``None`` for the normal CA-bundle verification. Public data, never a
+    # secret. Set only by an explicit operator action (never captured on first
+    # use automatically); a pinned camera trusts this certificate and nothing else.
+    tls_pinned_cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
     default_resolution: Mapped[str | None] = mapped_column(String, nullable=True)
     geolocation_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     geolocation_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)

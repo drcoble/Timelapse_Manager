@@ -18,6 +18,7 @@ database engine module and SQLAlchemy's own connection context.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,9 @@ from .config import Settings
 if TYPE_CHECKING:
     from .capture import CaptureSupervisor
     from .monitoring import NotificationDispatcher
+    from .monitoring.diagnostics import LogLevelOverrides, LoopLagMonitor
     from .render import RenderQueue, RenderScheduler
+    from .security.token import TokenFileCache
 
 
 @dataclass
@@ -67,6 +70,19 @@ class AppContext:
     :param notification_dispatcher: the poll-based notification dispatcher, or
         None before startup wiring constructs it. Startup installs the channels
         and starts/stops its poll loop.
+    :param loop_lag_monitor: the ``loop-lag`` ticker behind the event-loop lag
+        gauge, or None when the lifespan has not installed it.
+    :param log_level_overrides: the temporary log-level override manager used
+        by the debug endpoint, or None when the lifespan has not installed it.
+    :param local_token: the local API token, loaded once at startup and
+        re-read only when its file changes (#67 S2). None until the lifespan
+        installs it; the token dependency installs one on first use otherwise.
+    :param metrics_token: the read-only metrics token, likewise; None while the
+        metrics endpoint is disabled.
+    :param jobs_executor: the dedicated executor for long jobs (render
+        preparation, exports, imports, prunes, the codec backfill scan; #66 C3),
+        or None under alternative wiring, where :func:`executors.run_in` falls
+        back to the loop's default executor. Owned and shut down by the lifespan.
     """
 
     settings: Settings
@@ -91,6 +107,20 @@ class AppContext:
     # A tuple is immutable, so a shared default is safe. Appended after
     # env_overrides so existing positional construction is unaffected.
     ssrf_config_subnets: tuple[str, ...] = ()
+    # In-process diagnostics (#7), installed by the lifespan once the server's
+    # loop is running: the loop-lag ticker (which also holds the loop, so a
+    # metrics scrape on a worker thread can read its executor statistics) and
+    # the temporary log-level overrides. None under alternative wiring.
+    loop_lag_monitor: LoopLagMonitor | None = None
+    log_level_overrides: LogLevelOverrides | None = None
+    # API bearer tokens (#67 S2), loaded by the lifespan. Appended last so
+    # positional construction of the earlier fields is unaffected.
+    local_token: TokenFileCache | None = None
+    metrics_token: TokenFileCache | None = None
+    # Long-job executor (#66 C3), created and shut down by the lifespan.
+    # Appended last so positional construction of the earlier fields is
+    # unaffected.
+    jobs_executor: ThreadPoolExecutor | None = None
 
 
 # Installed once at startup via set_context(); read back via get_context().

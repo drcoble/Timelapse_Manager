@@ -2,8 +2,8 @@
 
 Provides a JSON or plain-text formatter selectable from settings, redaction of
 secret-looking values in structured fields, an optional file sink alongside the
-console, and a one-line startup banner. No third-party logging dependency is
-used.
+console, an in-memory ring buffer of recent records for problem reports, and a
+one-line startup banner. No third-party logging dependency is used.
 """
 
 from __future__ import annotations
@@ -11,12 +11,49 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
+from collections import deque
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
 
 if TYPE_CHECKING:
     from .config.settings import Settings
+
+# The current request's correlation id, set by the web request-id middleware for
+# the duration of a request and read back by :class:`RequestIdFilter` so every
+# log record emitted while handling that request carries the id. ``None`` outside
+# a request (startup, background loops), in which case no id is stamped.
+#
+# This lives in ``logging`` rather than the web package so ``configure_logging``
+# can attach the filter without importing ``web`` -- importing the web package
+# pulls in the router/middleware stack, which imports back into ``logging`` (via
+# ``monitoring.events``), a cycle. The web middleware imports these names from
+# here instead.
+request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
+class RequestIdFilter(logging.Filter):
+    """Stamp the current request's correlation id onto each log record.
+
+    Attached to every handler ``configure_logging`` installs. When a request is
+    in flight its id is set on :data:`request_id_ctx`; this copies it onto the
+    record as ``request_id`` (unless the record already carries one, e.g. an
+    explicit ``extra=``) so the JSON formatter emits it as a field. Records
+    outside any request are left untouched. Always returns ``True`` -- it
+    enriches records, it never filters them out.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        rid = request_id_ctx.get()
+        if rid is not None and not hasattr(record, "request_id"):
+            record.request_id = rid
+        return True
+
 
 # Field names whose values are masked in structured log output. Matched
 # case-insensitively as a substring, so "smtp_password" and "api_key" both hit.
@@ -28,7 +65,25 @@ _REDACTED = "***"
 # preserved; the credentials are replaced. Applied to both free-text messages
 # and string values inside structured fields so an embedded camera/SMTP/webhook
 # credential never reaches the log or, via log_event, the database.
-_URL_USERINFO_PATTERN = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s@]+@")
+# The userinfo runs to the *last* ``@`` before the path, so a password that holds
+# an unescaped ``@`` (``rtsp://user:p@ss@host/``) is masked whole, not up to its
+# first ``@`` with the rest left readable.
+# This permissive class is the default and fails closed: it runs to the last ``@``
+# before the next ``/`` or whitespace whatever characters (quotes, brackets,
+# backslashes) the password holds, so a plain-text password is never left
+# partly readable. Over-redacting is acceptable; leaking is not.
+_URL_USERINFO_PATTERN = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s]+@")
+
+# The same, bounded for text *known* to be a serialised JSON or repr structure
+# (``redact_text(..., serialized=True)``): it stops at a double quote, whitespace
+# and angle brackets so the match ends with the string it sits in instead of
+# running on to an ``@`` in the next field (``{"u":"rtsp://user:pw@h","e":"a@b"}``,
+# #224). A backslash escape (``\"``) is consumed as one unit, so a password with an
+# escaped quote is masked whole. It must never be applied to plain text, where an
+# unescaped quote in a password would end the match early and leak the rest.
+_SERIALIZED_USERINFO_PATTERN = re.compile(
+    r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)(?:\\.|[^/\s\"\\<>])+@"
+)
 
 # Secret-bearing query-string parameters, e.g. ``?token=abc&access_key=xyz``. A
 # webhook URL can carry a credential in its query string that userinfo redaction
@@ -57,7 +112,7 @@ def _is_secret_key(name: str) -> bool:
     return _SECRET_NAME_PATTERN.search(name) is not None
 
 
-def redact_text(text: str) -> str:
+def redact_text(text: str, *, serialized: bool = False) -> str:
     """Mask credentials embedded in any URL within a free-text string.
 
     Two classes of credential are scrubbed while the rest of the URL is kept for
@@ -68,10 +123,15 @@ def redact_text(text: str) -> str:
       ``https://h/x?token=***``; the value of any parameter whose name looks like
       a secret (``token``/``secret``/``key``/``password``/``sig``/...) is masked.
 
+    ``serialized=True`` is for text the caller *knows* is a serialised JSON or repr
+    structure: the userinfo match then stops at the string's own quote (#224). The
+    default treats the text as plain and masks through the last ``@``.
+
     Non-URL text is returned unchanged. Used for log message bodies and by the
     event logger before a message is persisted.
     """
-    text = _URL_USERINFO_PATTERN.sub(r"\g<scheme>***@", text)
+    pattern = _SERIALIZED_USERINFO_PATTERN if serialized else _URL_USERINFO_PATTERN
+    text = pattern.sub(r"\g<scheme>***@", text)
     return _QUERY_SECRET_PATTERN.sub(r"\g<sep>\g<key>=" + _REDACTED, text)
 
 
@@ -123,6 +183,164 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+# ---------------------------------------------------------------------------
+# In-memory ring buffer (#8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BufferedLogLine:
+    """One log record as the ring buffer keeps it.
+
+    Only the already-formatted, redacted text is kept -- never the
+    ``LogRecord`` itself, which can pin exception frames (and their locals) in
+    memory for as long as the record sits in the buffer.
+    """
+
+    created: float
+    request_id: str | None
+    text: str
+
+
+class RingBufferHandler(logging.Handler):
+    """Keep the last ``capacity`` log records in memory for problem reports.
+
+    A problem report includes the app's own log around the reported time. The
+    systemd sandbox may not let the service read the journal, so this handler
+    keeps a bounded copy in process. Each record is rendered as one plain-text
+    line with the message (and any traceback) run through :func:`redact_text`,
+    so the buffer never holds a URL credential even when the configured
+    console format is the non-redacting text format.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        super().__init__()
+        self._lines: deque[BufferedLogLine] = deque(maxlen=max(1, capacity))
+        self._lines_lock = threading.Lock()
+        self.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+
+    def resize(self, capacity: int) -> None:
+        """Change the capacity, keeping the newest records that still fit."""
+        with self._lines_lock:
+            self._lines = deque(self._lines, maxlen=max(1, capacity))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = self._render(record)
+            rid = getattr(record, "request_id", None)
+            line = BufferedLogLine(
+                created=record.created,
+                request_id=rid if isinstance(rid, str) else None,
+                text=text,
+            )
+            with self._lines_lock:
+                self._lines.append(line)
+        except Exception:  # noqa: BLE001 - a log handler must never raise
+            self.handleError(record)
+
+    def _render(self, record: logging.LogRecord) -> str:
+        """One redacted line: time, level, logger, request id, message."""
+        when = datetime.fromtimestamp(record.created, UTC).isoformat(
+            timespec="milliseconds"
+        )
+        rid = getattr(record, "request_id", None)
+        rid_part = f" [{rid}]" if isinstance(rid, str) else ""
+        text = (
+            f"{when} {record.levelname} {record.name}{rid_part} "
+            f"{redact_text(record.getMessage())}"
+        )
+        if record.exc_info:
+            formatter = self.formatter or logging.Formatter()
+            text += "\n" + redact_text(formatter.formatException(record.exc_info))
+        return text
+
+    def lines(self) -> list[BufferedLogLine]:
+        """A copy of the buffered lines, oldest first."""
+        with self._lines_lock:
+            return list(self._lines)
+
+
+# The process-wide ring buffer. ``configure_logging`` runs more than once per
+# process (the factory path and the lifespan both call it, and each test does),
+# and it removes every root handler each time, so the buffer is a singleton that
+# is re-attached (and resized) on every call rather than rebuilt and emptied.
+_ring_buffer: RingBufferHandler | None = None
+
+
+def get_ring_buffer() -> RingBufferHandler | None:
+    """Return the installed ring buffer, or ``None`` when it is disabled."""
+    return _ring_buffer
+
+
+def _install_ring_buffer(capacity: int, request_id_filter: logging.Filter) -> None:
+    """Attach the ring buffer to the root logger, creating it on first use."""
+    global _ring_buffer
+    if capacity <= 0:
+        _ring_buffer = None
+        return
+    if _ring_buffer is None:
+        _ring_buffer = RingBufferHandler(capacity)
+    else:
+        _ring_buffer.resize(capacity)
+        _ring_buffer.filters.clear()
+    _ring_buffer.addFilter(request_id_filter)
+    logging.getLogger().addHandler(_ring_buffer)
+
+
+# ---------------------------------------------------------------------------
+# Recent requests per user (#8)
+# ---------------------------------------------------------------------------
+
+# How many recent requests are remembered per user, and for how many users.
+_RECENT_REQUESTS_PER_USER = 20
+_RECENT_REQUESTS_MAX_USERS = 500
+
+
+@dataclass(frozen=True)
+class RecentRequest:
+    """One authenticated request: its correlation id, method, path and time."""
+
+    request_id: str
+    method: str
+    path: str
+    at: float
+
+
+class _RecentRequests:
+    """A bounded per-user memory of recent request ids.
+
+    A problem report names the reporter's last few requests so a maintainer can
+    find their lines in the log. Log records carry a ``request_id`` but not the
+    user, so the authentication dependency records the pairing here. Only the
+    method and path are kept -- never a query string, header or cookie.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_user: dict[int, deque[RecentRequest]] = {}
+
+    def record(self, user_id: int, request_id: str, method: str, path: str) -> None:
+        with self._lock:
+            entries = self._by_user.pop(user_id, None)
+            if entries is None:
+                entries = deque(maxlen=_RECENT_REQUESTS_PER_USER)
+            if not entries or entries[-1].request_id != request_id:
+                entries.append(RecentRequest(request_id, method, path, time.time()))
+            # Re-insert so dict order is least-recently-active first.
+            self._by_user[user_id] = entries
+            while len(self._by_user) > _RECENT_REQUESTS_MAX_USERS:
+                self._by_user.pop(next(iter(self._by_user)))
+
+    def for_user(self, user_id: int) -> list[RecentRequest]:
+        with self._lock:
+            return list(self._by_user.get(user_id, ()))
+
+
+recent_requests = _RecentRequests()
+
+
 def _build_formatter(log_format: str) -> logging.Formatter:
     """Return the formatter selected by the configured format."""
     if log_format == "json":
@@ -138,6 +356,10 @@ def _redact_db_url(url: str) -> str:
 
 
 _PACKAGE_LOGGER = "timelapse_manager"
+
+# Uvicorn's loggers. ``uvicorn.error`` carries the traceback of every unhandled
+# request exception, so it must never be left disabled.
+_SERVER_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
 def _reenable_package_loggers(level: int) -> None:
@@ -186,8 +408,14 @@ def configure_logging(settings: Settings, config_path: str | None = None) -> Non
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
+    # One filter instance, shared across handlers, stamps the in-flight request's
+    # correlation id onto every record so a JSON log line is traceable to its
+    # request. It only enriches records, so sharing one instance is safe.
+    request_id_filter = RequestIdFilter()
+
     console = logging.StreamHandler()
     console.setFormatter(formatter)
+    console.addFilter(request_id_filter)
     root.addHandler(console)
 
     # Re-enable the application loggers explicitly. When the process is launched
@@ -203,12 +431,22 @@ def configure_logging(settings: Settings, config_path: str | None = None) -> Non
     # the package level/propagation so ``timelapse_manager.*`` emits at the
     # configured level on every launch path.
     _reenable_package_loggers(level)
+    # The server's own loggers get the same treatment: the in-process migration
+    # (Alembic's ``fileConfig``) used to disable ``uvicorn.error`` the same way,
+    # which dropped every "Exception in ASGI application" traceback (#37).
+    for name in _SERVER_LOGGERS:
+        logging.getLogger(name).disabled = False
+
+    # The problem-report ring buffer (#8) sits alongside the console handler so
+    # it sees exactly what the operator's log sees.
+    _install_ring_buffer(settings.logging.ring_buffer_records, request_id_filter)
 
     if settings.logging.file_sink is not None:
         sink = settings.logging.file_sink
         sink.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(sink, encoding="utf-8")
         file_handler.setFormatter(formatter)
+        file_handler.addFilter(request_id_filter)
         root.addHandler(file_handler)
 
     # httpx/httpcore emit the full request URL at INFO on every call. A URL can

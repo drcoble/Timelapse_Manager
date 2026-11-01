@@ -16,6 +16,11 @@
  *   - backdrop: <div class="drawer-backdrop" data-drawer-backdrop></div>
  *   - close:   any element inside the drawer with [data-drawer-close]
  *
+ * While closed the drawer is `inert` and `visibility:hidden` (`.drawer--hidden`,
+ * added once the slide-out ends, at once under prefers-reduced-motion), so
+ * neither focus nor assistive tech can reach it, and its body is emptied so
+ * typed credentials do not linger in a hidden DOM.
+ *
  * While open, the nav and main regions are made `inert` + aria-hidden so the
  * modal semantics are honest, the page behind is scroll-locked, focus is
  * trapped inside the drawer, and Escape or a backdrop click closes it. Focus is
@@ -34,6 +39,8 @@
   var openDrawerEl = null;
   var pendingOpen = null; // {drawer, opener} awaiting an HTMX body load
   var scrollbarComp = false;
+  var finishTimer = null; // fallback if the slide-out never fires transitionend
+  var CLOSE_FALLBACK_MS = 400; // > the 200ms --transition-mid slide
 
   function backdropFor(drawer) {
     return (
@@ -102,6 +109,26 @@
     if (t) titleEl.textContent = t;
   }
 
+  function reducedMotion() {
+    return (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  }
+
+  // Second half of a close: hide the panel from the visibility tree and drop
+  // its content. A no-op if the drawer was reopened in the meantime, so a late
+  // transitionend or timer cannot blank an open drawer.
+  function finishClose(drawer) {
+    if (finishTimer !== null) {
+      clearTimeout(finishTimer);
+      finishTimer = null;
+    }
+    if (openDrawerEl === drawer || drawer.classList.contains("open")) return;
+    drawer.classList.add("drawer--hidden");
+    bodyOf(drawer).replaceChildren();
+  }
+
   function open(drawer, opener) {
     if (!drawer) return;
     if (openDrawerEl === drawer) {
@@ -115,6 +142,12 @@
     openDrawerEl = drawer;
     lastOpener = opener || lastOpener || null;
     var backdrop = backdropFor(drawer);
+    if (finishTimer !== null) {
+      clearTimeout(finishTimer);
+      finishTimer = null;
+    }
+    drawer.removeAttribute("inert");
+    drawer.classList.remove("drawer--hidden");
     drawer.classList.add("open");
     drawer.setAttribute("aria-hidden", "false");
     if (backdrop) backdrop.classList.add("open");
@@ -132,6 +165,7 @@
     var backdrop = backdropFor(drawer);
     drawer.classList.remove("open");
     drawer.setAttribute("aria-hidden", "true");
+    drawer.setAttribute("inert", "");
     if (backdrop) backdrop.classList.remove("open");
     setOutsideInert(false);
     lockScroll(false);
@@ -141,7 +175,27 @@
       lastOpener.focus();
     }
     lastOpener = null;
+    if (finishTimer !== null) clearTimeout(finishTimer);
+    if (reducedMotion()) {
+      finishClose(drawer);
+    } else {
+      finishTimer = setTimeout(function () {
+        finishClose(drawer);
+      }, CLOSE_FALLBACK_MS);
+    }
   }
+
+  document.addEventListener("transitionend", function (e) {
+    var el = e.target;
+    if (
+      el &&
+      el.classList &&
+      el.classList.contains("drawer") &&
+      e.propertyName === "transform"
+    ) {
+      finishClose(el);
+    }
+  });
 
   function onKeydown(e) {
     if (!openDrawerEl) return;
@@ -200,6 +254,23 @@
     ) {
       close();
     }
+  });
+
+  // A failed load into a drawer body must not leave the open pending: a later,
+  // unrelated swap into the drawer would otherwise pop it open. The error toast
+  // itself comes from htmx-errors.js.
+  function dropPendingOpen(e) {
+    if (!pendingOpen) return;
+    var d = e.detail || {};
+    var tgt = d.target || e.target;
+    var inDrawer =
+      tgt && typeof tgt.closest === "function" && tgt.closest(".drawer");
+    if (inDrawer === pendingOpen.drawer || d.elt === pendingOpen.opener) {
+      pendingOpen = null;
+    }
+  }
+  ["htmx:responseError", "htmx:sendError", "htmx:timeout"].forEach(function (n) {
+    document.body.addEventListener(n, dropPendingOpen);
   });
 
   // Complete a deferred open (or refresh an open drawer) once HTMX has swapped

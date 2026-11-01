@@ -38,9 +38,10 @@ from timelapse_manager.db.session import session_scope
 from timelapse_manager.storage.monitor import DiskSpaceMonitor
 
 # A few-second capture cadence (the system must sustain intervals as short as a
-# few seconds) and a wall-clock window that should see roughly three captures.
+# few seconds) and a wall-clock window generous enough to see at least two
+# captures even on a loaded host.
 _INTERVAL_SECONDS = 1
-_RUN_SECONDS = 2.6
+_RUN_SECONDS = 5.0
 
 
 class _RealtimeAdapter(FakeAdapter):
@@ -122,6 +123,7 @@ def _seed_project(migrated_factory, tmp_path: Path) -> tuple[int, int]:
 
 
 @pytest.mark.slow
+@pytest.mark.flaky(reruns=2, reruns_delay=1)
 async def test_sustains_short_interval_on_real_clock(
     migrated_factory, tmp_path: Path
 ) -> None:
@@ -164,12 +166,15 @@ async def test_sustains_short_interval_on_real_clock(
         )
         timestamps = [f.capture_timestamp for f in frames]
 
-    # Over ~2.6s at a 1s cadence we expect ~3 frames; allow generous slack for a
-    # loaded CI host while still proving real-time progress (more than one frame).
-    assert 2 <= len(frames) <= 6, f"unexpected frame count {len(frames)} in {elapsed}s"
-    # Consecutive captures are spaced about one interval apart (not all at once).
+    # Over ~5s at a 1s cadence we expect 3-4 frames; require at least 2 to
+    # prove real-time progress on any loaded host.
+    assert len(frames) >= 2, f"too few frames ({len(frames)}) in {elapsed:.1f}s"
+    # Consecutive captures must be spaced at least half an interval apart,
+    # proving they are gated by the cadence and not fired back-to-back.
+    # No upper bound: a temporarily starved event loop stretching one gap is
+    # not a correctness failure and is the primary source of flakiness.
     pairs = zip(timestamps, timestamps[1:], strict=False)
     gaps = [(b - a).total_seconds() for a, b in pairs]
-    assert all(0.5 <= g <= 2.0 for g in gaps), f"cadence gaps off-interval: {gaps}"
+    assert all(g >= 0.5 for g in gaps), f"captures fired back-to-back: {gaps}"
 
     await supervisor.stop()

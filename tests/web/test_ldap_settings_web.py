@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ from timelapse_manager.security.ldap_settings_service import (
     LdapSettingsUpdate,
     update_settings,
 )
+from timelapse_manager.security.session_revalidation import breaker_for
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -367,6 +369,8 @@ class TestLdapSettingsSave:
             {
                 "ldap_enabled": "on",
                 "ldap_server_urls": "ldap://dir.example.com",
+                "ldap_tls_mode": "none",
+                "ldap_bind_dn": "cn=svc,dc=example,dc=com",
                 "ldap_bind_password": "",  # empty keeps stored
                 "ldap_search_base": "ou=people,dc=example,dc=com",
                 "ldap_username_attribute": "uid",
@@ -630,3 +634,284 @@ class TestAuthSourceBadges:
         assert resp.status_code == 200
         assert "LOCAL" in resp.text
         assert "LDAP" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Retarget, unknown TLS mode, default (#67 S9)
+# ---------------------------------------------------------------------------
+
+
+def _unchanged_form(**overrides: str) -> dict[str, str]:
+    """The seeded configuration, resubmitted as the form would (password masked)."""
+    data = {
+        "ldap_enabled": "on",
+        "ldap_server_urls": "ldap://dir.example.com",
+        "ldap_tls_mode": "none",
+        "ldap_bind_dn": "cn=svc,dc=example,dc=com",
+        "ldap_bind_password": "***",
+        "ldap_search_base": "ou=people,dc=example,dc=com",
+        "ldap_username_attribute": "uid",
+        "ldap_membership_mode": "memberof",
+    }
+    data.update(overrides)
+    return data
+
+
+class TestRetargetAndTlsMode:
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"ldap_server_urls": "ldap://other.example.com"},
+            {"ldap_tls_mode": "ldaps"},
+            {"ldap_bind_dn": "cn=other,dc=example,dc=com"},
+        ],
+    )
+    def test_retarget_with_masked_password_clears_the_secret(
+        self, admin_client: TestClient, change: dict[str, str]
+    ) -> None:
+        _seed_ldap(admin_client)
+        assert _stored_bind_password() is not None
+        assert _post_ldap(admin_client, _unchanged_form(**change)).status_code == 303
+        assert _stored_bind_password() is None
+
+    def test_the_form_then_asks_for_the_password_again(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        _post_ldap(
+            admin_client, _unchanged_form(ldap_server_urls="ldap://other.example.com")
+        )
+        page = admin_client.get("/settings").text
+        assert "Re-enter the bind" in page
+        assert "stored-service-secret" not in page
+
+    def test_the_hint_is_absent_while_a_password_is_stored(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        assert "Re-enter the bind" not in admin_client.get("/settings").text
+
+    def test_retarget_with_a_new_password_keeps_the_new_one(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        _post_ldap(
+            admin_client,
+            _unchanged_form(
+                ldap_server_urls="ldap://other.example.com",
+                ldap_bind_password="new-target-secret",
+            ),
+        )
+        assert _stored_bind_password() is not None
+
+    def test_an_unchanged_target_keeps_the_secret(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        before = _stored_bind_password()
+        assert _post_ldap(admin_client, _unchanged_form()).status_code == 303
+        assert _stored_bind_password() == before
+
+    def test_an_unknown_tls_mode_is_refused_and_nothing_is_saved(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        before = _stored_bind_password()
+        resp = _post_ldap(
+            admin_client,
+            _unchanged_form(ldap_tls_mode="plaintext-please", ldap_bind_password="x1"),
+        )
+        assert resp.status_code == 200  # the page re-rendered with an inline error
+        assert "Unknown TLS mode" in resp.text
+        assert "plaintext-please" not in resp.text
+        assert _stored_bind_password() == before
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(LdapSettings, 1)
+            assert row is not None and row.tls_mode == "none"
+
+    def test_a_missing_tls_field_defaults_to_ldaps_not_plaintext(
+        self, admin_client: TestClient
+    ) -> None:
+        data = _unchanged_form()
+        del data["ldap_tls_mode"]
+        _post_ldap(admin_client, data)
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(LdapSettings, 1)
+            assert row is not None and row.tls_mode == "ldaps"
+
+    def test_a_fresh_install_preselects_ldaps(self, admin_client: TestClient) -> None:
+        page = admin_client.get("/settings").text
+        assert re.search(r'<option value="ldaps"\s+selected', page)
+
+    def test_test_connection_after_a_retarget_uses_no_stored_password(
+        self, admin_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_ldap(admin_client)
+        _post_ldap(
+            admin_client, _unchanged_form(ldap_server_urls="ldap://other.example.com")
+        )
+        seen: dict[str, Any] = {}
+
+        def fake(**kw: Any) -> LdapDirectoryState:
+            seen.update(kw)
+            return _fake_dir_state(LdapOutcome.CONFIG_ERROR)
+
+        monkeypatch.setattr(routers, "ldap_resolve_directory_state", fake)
+        csrf = csrf_of(admin_client, "/settings")
+        admin_client.post(
+            "/settings/ldap/test-connection",
+            data={"csrf_token": csrf},
+            headers={"HX-Request": "true"},
+        )
+        assert seen["bind_password"] is None
+        assert seen["settings"].server_urls == ["ldap://other.example.com"]
+
+
+# ---------------------------------------------------------------------------
+# The directory breaker is reset by an admin's save / successful test (#203)
+# ---------------------------------------------------------------------------
+
+
+def _open_breaker() -> None:
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        breaker_for(db).record_unreachable(3600)
+        assert breaker_for(db).is_open() is True
+
+
+def _breaker_open() -> bool:
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        return breaker_for(db).is_open()
+
+
+class TestBreakerReset:
+    def test_saving_the_settings_closes_an_open_breaker(
+        self, admin_client: TestClient
+    ) -> None:
+        _seed_ldap(admin_client)
+        _open_breaker()
+        assert _post_ldap(admin_client, _unchanged_form()).status_code == 303
+        assert _breaker_open() is False
+
+    def test_a_refused_save_leaves_it_open(self, admin_client: TestClient) -> None:
+        _seed_ldap(admin_client)
+        _open_breaker()
+        # Enabled but incomplete: refused with an inline error.
+        resp = _post_ldap(
+            admin_client,
+            {"ldap_enabled": "on", "ldap_server_urls": "", "ldap_tls_mode": "ldaps"},
+        )
+        assert resp.status_code == 200
+        assert _breaker_open() is True
+        resp = _post_ldap(admin_client, _unchanged_form(ldap_tls_mode="nope"))
+        assert resp.status_code == 200
+        assert _breaker_open() is True
+
+    @pytest.mark.parametrize(
+        "outcome", [LdapOutcome.AUTHENTICATED, LdapOutcome.NO_SUCH_USER]
+    )
+    def test_a_successful_test_connection_closes_it(
+        self,
+        admin_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: LdapOutcome,
+    ) -> None:
+        _open_breaker()
+        resp = TestLdapTestConnection()._post_test(admin_client, monkeypatch, outcome)
+        assert resp.status_code == 200
+        assert _breaker_open() is False
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            LdapOutcome.SERVER_UNREACHABLE,
+            LdapOutcome.CONFIG_ERROR,
+            LdapOutcome.INVALID_CREDENTIALS,
+            LdapOutcome.DISABLED,
+        ],
+    )
+    def test_a_failed_test_connection_leaves_it_open(
+        self,
+        admin_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: LdapOutcome,
+    ) -> None:
+        _open_breaker()
+        resp = TestLdapTestConnection()._post_test(admin_client, monkeypatch, outcome)
+        assert resp.status_code == 200
+        assert _breaker_open() is True
+
+    def test_the_test_connection_runs_while_the_breaker_is_open(
+        self, admin_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The admin's test is not itself refused by an open breaker."""
+        _open_breaker()
+        resp = TestLdapTestConnection()._post_test(
+            admin_client, monkeypatch, LdapOutcome.AUTHENTICATED
+        )
+        assert "Connected and bind succeeded" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Admin-only banner while LDAP runs without TLS (#67 S9)
+# ---------------------------------------------------------------------------
+
+
+def _set_tls_mode(client: TestClient, mode: str, *, enabled: bool = True) -> None:
+    _seed_ldap(client, enabled=enabled)
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        row = db.get(LdapSettings, 1)
+        assert row is not None
+        row.tls_mode = mode
+
+
+class TestPlaintextBanner:
+    MARKER = "ldap-plaintext-banner"
+
+    def test_admin_sees_it_with_tls_none(self, admin_client: TestClient) -> None:
+        _set_tls_mode(admin_client, "none")
+        resp = admin_client.get("/partials/status")
+        assert resp.status_code == 200
+        assert self.MARKER in resp.text
+        assert "stored-service-secret" not in resp.text
+
+    @pytest.mark.parametrize("mode", ["ldaps", "starttls"])
+    def test_it_is_hidden_when_encrypted(
+        self, admin_client: TestClient, mode: str
+    ) -> None:
+        _set_tls_mode(admin_client, mode)
+        assert self.MARKER not in admin_client.get("/partials/status").text
+
+    def test_it_is_hidden_while_ldap_is_disabled(
+        self, admin_client: TestClient
+    ) -> None:
+        _set_tls_mode(admin_client, "none", enabled=False)
+        assert self.MARKER not in admin_client.get("/partials/status").text
+
+    def test_it_is_hidden_when_ldap_was_never_configured(
+        self, admin_client: TestClient
+    ) -> None:
+        assert self.MARKER not in admin_client.get("/partials/status").text
+
+    def test_an_operator_does_not_see_it(self, operator_client: TestClient) -> None:
+        _set_tls_mode(operator_client, "none")
+        resp = operator_client.get("/partials/status")
+        assert resp.status_code == 200
+        assert self.MARKER not in resp.text
+
+    def test_a_viewer_does_not_see_it(self, viewer_client: TestClient) -> None:
+        _set_tls_mode(viewer_client, "none")
+        resp = viewer_client.get("/partials/status")
+        assert resp.status_code == 200
+        assert self.MARKER not in resp.text
+
+    def test_it_sits_in_the_status_banner_not_base(
+        self, admin_client: TestClient
+    ) -> None:
+        """base.html only hosts the lazy placeholder; the content is the partial."""
+        _set_tls_mode(admin_client, "none")
+        assert self.MARKER not in admin_client.get("/").text

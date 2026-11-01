@@ -68,11 +68,13 @@
     <input type="hidden" name="project_id" value="{{ project.id }}">
     {% if show_deleted %}<input type="hidden" name="show_deleted" value="1">{% endif %}
     <div>
-      <label class="form-label" for="frame-jump-at">Jump to date &amp; time</label>
+      <label class="form-label" for="frame-jump-at">Jump to date &amp; time ({{ viewer_timezone | tz_label }})</label>
       <input type="datetime-local" id="frame-jump-at" name="at" class="form-control"
+             aria-describedby="frame-jump-hint"
              style="max-width:240px;">
     </div>
     <button type="submit" class="btn btn-secondary btn-sm">Go</button>
+    <span class="form-hint" id="frame-jump-hint" style="flex-basis:100%;margin:0;">Times are in {{ viewer_timezone or 'UTC' }}. A repeated hour at a daylight-saving change means its first occurrence.</span>
   </form>
 
   {# Interactive ribbon (single-project only) — the scrubber. role="slider" with

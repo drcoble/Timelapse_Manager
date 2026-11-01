@@ -79,8 +79,21 @@ def _bypass_snapshot_guard():
     the SSRF guard. These tests verify adapter behaviour (auth, frame parsing,
     FrameWriter integration), not the guard itself. The guard's denial of
     loopback targets is tested separately in the abuse test suite.
+
+    The body-size and dimension caps are read from the runtime context, which
+    these tests do not construct, so they are stubbed to large defaults here.
     """
-    with patch("timelapse_manager.cameras.http_jpeg._guard_snapshot_url"):
+    with (
+        patch("timelapse_manager.cameras.http_jpeg._guard_snapshot_url"),
+        patch(
+            "timelapse_manager.cameras.http_jpeg._resolve_max_image_bytes",
+            return_value=64 * 1024 * 1024,
+        ),
+        patch(
+            "timelapse_manager.cameras.http_jpeg._resolve_max_image_dimension_px",
+            return_value=16000,
+        ),
+    ):
         yield
 
 

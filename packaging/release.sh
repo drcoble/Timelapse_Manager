@@ -82,13 +82,14 @@ _pin_field() {
 }
 
 # Return the ordered list of candidate download URLs for the pinned FFmpeg.
-# mirror_urls (if present) come first; url is always the final fallback.
-# Each URL is printed on its own line.
+# TLM_FFMPEG_MIRROR_URL (an optional private mirror, injected by the build
+# environment) comes first, then mirror_urls from the pin, and url is always the
+# final fallback. Each URL is printed on its own line.
 _pin_download_urls() {
     local snippet='
-import json, sys
+import json, os, sys
 pin = json.load(open(sys.argv[1]))
-urls = pin.get("mirror_urls", [])
+urls = [os.environ.get("TLM_FFMPEG_MIRROR_URL", "")] + list(pin.get("mirror_urls", []))
 primary = pin["url"]
 seen = list(dict.fromkeys(u for u in urls if u))
 if primary not in seen:
@@ -125,8 +126,8 @@ _stage_pinned_ffmpeg() {
     stage="$(mktemp -d)"
     tarball="${stage}/ffmpeg.tar.xz"
 
-    # Try each candidate URL in order (owner mirror first, upstream fallback
-    # last). The sha256 from ffmpeg-pin.json is the trust anchor regardless of
+    # Try each candidate URL in order (private mirror first when
+    # TLM_FFMPEG_MIRROR_URL is set, upstream fallback last). The sha256 from ffmpeg-pin.json is the trust anchor regardless of
     # source: a mismatch means the tarball is corrupt or tampered, not that we
     # should accept it. We only fail hard when every URL is exhausted.
     local fetched=0
@@ -143,13 +144,13 @@ _stage_pinned_ffmpeg() {
 
         # The Gitea generic package registry requires authentication (returns
         # HTTP 401 without a token).  When fetching from the Gitea host
-        # (git.2cbn.com) add an Authorization header if GITEA_TOKEN is set.
-        # Non-Gitea URLs (the upstream GitHub fallback) are fetched without
-        # credentials.  The sha256 in ffmpeg-pin.json is the trust anchor
-        # regardless of which source URL delivered the bytes.
+        # (the URL in TLM_FFMPEG_MIRROR_URL) add an Authorization header if
+        # GITEA_TOKEN is set. Every other URL (the public upstream) is fetched
+        # without credentials, so the token never leaves the mirror host. The
+        # sha256 in ffmpeg-pin.json is the trust anchor regardless of which source URL delivered the bytes.
         local _fetch_ok=0
         case "${candidate_url}" in
-            *git.2cbn.com*)
+            "${TLM_FFMPEG_MIRROR_URL:-}")
                 if [ -n "${GITEA_TOKEN:-}" ]; then
                     curl --fail --location --silent --show-error \
                         -H "Authorization: token ${GITEA_TOKEN}" \
@@ -198,6 +199,11 @@ _stage_pinned_ffmpeg() {
 
 cd "${REPO_ROOT}"
 
+# Build only from the committed lockfile (#67 S25). Every `uv run` below fails
+# if uv.lock is missing or out of date with pyproject.toml, instead of quietly
+# re-resolving and freezing whatever the index serves today.
+export UV_LOCKED=1
+
 # --- Resolve identifiers ----------------------------------------------------
 # Version comes from the package itself (single source of truth), not a literal.
 VERSION="$(uv run python -c 'import timelapse_manager as t; print(t.__version__)')" \
@@ -231,7 +237,10 @@ fi
 # "unknown" rather than aborting the release (set -e is on, so the `|| echo`
 # guard is load-bearing).
 info "generating build metadata module"
-BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# TLM_BUILD_SHA lets a build without a git checkout (the release container
+# builds from an exported source tree) record the commit it was frozen from.
+BUILD_SHA="${TLM_BUILD_SHA:-}"
+[ -n "${BUILD_SHA}" ] || BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILD_DATE="$(date -u +%Y-%m-%d)"
 cat > "${REPO_ROOT}/src/timelapse_manager/_build_info.py" <<EOF
 """Generated at build time by packaging/release.sh. Do not edit or commit."""
@@ -249,7 +258,7 @@ _stage_pinned_ffmpeg
 # --- Freeze -----------------------------------------------------------------
 info "freezing ${BUNDLE_NAME} with PyInstaller"
 rm -rf "${BUILD_DIR}/timelapse-manager" "${DIST_DIR}/timelapse-manager" "${BUNDLE_DIR}"
-uv run pyinstaller --noconfirm --distpath "${DIST_DIR}" --workpath "${BUILD_DIR}" "${SPEC}"
+uv run --locked pyinstaller --noconfirm --distpath "${DIST_DIR}" --workpath "${BUILD_DIR}" "${SPEC}"
 
 # PyInstaller emits dist/timelapse-manager (the EXE name from the spec). Move it
 # to the versioned, os/arch-qualified directory that we tar and release.
@@ -324,20 +333,28 @@ mkdir -p "${SMOKE_DIR}/state"
 setsid "${EXE}" run &
 APP_PID=$!
 
+# Budget for a cold start on a busy runner: the bundle unpacks and runs every
+# migration from an empty database before it serves. That took 4 s on one run
+# and 26 s on the next (v0.2.0.dev7), so 30 s was too tight.
+SMOKE_BUDGET_SECONDS="${SMOKE_BUDGET_SECONDS:-120}"
 ok=0
-for _ in $(seq 1 30); do
+died=0
+for _ in $(seq 1 "${SMOKE_BUDGET_SECONDS}"); do
     if curl --fail --silent --insecure "https://127.0.0.1:${HTTPS_PORT}/healthz" >/dev/null 2>&1 \
         || curl --fail --silent "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1; then
         ok=1
         break
     fi
     # Stop early if the bundle died, rather than waiting out the full budget.
-    kill -0 "${APP_PID}" 2>/dev/null || break
+    kill -0 "${APP_PID}" 2>/dev/null || { died=1; break; }
     sleep 1
 done
 
 if [ "${ok}" -eq 1 ]; then
     info "smoke test PASSED: /healthz answered from the frozen bundle"
 else
-    err "smoke test FAILED: /healthz did not answer within 30s"
+    if [ "${died}" -eq 1 ]; then
+        err "smoke test FAILED: the bundle exited before /healthz answered"
+    fi
+    err "smoke test FAILED: /healthz did not answer within ${SMOKE_BUDGET_SECONDS}s"
 fi

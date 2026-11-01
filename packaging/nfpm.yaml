@@ -5,50 +5,85 @@
 # tokenised packaging/systemd unit) into native Linux installers. nfpm is a
 # single static binary, so this works on any Linux build host without rpmbuild.
 #
-# Build with: packaging/build-linux-packages.sh
-# (VERSION and ARCH are read from the environment; see that script.)
+# Build with: packaging/build-linux-packages.sh <pep440-version> [arch]
+# The script renders the ${...} tokens below (see it for the list) and stages the
+# bundle without its packaging/ tree. The version is mapped by pkgversion.py so
+# a pre-release sorts below its final in dpkg and rpm (#303).
 
 name: timelapse-manager
 arch: ${ARCH}
 platform: linux
-version: ${VERSION}
+# version_schema none: nfpm does not parse the version, it joins the fields as
+# version~prerelease+metadata, which pkgversion.py computed from the PEP 440 tag.
+version_schema: none
+version: ${PKG_VERSION}
+prerelease: ${PKG_PRERELEASE}
+version_metadata: ${PKG_METADATA}
+release: "1"
 section: utils
 priority: optional
-# TODO(owner): replace the maintainer placeholder with the public maintainer
-# identity before publishing packages. The email address will appear in the
-# .deb/.rpm package metadata and should be the address the project uses for
-# security/bug reports, not a private address.
-maintainer: Timelapse Manager maintainers <maintainer@REPLACE_ME>
+maintainer: Drew Coble <drcoble@users.noreply.github.com>
 description: |
   Connect to network IP cameras, capture stills at configurable intervals over
   long durations, and assemble them into timelapse videos. Ships a self-contained
   bundle (Python runtime + dependencies + pinned FFmpeg) and runs as a systemd
   service.
-vendor: Timelapse Manager
+vendor: Drew Coble
 homepage: https://github.com/drcoble/Timelapse_Manager
 license: Apache-2.0
 
-# The frozen bundle installs under /opt; the unit + managed dirs are laid down
-# here and finished by the maintainer scripts (service user, migrations, enable).
+# The health wait after an install or upgrade uses curl; without it the scripts
+# fall back to the systemd state alone.
+recommends:
+  - curl
+
+# The frozen bundle installs under /opt (without its packaging/ tree, which only
+# the tarball's install.sh needs); the unit + managed dirs are laid down here and
+# finished by the maintainer scripts (service user, migrations, enable).
 contents:
-  - src: ./dist/timelapse-manager-${VERSION}-linux-${ARCH}/
+  - src: ${BUNDLE_STAGE}/
     dst: /opt/timelapse-manager
+  # Put the CLI on PATH: the docs tell package users to run `sudo
+  # timelapse-manager setup-code`.
+  - src: /opt/timelapse-manager/timelapse-manager
+    dst: /usr/bin/timelapse-manager
+    type: symlink
+  # /usr/lib/systemd/system is the canonical path on both Debian and EL; the
+  # old /lib/... works only on merged-/usr systems.
   - src: ./packaging/build/timelapse-manager.service
-    dst: /lib/systemd/system/timelapse-manager.service
+    dst: /usr/lib/systemd/system/timelapse-manager.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  # Default config: a conffile, so an operator's edits survive upgrades. Readable
+  # by the service group (the service and `sudo -u timelapse` need it); the CLI's
+  # /etc lookup (#103) finds it, giving admin commands the service's data dir.
+  - src: ./packaging/config.yml
+    dst: /etc/timelapse-manager/config.yml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: timelapse
   - dst: /var/lib/timelapse-manager
     type: dir
     file_info:
       mode: 0750
       owner: timelapse
       group: timelapse
+  # Configuration is root-owned and group-readable: the service reads it and never
+  # writes there (state lives under /var/lib/timelapse-manager).
   - dst: /etc/timelapse-manager
     type: dir
     file_info:
       mode: 0750
-      owner: timelapse
+      owner: root
       group: timelapse
 
 scripts:
+  # preinstall creates the service user before the owned directories land.
+  preinstall: ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh
   preremove: ./packaging/scripts/preremove.sh
   postremove: ./packaging/scripts/postremove.sh
@@ -56,7 +91,17 @@ scripts:
 overrides:
   deb:
     depends:
-      - adduser
+      - passwd
+      - systemd
   rpm:
     depends:
       - shadow-utils
+      - util-linux
+      - systemd
+
+# RPM signing is optional: build-linux-packages.sh fills key_file from
+# TLM_RPM_SIGNING_KEY_FILE, and an empty value leaves the package unsigned. The
+# key's passphrase, if any, is read by nfpm from NFPM_RPM_PASSPHRASE.
+rpm:
+  signature:
+    key_file: ${RPM_KEY_FILE}

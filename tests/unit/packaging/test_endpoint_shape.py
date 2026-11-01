@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import LOOPBACK_PEER
 from timelapse_manager.app import create_app
 from timelapse_manager.config.settings import (
     CaptureSettings,
@@ -60,7 +61,7 @@ def knob_client(
     settings_with_knob: Settings,
 ) -> pytest.Generator[TestClient, None, None]:
     """TestClient whose lifespan uses the knob-settings fixture."""
-    with TestClient(create_app(settings_with_knob)) as c:
+    with TestClient(create_app(settings_with_knob), client=LOOPBACK_PEER) as c:
         yield c
 
 
@@ -148,7 +149,7 @@ class TestSystemFfmpegPath:
         from timelapse_manager.security.token import ensure_local_token
 
         token = ensure_local_token(settings_with_knob)
-        with TestClient(create_app(settings_with_knob)) as c:
+        with TestClient(create_app(settings_with_knob), client=LOOPBACK_PEER) as c:
             body = c.get(
                 "/api/v1/system",
                 headers={"Authorization": f"Bearer {token}"},
@@ -163,10 +164,25 @@ class TestSystemFfmpegPath:
         from timelapse_manager.security.token import ensure_local_token
 
         token = ensure_local_token(settings_with_knob)
-        with TestClient(create_app(settings_with_knob)) as c:
+        with TestClient(create_app(settings_with_knob), client=LOOPBACK_PEER) as c:
             healthz_path = c.get("/healthz").json()["ffmpeg_path"]
             system_path = c.get(
                 "/api/v1/system",
                 headers={"Authorization": f"Bearer {token}"},
             ).json()["ffmpeg_path"]
         assert healthz_path == system_path
+
+
+class TestHealthzPathNotDisclosedRemotely:
+    """The ffmpeg path is for this host only (#67 S19)."""
+
+    def test_remote_peer_gets_no_ffmpeg_path(
+        self, settings_with_knob: Settings
+    ) -> None:
+        with TestClient(
+            create_app(settings_with_knob), client=("198.51.100.7", 40000)
+        ) as c:
+            response = c.get("/healthz")
+        assert response.status_code == 200
+        assert "ffmpeg_path" not in response.json()
+        assert "/opt/static/ffmpeg" not in response.text

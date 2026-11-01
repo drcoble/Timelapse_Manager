@@ -17,11 +17,19 @@ import pytest
 import yaml
 
 import timelapse_manager
+import timelapse_manager.cli as cli_module
 from timelapse_manager.cli import main
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_discovered_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep a developer's real /etc or ~/.config file out of these tests (#103)."""
+    monkeypatch.setattr(cli_module, "_SYSTEM_CONFIG_PATH", tmp_path / "no-system.yml")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-user-config"))
 
 
 def _run_cli(*args: str) -> tuple[int, str, str]:
@@ -163,9 +171,7 @@ class TestCliCoreOperations:
             captured["headers"] = kwargs.get("headers")
             return httpx.Response(status_code, json=body)
 
-        monkeypatch.setattr(
-            "timelapse_manager.cli.ensure_local_token", lambda _s: "tok"
-        )
+        monkeypatch.setattr("timelapse_manager.cli._read_cli_token", lambda _s: "tok")
         monkeypatch.setattr("timelapse_manager.cli.httpx.request", fake_request)
         return captured
 
@@ -546,3 +552,87 @@ class TestCliUserCreate:
         # argparse exits 2 on invalid choice.
         assert code == 2
         assert "superuser" in stderr or "invalid choice" in stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# setup-code subcommand (#67 S11)
+# ---------------------------------------------------------------------------
+
+
+class TestSetupCode:
+    """``setup-code`` prints the first-run code, creating it when needed."""
+
+    def _prepare(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Migrate a fresh database; return the data directory the CLI uses."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        monkeypatch.chdir(Path(__file__).parent.parent.parent)
+        monkeypatch.setenv("TLM_DATABASE__URL", f"sqlite:///{tmp_path / 'sc.db'}")
+        monkeypatch.setenv("TLM_PATHS__DATA_DIR", str(data_dir))
+        monkeypatch.setenv("TLM_AUTH__ARGON2_MEMORY_KIB", "256")
+        monkeypatch.setenv("TLM_AUTH__ARGON2_TIME_COST", "1")
+        monkeypatch.setenv("TLM_AUTH__ARGON2_PARALLELISM", "1")
+        code, _, stderr = _run_cli("migrate")
+        assert code == 0, stderr
+        return data_dir
+
+    def test_creates_and_prints_the_code_before_any_page_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from timelapse_manager.security.login import read_setup_code
+
+        data_dir = self._prepare(tmp_path, monkeypatch)
+        code, stdout, stderr = _run_cli("setup-code")
+        assert code == 0, stderr
+        printed = stdout.strip()
+        assert len(printed) == 12
+        assert read_setup_code(data_dir) == printed
+        assert (data_dir / "setup-code").stat().st_mode & 0o777 == 0o600
+        # A second run prints the same code; it does not mint a new one.
+        code, again, _ = _run_cli("setup-code")
+        assert code == 0
+        assert again.strip() == printed
+
+    def test_fails_and_removes_a_stale_file_once_setup_is_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = self._prepare(tmp_path, monkeypatch)
+        _run_cli("setup-code")
+        assert (data_dir / "setup-code").exists()
+        code, _, stderr = _run_cli(
+            "user",
+            "create",
+            "--username",
+            "boss",
+            "--role",
+            "admin",
+            "--password",
+            "BossPassword123!",  # noqa: S106 - test credential
+        )
+        assert code == 0, stderr
+        code, stdout, stderr = _run_cli("setup-code")
+        assert code == 1
+        assert stdout == ""
+        assert "already complete" in stderr
+        assert not (data_dir / "setup-code").exists()
+
+    def test_unmigrated_database_is_a_clean_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        monkeypatch.setenv("TLM_DATABASE__URL", f"sqlite:///{tmp_path / 'none.db'}")
+        monkeypatch.setenv("TLM_PATHS__DATA_DIR", str(data_dir))
+        code, stdout, stderr = _run_cli("setup-code")
+        assert code == 1
+        assert stdout == ""
+        assert "migrate" in stderr
+        assert not (data_dir / "setup-code").exists()
+
+    def test_missing_data_dir_is_a_clean_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TLM_PATHS__DATA_DIR", str(tmp_path / "absent"))
+        code, _, stderr = _run_cli("setup-code")
+        assert code == 1
+        assert "does not exist" in stderr

@@ -19,17 +19,41 @@
       <span class="theme-icon" aria-hidden="true">&#9680;</span>
     </button>
     {#
-      Active-alerts indicator + panel. The container owns the polling
-      trigger and swaps the fragment into its innerHTML, so the badge count
-      and the accessible label stay current and the trigger survives each
-      swap. Open/closed is CSS-driven (:focus-within / :hover) on the
-      static container, so a poll never snaps an open panel shut.
+      Active-alerts indicator + panel (#70 F-R6). The toggle and the panel are
+      static: no poll ever replaces them, so focus and the open state survive
+      every refresh. alerts.js opens and closes the panel (click, Enter or
+      Space on the toggle; Escape or a click outside closes it), keeps
+      aria-expanded in step, and pauses the poll while the panel is open.
+
+      The poller is the separate #alerts-area element. data-poll marks it a
+      background poll (poll.js): passive for the idle timeout, paused while the
+      tab is hidden or while it carries data-poll-paused, and refreshed by
+      tlm:visible when the tab comes back. tlm:refresh is alerts.js's one
+      refresh when the panel closes. It swaps nothing itself: /alerts/summary
+      (and the clear actions) answer with out-of-band replacements for
+      #alerts-badge, #alerts-count-label and #alerts-panel-body only.
     #}
-    <div id="alerts-area"
-         class="alerts-area"
-         hx-get="/alerts/summary"
-         hx-trigger="load, every 30s"
-         hx-swap="innerHTML"></div>
+    <div class="alerts-menu">
+      <button type="button"
+              id="alerts-toggle"
+              class="alerts-toggle"
+              aria-expanded="false"
+              aria-controls="alerts-panel">
+        <span class="alerts-icon" aria-hidden="true"><svg class="icon"><use href="#icon-alert"></use></svg></span>
+        <span id="alerts-count-label" class="visually-hidden">Active alerts</span>
+        <span id="alerts-badge" aria-hidden="true"></span>
+      </button>
+      <div id="alerts-panel" class="alerts-panel" role="region" aria-label="Active alerts" tabindex="-1" hidden>
+        <div id="alerts-panel-body">
+          <p class="alerts-empty">Loading alerts&hellip;</p>
+        </div>
+      </div>
+      <div id="alerts-area"
+           data-poll
+           hx-get="/alerts/summary"
+           hx-trigger="load, every 30s, tlm:visible from:document, tlm:refresh"
+           hx-swap="none"></div>
+    </div>
     {# Operator is the default working role — its badge is suppressed so the
        badge only signals a departure from normal (admin or read-only viewer). #}
     {% if current_user.role != 'operator' %}

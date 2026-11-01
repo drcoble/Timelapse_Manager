@@ -1,0 +1,14 @@
+# Deliberate test values (redaction fixtures, the RFC 6455 sample key, idempotency
+# UUIDs and a fake token). Fingerprints are relative to the repository root.
+tests/api/test_debug_endpoints.py:generic-api-key:63
+tests/cameras/test_bounded_parsing.py:generic-api-key:552
+tests/cameras/test_vapix_events.py:generic-api-key:209
+tests/reports_support.py:generic-api-key:39
+tests/reports_support.py:generic-api-key:42
+tests/reports_support.py:generic-api-key:43
+tests/unit/test_autoquery.py:generic-api-key:380
+tests/unit/test_logging.py:generic-api-key:236
+tests/unit/test_report_anonymize.py:generic-api-key:36
+tests/web/test_frames_idempotency.py:generic-api-key:159
+tests/web/test_frames_idempotency.py:generic-api-key:209
+tests/web/test_frames_idempotency.py:generic-api-key:98

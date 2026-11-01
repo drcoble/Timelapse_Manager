@@ -9,7 +9,11 @@ sides of the anchor.
 
 from __future__ import annotations
 
+import re
+
 import pytest
+
+from tests.e2e._tz_support import set_viewer_zone
 
 pytestmark = pytest.mark.ui
 
@@ -21,12 +25,38 @@ class TestFramesNav:
         """Submitting the date-jump form swaps the grid to a windowed view."""
         page, base = logged_in_data_page  # type: ignore[misc]
         page.goto(f"{base}/frames?project_id=1")  # type: ignore[union-attr]
+        # The jump value is read in the viewer's zone; pin UTC so minute 20 of
+        # the seeded series (2026-01-01T00:00Z + i min) is the same instant on
+        # every host.
+        set_viewer_zone(page, "UTC")
         page.wait_for_selector(".frame-grid .frame-tile", timeout=30000)  # type: ignore[union-attr]
+        newest_id = int(
+            page.locator(".frame-grid .frame-tile")  # type: ignore[union-attr]
+            .first.get_attribute("id")
+            .split("-")[-1]
+        )
+        # Wait for htmx to bind the jump form first: a submit that lands before
+        # it is a plain full-page GET, not the hx-get swap (#286, as #265).
+        page.wait_for_function(  # type: ignore[union-attr]
+            "() => !!document.querySelector('.frame-jump')?.['htmx-internal-data']",
+            timeout=30000,
+        )
         # Jump to ~minute 20 -> a window centered there (older AND newer frames).
         page.fill("#frame-jump-at", "2026-01-01T00:20")  # type: ignore[union-attr]
-        page.click(".frame-jump button[type='submit']")  # type: ignore[union-attr]
-        # The grid is swapped in place; wait for the windowed batch to settle.
-        page.wait_for_timeout(800)  # type: ignore[union-attr]
+        with page.expect_response(  # type: ignore[union-attr]
+            lambda r: "/frames" in r.url and "at=" in r.url
+        ):
+            page.click(".frame-jump button[type='submit']")  # type: ignore[union-attr]
+        # The grid is swapped in place: wait for the swap itself, not a delay.
+        # The first tile of the unjumped grid is the newest frame; the window
+        # around minute 20 stops short of it. An un-swapped (or fully
+        # reloaded) page would still start at the newest frame.
+        page.wait_for_function(  # type: ignore[union-attr]
+            "(n) => { const t = document.querySelector('#frame-grid .frame-tile');"
+            " return !!t && parseInt(t.id.split('-').pop(), 10) < n; }",
+            arg=newest_id,
+            timeout=30000,
+        )
         # The window straddles the anchor: it reaches the series start (end-cap)
         # because minute 20 is within 30 frames of the first frame.
         assert page.locator(".frame-grid .frame-tile").count() > 0  # type: ignore[union-attr]
@@ -96,3 +126,100 @@ class TestFramesNav:
         )
         assert page.locator("#frame-new-pill:not([hidden])").count() == 1  # type: ignore[union-attr]
         assert "new frames" in pill.inner_text()  # type: ignore[union-attr]
+
+
+class TestNewFramesPillBaseline:
+    """#199: the pill's ``after`` cursor is the newest frame in the grid."""
+
+    def test_after_stays_the_newest_frame_once_older_batches_load(
+        self, logged_in_data_page: tuple[object, str]
+    ) -> None:
+        page, base = logged_in_data_page  # type: ignore[misc]
+        seen: list[str] = []
+
+        def answer(route: object) -> None:
+            seen.append(route.request.url)  # type: ignore[attr-defined]
+            route.fulfill(  # type: ignore[attr-defined]
+                status=200, content_type="application/json", body='{"count": 0}'
+            )
+
+        page.route("**/frames/since**", answer)  # type: ignore[union-attr]
+        page.goto(f"{base}/frames?project_id=1")  # type: ignore[union-attr]
+        page.wait_for_selector("#frame-new-pill", state="attached", timeout=30000)  # type: ignore[union-attr]
+        page.wait_for_selector(".frame-grid .frame-tile", timeout=30000)  # type: ignore[union-attr]
+        first_tile = page.locator(".frame-grid .frame-tile").first  # type: ignore[union-attr]
+        newest_id = int(first_tile.get_attribute("id").split("-")[-1])
+
+        # 65 frames, 60 per batch: scrolling the sentinel in loads the older 5,
+        # whose end-cap then describes only that batch's newest frame.
+        page.locator(".frame-sentinel").scroll_into_view_if_needed()  # type: ignore[union-attr]
+        page.wait_for_function(  # type: ignore[union-attr]
+            "() => document.querySelectorAll('.frame-grid .frame-tile').length === 65",
+            timeout=30000,
+        )
+        assert page.locator(".frame-sentinel").count() == 0  # type: ignore[union-attr]
+
+        # Back-to-visible runs the frames poller once at once.
+        page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")  # type: ignore[union-attr]
+        deadline = 30
+        while not any("/frames/since" in u for u in seen) and deadline:
+            page.wait_for_timeout(250)  # type: ignore[union-attr]
+            deadline -= 1
+        assert seen, "the poller never asked /frames/since"
+        match = re.search(r"after=(\d+)", seen[-1])
+        assert match is not None
+        assert int(match.group(1)) == newest_id
+
+
+class TestNewFramesPillAfterJump:
+    """#262: a jump to an older window does not lower the pill's baseline."""
+
+    def test_after_stays_the_newest_frame_seen_since_load(
+        self, logged_in_data_page: tuple[object, str]
+    ) -> None:
+        page, base = logged_in_data_page  # type: ignore[misc]
+        seen: list[str] = []
+
+        def answer(route: object) -> None:
+            seen.append(route.request.url)  # type: ignore[attr-defined]
+            route.fulfill(  # type: ignore[attr-defined]
+                status=200, content_type="application/json", body='{"count": 0}'
+            )
+
+        page.route("**/frames/since**", answer)  # type: ignore[union-attr]
+        page.goto(f"{base}/frames?project_id=1")  # type: ignore[union-attr]
+        # The jump value is read in the viewer's zone; pin UTC so minute 5 of the
+        # seeded series (2026-01-01T00:00Z + i min) is the same instant everywhere.
+        set_viewer_zone(page, "UTC")
+        page.wait_for_selector("#frame-new-pill", state="attached", timeout=30000)  # type: ignore[union-attr]
+        page.wait_for_selector(".frame-grid .frame-tile", timeout=30000)  # type: ignore[union-attr]
+        first_tile = page.locator(".frame-grid .frame-tile").first  # type: ignore[union-attr]
+        newest_id = int(first_tile.get_attribute("id").split("-")[-1])
+
+        # Jump to an older window. Wait for htmx to bind the form first: a submit
+        # that lands before it is a plain page load, which resets the script.
+        page.wait_for_function(  # type: ignore[union-attr]
+            "() => !!document.querySelector('.frame-jump')?.['htmx-internal-data']",
+            timeout=30000,
+        )
+        page.fill("#frame-jump-at", "2026-01-01T00:05")  # type: ignore[union-attr]
+        with page.expect_response(  # type: ignore[union-attr]
+            lambda r: "/frames" in r.url and "at=" in r.url
+        ):
+            page.click(".frame-jump button[type='submit']")  # type: ignore[union-attr]
+        page.wait_for_function(  # type: ignore[union-attr]
+            "(n) => { const t = document.querySelector('#frame-grid .frame-tile');"
+            " return !!t && parseInt(t.id.split('-').pop(), 10) < n; }",
+            arg=newest_id,
+            timeout=30000,
+        )
+
+        page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")  # type: ignore[union-attr]
+        deadline = 30
+        while not any("/frames/since" in u for u in seen) and deadline:
+            page.wait_for_timeout(250)  # type: ignore[union-attr]
+            deadline -= 1
+        assert seen, "the poller never asked /frames/since"
+        match = re.search(r"after=(\d+)", seen[-1])
+        assert match is not None
+        assert int(match.group(1)) == newest_id

@@ -23,6 +23,13 @@ from timelapse_manager.runtime import get_context
 from timelapse_manager.storage import paths
 from timelapse_manager.web import routers
 
+from .thumbnail_support import (
+    FAKE_THUMB_BYTES,
+    FakeFfmpeg,
+    cache_entries,
+    install_fake_ffmpeg,
+)
+
 _JPEG_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 32 + b"\xff\xd9"
 _PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 
@@ -264,7 +271,9 @@ class TestProjectViewFields:
             assert project is not None
             view = routers._project_view(db, project)
 
-        assert view.latest_frame_url == f"/projects/{pid}/frames/{fid}/image"
+        assert view.latest_frame_url == (
+            f"/projects/{pid}/frames/{fid}/thumbnail?size=640"
+        )
 
     def test_latest_frame_url_none_when_no_frames(
         self, admin_client: TestClient
@@ -279,7 +288,10 @@ class TestProjectViewFields:
             view = routers._project_view(db, project)
 
         assert view.latest_frame_url is None
-        assert view.next_capture_at is None
+        # An active interval project that has never captured is due now (#5).
+        assert view.next_capture_at_raw is not None
+        due_in = view.next_capture_at_raw - datetime.datetime.now(datetime.UTC)
+        assert abs(due_in.total_seconds()) < 60
 
     def test_latest_frame_url_uses_highest_sequence(
         self, admin_client: TestClient
@@ -295,7 +307,9 @@ class TestProjectViewFields:
             assert project is not None
             view = routers._project_view(db, project)
 
-        assert view.latest_frame_url == f"/projects/{pid}/frames/{newest}/image"
+        assert view.latest_frame_url == (
+            f"/projects/{pid}/frames/{newest}/thumbnail?size=640"
+        )
 
     def test_soft_deleted_frame_ignored_for_latest(
         self, admin_client: TestClient
@@ -317,14 +331,18 @@ class TestProjectViewFields:
             view = routers._project_view(db, project)
 
         # The highest-sequence frame is soft-deleted, so the active one wins.
-        assert view.latest_frame_url == f"/projects/{pid}/frames/{active}/image"
+        assert view.latest_frame_url == (
+            f"/projects/{pid}/frames/{active}/thumbnail?size=640"
+        )
 
     def test_next_capture_at_is_last_capture_plus_interval(
         self, admin_client: TestClient
     ) -> None:
         cam = _seed_camera()
         pid = _seed_project(name="View NextCap", camera_id=cam, interval=120)
-        ts = datetime.datetime(2026, 6, 11, 10, 0, 0)
+        ts = datetime.datetime.now(datetime.UTC).replace(
+            tzinfo=None, microsecond=0
+        ) - datetime.timedelta(seconds=30)
         _write_default_frame(pid, sequence_index=1, capture_timestamp=ts)
 
         ctx = get_context()
@@ -333,8 +351,10 @@ class TestProjectViewFields:
             assert project is not None
             view = routers._project_view(db, project)
 
-        # ts + 120s = 10:02 UTC, formatted by _fmt_dt.
-        assert view.next_capture_at == "2026-06-11 10:02 UTC"
+        # Last capture (from the frame table) + the interval.
+        assert view.next_capture_at_raw == (
+            ts.replace(tzinfo=datetime.UTC) + datetime.timedelta(seconds=120)
+        )
 
     def test_next_capture_at_none_without_timestamp(
         self, admin_client: TestClient
@@ -349,7 +369,10 @@ class TestProjectViewFields:
             assert project is not None
             view = routers._project_view(db, project)
 
-        assert view.next_capture_at is None
+        # A frame without a timestamp is not a known capture: due now (#5).
+        assert view.next_capture_at_raw is not None
+        due_in = view.next_capture_at_raw - datetime.datetime.now(datetime.UTC)
+        assert abs(due_in.total_seconds()) < 60
 
 
 class TestFrameTileThumbnail:
@@ -428,3 +451,241 @@ class TestFrameThumbnail:
         # A second request still succeeds (served from cache).
         second = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
         assert second.status_code == 200
+
+
+class TestFrameImageContainment:
+    """The route uses the shared containment helper (#67 S16)."""
+
+    def test_symlinked_frame_out_of_tree_is_404(
+        self,
+        admin_client: TestClient,
+        tmp_path_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Img Symlink", camera_id=cam)
+        secret = tmp_path_factory.mktemp("outside-link") / "secret.txt"
+        secret.write_bytes(b"TOP SECRET")
+        fid = _write_default_frame(pid, file_name="00000001.jpg")
+        planted = paths.frames_root(get_context().settings) / str(pid) / "00000001.jpg"
+        planted.unlink()
+        planted.symlink_to(secret)
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/image")
+
+        assert resp.status_code == 404
+        assert b"TOP SECRET" not in resp.content
+
+    def test_relative_frame_from_before_storage_path_change_is_served(
+        self,
+        admin_client: TestClient,
+        tmp_path_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        # Captured under the default layout (relative stored name), then the
+        # project got a storage_path: the frame is still in frames_root/<id>.
+        cam = _seed_camera()
+        pid = _seed_project(name="Img Moved", camera_id=cam)
+        fid = _write_default_frame(pid)
+        store = tmp_path_factory.mktemp("moved-store")
+        with session_scope(get_context().session_factory) as db:
+            proj = db.get(Project, pid)
+            assert proj is not None
+            proj.storage_path = str(store)
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/image")
+
+        assert resp.status_code == 200
+        assert resp.content == _JPEG_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Bounded, atomic thumbnail generation (#67 P3). ffmpeg is faked
+# (``thumbnail_support``), so these run without a binary.
+# ---------------------------------------------------------------------------
+
+
+def _png_header(width: int, height: int) -> bytes:
+    """A PNG signature + IHDR declaring ``width`` x ``height`` (no pixels)."""
+    import struct
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+    )
+
+
+@pytest.fixture()
+def fake_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> FakeFfmpeg:
+    return install_fake_ffmpeg(monkeypatch)
+
+
+class TestThumbnailBounds:
+    def test_generated_once_then_served_from_cache(
+        self, admin_client: TestClient, fake_ffmpeg: FakeFfmpeg
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Cache", camera_id=cam)
+        fid = _write_default_frame(pid)
+
+        first = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+        second = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert first.status_code == second.status_code == 200
+        assert first.content == second.content == FAKE_THUMB_BYTES
+        assert first.headers["cache-control"] == "private, max-age=86400"
+        assert len(fake_ffmpeg.calls) == 1
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        assert cache_entries(cache_dir) == [f"{fid}.jpg"]
+
+    def test_slots_exhausted_serves_full_image_uncached(
+        self,
+        admin_client: TestClient,
+        fake_ffmpeg: FakeFfmpeg,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import contextlib
+
+        from timelapse_manager.encode import thumbnail
+
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Busy", camera_id=cam)
+        fid = _write_default_frame(pid)
+        monkeypatch.setattr(thumbnail, "SLOT_TIMEOUT_SECONDS", 0.05)
+        limit = get_context().settings.render.thumbnail_concurrency
+
+        with contextlib.ExitStack() as stack:
+            for _ in range(limit):
+                assert stack.enter_context(thumbnail.generation_slot(limit))
+            busy = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert busy.status_code == 200
+        assert busy.content == _JPEG_BYTES  # the full frame
+        assert busy.headers["cache-control"] == "private, no-cache"
+        assert fake_ffmpeg.calls == []
+
+        # Once a slot is free the real thumbnail is generated and cached.
+        free = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+        assert free.content == FAKE_THUMB_BYTES
+        assert free.headers["cache-control"] == "private, max-age=86400"
+
+    def test_oversized_frame_is_404_not_500(
+        self, admin_client: TestClient, fake_ffmpeg: FakeFfmpeg
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Bomb", camera_id=cam)
+        fid = _write_default_frame(
+            pid, file_name="00000001.png", data=_png_header(50_000, 50_000)
+        )
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+        again = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert resp.status_code == again.status_code == 404
+        assert fake_ffmpeg.calls == []  # refused on the header, before ffmpeg
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        assert cache_entries(cache_dir) == []
+
+    def test_oversized_frame_logged_once(
+        self,
+        admin_client: TestClient,
+        fake_ffmpeg: FakeFfmpeg,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from timelapse_manager.web.routers import frames as frames_router
+
+        # The once-per-frame memory is process-wide; frame ids repeat across
+        # tests (a fresh database each), so start this one with it empty.
+        monkeypatch.setattr(frames_router, "_REFUSED_THUMBNAIL_FRAMES", set())
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Bomb Log", camera_id=cam)
+        fid = _write_default_frame(
+            pid, file_name="00000001.png", data=_png_header(50_000, 50_000)
+        )
+
+        with caplog.at_level("WARNING", logger="timelapse_manager.web.routers.frames"):
+            for _ in range(3):
+                admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        refused = [r for r in caplog.records if f"frame {fid} " in r.getMessage()]
+        assert len(refused) == 1
+
+    @pytest.mark.parametrize("mode", ["partial-then-fail", "empty"])
+    def test_failed_generation_leaves_no_file(
+        self, admin_client: TestClient, fake_ffmpeg: FakeFfmpeg, mode: str
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name=f"Tb Fail {mode}", camera_id=cam)
+        fid = _write_default_frame(pid)
+        fake_ffmpeg.mode = mode
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert resp.status_code == 200
+        assert resp.content == _JPEG_BYTES  # graceful fallback to the frame
+        assert resp.headers["cache-control"] == "private, no-cache"
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        # Neither a partial thumbnail nor a temporary file is left behind.
+        assert cache_entries(cache_dir) == []
+
+    def test_ffmpeg_writes_a_temp_name_beside_the_cache_file(
+        self, admin_client: TestClient, fake_ffmpeg: FakeFfmpeg
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Temp", camera_id=cam)
+        fid = _write_default_frame(pid)
+
+        admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        out = Path(fake_ffmpeg.calls[0][-1])
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        assert out.parent == cache_dir
+        assert out.name.startswith(f"{fid}{paths.THUMBNAIL_TEMP_MARKER}")
+        # ffmpeg picks its output format from the extension.
+        assert out.suffix == ".jpg"
+
+    def test_symlink_planted_in_cache_is_not_served(
+        self,
+        admin_client: TestClient,
+        fake_ffmpeg: FakeFfmpeg,
+        tmp_path_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Planted", camera_id=cam)
+        fid = _write_default_frame(pid)
+        secret = tmp_path_factory.mktemp("outside-thumb") / "secret.jpg"
+        secret.write_bytes(b"TOP SECRET")
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / f"{fid}.jpg").symlink_to(secret)
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert resp.status_code == 200
+        assert b"TOP SECRET" not in resp.content
+        assert not (cache_dir / f"{fid}.jpg").is_symlink()  # replaced
+        assert secret.read_bytes() == b"TOP SECRET"
+
+    def test_cache_dir_symlinked_out_of_root_is_not_written(
+        self,
+        admin_client: TestClient,
+        fake_ffmpeg: FakeFfmpeg,
+        tmp_path_factory,  # type: ignore[no-untyped-def]
+    ) -> None:
+        cam = _seed_camera()
+        pid = _seed_project(name="Tb Escaped", camera_id=cam)
+        fid = _write_default_frame(pid)
+        outside = tmp_path_factory.mktemp("outside-cache")
+        cache_dir = paths.thumbnail_cache_dir(get_context().settings, pid)
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        cache_dir.symlink_to(outside, target_is_directory=True)
+
+        resp = admin_client.get(f"/projects/{pid}/frames/{fid}/thumbnail")
+
+        assert resp.status_code == 200
+        assert resp.content == _JPEG_BYTES
+        assert resp.headers["cache-control"] == "private, no-cache"
+        assert fake_ffmpeg.calls == []
+        assert list(outside.iterdir()) == []

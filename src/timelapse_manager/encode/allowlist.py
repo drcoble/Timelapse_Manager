@@ -13,7 +13,9 @@ assemble a command containing anything it does not explicitly understand.
 
 from __future__ import annotations
 
-from .encoder import EncoderCapabilityError
+from dataclasses import dataclass
+
+from .encoder import EncoderCapabilityError, EncoderError
 
 # Logical codec name -> the ffmpeg encoder that produces it. The key is what a
 # caller (and the stored render settings) speaks in; the value is the concrete
@@ -170,6 +172,163 @@ def ensure_filters_allowed(filter_names: list[str], *, allow_hw: bool = False) -
             raise EncoderCapabilityError(
                 f"disallowed filter: {name!r}", option="filter"
             )
+
+
+# libavutil's ``WHITESPACES``: what ``av_get_token`` and the graph parser skip.
+_WHITESPACES = " \n\t\r"
+
+
+@dataclass(frozen=True)
+class ParsedFilter:
+    """One filter as ffmpeg's filtergraph parser would see it.
+
+    ``name`` is the filter name (anything after an ``@`` instance separator is
+    kept, so an unexpected instance name fails the comparison with the expected
+    list). ``args`` is the option string after the graph level's unquoting, i.e.
+    what the filter's own option parser receives, or ``None`` with no ``=``.
+    """
+
+    name: str
+    args: str | None
+
+
+def _get_token(text: str, pos: int, term: str) -> tuple[str, int]:
+    """Port of libavutil's ``av_get_token``: read one token from ``text[pos:]``.
+
+    Leading whitespace is skipped. Outside quotes a backslash takes the next
+    character literally; ``'...'`` is copied literally up to the closing quote
+    (a backslash inside quotes is an ordinary character). The token ends at the
+    first unquoted, unescaped character in ``term``. Trailing whitespace is
+    trimmed unless it was escaped or quoted.
+
+    :returns: ``(token, position of the terminator or end of text)``.
+    """
+    out: list[str] = []
+    keep = 0  # length of ``out`` that trailing-whitespace trimming must keep
+    length = len(text)
+    while pos < length and text[pos] in _WHITESPACES:
+        pos += 1
+    while pos < length and text[pos] not in term:
+        char = text[pos]
+        pos += 1
+        if char == "\\" and pos < length:
+            out.append(text[pos])
+            pos += 1
+            keep = len(out)
+        elif char == "'":
+            while pos < length and text[pos] != "'":
+                out.append(text[pos])
+                pos += 1
+            if pos < length:
+                pos += 1
+                keep = len(out)
+        else:
+            out.append(char)
+    while len(out) > keep and out[-1] in _WHITESPACES:
+        out.pop()
+    return "".join(out), pos
+
+
+def _skip_whitespace(text: str, pos: int) -> int:
+    """Return the first position at or after ``pos`` that is not whitespace."""
+    while pos < len(text) and text[pos] in _WHITESPACES:
+        pos += 1
+    return pos
+
+
+def _skip_link_labels(graph: str, pos: int) -> int:
+    """Skip any ``[label]`` pads at ``pos``, as the graph parser does.
+
+    :raises EncoderError: on an empty or unterminated label.
+    """
+    while pos < len(graph) and graph[pos] == "[":
+        label, pos = _get_token(graph, pos + 1, "]")
+        if not label or pos >= len(graph):
+            raise EncoderError("unparseable filtergraph: bad link label")
+        pos = _skip_whitespace(graph, pos + 1)
+    return pos
+
+
+def parse_filtergraph(graph: str) -> list[ParsedFilter]:
+    """Split a filtergraph into its filters the way ffmpeg's parser does.
+
+    A port of ``avfilter_graph_segment_parse`` (libavfilter ``graphparser.c``):
+    filters are separated by unquoted ``,`` (within a chain) and ``;`` (between
+    chains); ``[label]`` pads before and after a filter are skipped; the name is
+    the token before ``=``, and the options are the next token up to an
+    unquoted ``[``, ``]``, ``,`` or ``;``, with one level of quoting and
+    escaping removed. Anything ffmpeg itself would reject (trailing garbage after
+    a filter, an empty name, a bad label) raises.
+
+    This exists so the encoder can check the *final* graph string, not just the
+    fragments it meant to assemble: a value that broke out of its quoting would
+    show up here as an extra or renamed filter.
+
+    :raises EncoderError: if the graph cannot be parsed.
+    """
+    filters: list[ParsedFilter] = []
+    pos = _skip_whitespace(graph, 0)
+    while pos < len(graph):
+        pos = _skip_link_labels(graph, pos)
+        name, pos = _get_token(graph, pos, "=,;[")
+        if not name:
+            raise EncoderError("unparseable filtergraph: empty filter name")
+        args: str | None = None
+        if pos < len(graph) and graph[pos] == "=":
+            args, pos = _get_token(graph, pos + 1, "[],;")
+        pos = _skip_link_labels(graph, pos)
+        pos = _skip_whitespace(graph, pos)
+        filters.append(ParsedFilter(name=name, args=args))
+        if pos >= len(graph):
+            break
+        if graph[pos] not in ",;":
+            raise EncoderError(
+                "unparseable filtergraph: trailing garbage after a filter"
+            )
+        pos = _skip_whitespace(graph, pos + 1)
+    if not filters:
+        raise EncoderError("unparseable filtergraph: no filters")
+    return filters
+
+
+def parse_filter_names(graph: str) -> list[str]:
+    """Return the filter names in ``graph``, in order; see :func:`parse_filtergraph`.
+
+    :raises EncoderError: if the graph cannot be parsed.
+    """
+    return [f.name for f in parse_filtergraph(graph)]
+
+
+def _is_key_char(char: str) -> bool:
+    """libavutil ``is_key_char``: ASCII letters, digits and ``-_/.``."""
+    return ("a" <= char.lower() <= "z") or ("0" <= char <= "9") or char in "-_/."
+
+
+def parse_filter_options(args: str) -> list[tuple[str | None, str]]:
+    """Split a filter's option string into ``(key, value)`` pairs.
+
+    A port of the loop in ``ff_filter_opt_parse`` over ``av_opt_get_key_value``
+    with ``=`` and ``:``: the key is a run of key characters followed by ``=``;
+    the value is a token (one more level of quoting and escaping removed) up to
+    the next unescaped ``:``. A positional (shorthand) value has key ``None``.
+    """
+    pairs: list[tuple[str | None, str]] = []
+    pos = 0
+    while pos < len(args):
+        key_end = _skip_whitespace(args, pos)
+        key_start = key_end
+        while key_end < len(args) and _is_key_char(args[key_end]):
+            key_end += 1
+        after = _skip_whitespace(args, key_end)
+        key: str | None = None
+        if after < len(args) and args[after] == "=":
+            key = args[key_start:key_end]
+            pos = after + 1
+        value, pos = _get_token(args, pos, ":")
+        pairs.append((key, value))
+        if pos < len(args):
+            pos += 1
+    return pairs
 
 
 def validate_fps(fps: float) -> None:

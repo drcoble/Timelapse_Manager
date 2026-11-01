@@ -1,0 +1,39 @@
+{#
+  Partial: job_card_delete.html — the in-card delete with its confirmation.
+
+  The Delete button (.btn-danger) is a <summary>; opening it reveals the
+  .inline-confirm banner in place, which names the file and its size, warns for
+  an archive render, and says a running job will be stopped first. The confirm
+  button is the real form submit (CSRF field included). With HTMX it posts in
+  place and the response removes the list row, shows a toast and closes the
+  dialog; without JavaScript it posts and is redirected back.
+
+  Context: card — _JobCardView; noun — "render" | "export"; csrf_token.
+#}
+{% set label = noun | capitalize ~ ' #' ~ card.id %}
+<details class="job-card-delete">
+  <summary class="btn btn-danger btn-sm">Delete</summary>
+  <div class="inline-confirm" role="group" aria-label="Confirm deleting {{ label }}">
+    <div class="inline-confirm__msg">
+      <p>
+        Delete {{ label }}
+        {%- if card.file_name %} and its file <span class="mono">{{ card.file_name }}</span>
+          ({{ card.file_size_display }}){% else %}? No file is on disk, so only the
+          record will be removed{% endif %}. This cannot be undone.
+      </p>
+      {% if card.is_running %}
+        <p><strong>This {{ noun }} is still running: it will be stopped first.</strong></p>
+      {% endif %}
+      {% if card.is_archive %}
+        <p><strong>This is an archive render. Automatic pruning deliberately
+          keeps archive renders; deleting it removes the archived copy.</strong></p>
+      {% endif %}
+    </div>
+    <span class="inline-confirm__spacer"></span>
+    <form method="post" action="{{ card.delete_url }}" style="margin:0;display:inline;"
+          hx-post="{{ card.delete_url }}" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-sm btn-danger">Yes, delete</button>
+    </form>
+  </div>
+</details>

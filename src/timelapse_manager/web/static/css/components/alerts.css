@@ -72,6 +72,47 @@
 }
 .toast-close:hover { color: var(--color-text); }
 
+/* Optional action inside a toast (e.g. "Reload" after a CSRF failure). */
+.toast-action {
+  margin-top: var(--sp-2);
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: var(--sp-1) var(--sp-3);
+}
+.toast-action:hover { background: var(--color-surface); }
+.toast-action:focus-visible,
+.toast-close:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Connection-lost banner (htmx-errors.js): one shared notice while the server
+   is unreachable, instead of a toast per failed request.
+   -------------------------------------------------------------------------- */
+.connection-banner {
+  position: fixed;
+  top: var(--sp-3);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 510;
+  max-width: calc(100vw - 2 * var(--sp-4));
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-md);
+  background: var(--color-error-bg);
+  color: var(--color-text);
+  font-size: 0.875rem;
+  font-weight: 500;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+.connection-banner[hidden] { display: none; }
+
 /* --------------------------------------------------------------------------
    Alert Banners (inline page alerts)
    -------------------------------------------------------------------------- */
@@ -133,3 +174,99 @@
   color: var(--color-running);
 }
 .alert.success .alert-desc { color: var(--color-success-desc); }
+
+/* --------------------------------------------------------------------------
+   Active-alerts indicator + panel (page header, #70 F-R6)
+
+   The panel is a disclosure driven by alerts.js through the `hidden`
+   attribute; there is no :hover or :focus-within open rule, so a touch
+   device can open it, Escape can close it while focus is still on the
+   toggle, and a background poll never changes its state.
+   -------------------------------------------------------------------------- */
+.alerts-menu {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.alerts-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-2);
+  line-height: 1;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.alerts-toggle:hover,
+.alerts-toggle:focus-visible,
+.alerts-toggle[aria-expanded="true"] { background: var(--color-surface-2); color: var(--color-text); }
+.alerts-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.alerts-icon { font-size: 1rem; }
+.alerts-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 99px;
+  background: var(--color-error);
+  color: var(--color-on-accent);
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+
+.alerts-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 360px;
+  max-width: 90vw;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-2);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 200;
+  padding: var(--sp-3);
+}
+.alerts-panel[hidden] { display: none; }
+.alerts-panel:focus { outline: none; }
+.alerts-panel:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.alerts-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+.alerts-panel-title { font-weight: 600; font-size: 0.875rem; }
+
+.alerts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.alerts-item { align-items: center; }
+.alerts-level { font-weight: 700; letter-spacing: 0.04em; margin-right: var(--sp-2); }
+.alerts-dismiss { flex-shrink: 0; }
+.alerts-empty { color: var(--color-text-dim); font-size: 0.875rem; margin: var(--sp-2) 0 0; }

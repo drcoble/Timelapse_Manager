@@ -1,0 +1,44 @@
+{#
+  Partial: export_row.html — one frame export on the project Frames tab.
+  Context: export — the row view {id, status, created_at, created_at_raw,
+                    download_url, card_url}
+           can_operate — bool (the export download is operator-gated)
+
+  status values: queued | running | complete | error
+  The "Export #N" link opens the export card in the page's job-card dialog.
+#}
+<div class="job-item" id="export-row-{{ export.id }}" role="row">
+  <div class="job-meta">
+    <div class="job-name">
+      <span class="kind-badge export">Export</span>
+      &nbsp;
+      <a href="{{ export.card_url }}"
+         id="export-open-{{ export.id }}"
+         class="job-open"
+         data-modal-open="#job-card-modal"
+         hx-get="{{ export.card_url }}"
+         hx-target="#job-card-content"
+         hx-swap="innerHTML">Export #{{ export.id }}</a>
+    </div>
+    <div class="job-detail">
+      {{ export.created_at_raw | localdt if export.created_at_raw else export.created_at }}
+      &nbsp;&middot;&nbsp;
+      {% if export.status == 'queued' %}
+        <span style="color:var(--color-text-dim);">Queued</span>
+      {% elif export.status == 'running' %}
+        <span style="color:var(--color-accent-hover);">Preparing&hellip;</span>
+      {% elif export.status == 'complete' %}
+        <span style="color:var(--color-running);">Ready</span>
+      {% elif export.status == 'error' %}
+        <span style="color:var(--color-error);">Error</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="job-actions">
+    {% if can_operate and export.download_url %}
+      <a href="{{ export.download_url }}" class="btn btn-secondary btn-sm" download>
+        &#8659; Download
+      </a>
+    {% endif %}
+  </div>
+</div>

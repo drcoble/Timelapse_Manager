@@ -20,8 +20,8 @@
   No-JS path:
     A real <form method="post" enctype="multipart/form-data"> submits to the
     same route, producing a full-page response. The csrf_token hidden field
-    covers the no-JS submission (the HTMX path instead reads the value from the
-    page-level hx-headers on <body>).
+    covers the no-JS submission (the HTMX path instead sends the
+    X-CSRF-Token header that csrf.js reads from the page's csrf-token meta tag).
 
   Result target:
     An empty <div id="frames-import-result"> lives as a SIBLING of the
@@ -30,30 +30,47 @@
     via outerHTML. This means the form is not swapped away, so repeated imports
     work and the result persists after the disclosure is collapsed.
 #}
-{# Suppress the native disclosure triangle on the <summary> that renders as a
-   button. list-style:none covers standard engines; ::-webkit-details-marker
-   covers older WebKit. Scoped here because this pseudo-element cannot be
-   targeted from an inline style attribute. #}
-<style>
-.frames-import-disclosure > summary { list-style: none; }
-.frames-import-disclosure > summary::-webkit-details-marker { display: none; }
-</style>
 <form method="post"
       enctype="multipart/form-data"
       action="/projects/{{ project.id }}/frames/import"
       novalidate
       hx-post="/projects/{{ project.id }}/frames/import"
       hx-encoding="multipart/form-data"
+      data-htmx-timeout="none"
       hx-target="#frames-import-result"
       hx-swap="outerHTML"
       hx-disabled-elt="[data-import-submit]">
 
-  {# Hidden field for the no-JS plain-submit path. HTMX reads the CSRF token
-     from the page-level X-CSRF-Token header on <body> so this is redundant
-     for the enhanced path — harmless either way. #}
+  {# KEEP THIS FIRST in the form, before the file input: the CSRF middleware
+     reads only the first multipart part of a no-JS import (WP-67-N), and
+     tests/web/test_frontend_contracts.py asserts the order.
+     Hidden field for the no-JS plain-submit path. csrf.js sends the CSRF token
+     from the csrf-token meta tag as the X-CSRF-Token header on every htmx
+     request, so this is redundant for the enhanced path — harmless either way. #}
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
   <div class="form-stack" style="margin-top:var(--sp-4);">
+
+    {# Before the file input on purpose: the CSRF field above stays first, and the
+       multipart reader keeps this text field because it arrives ahead of files. #}
+    <div class="form-group">
+      <label class="form-label" for="frames-import-exif-timezone">
+        Camera time zone <span style="color:var(--color-text-dim);">(optional)</span>
+      </label>
+      <input type="text"
+             id="frames-import-exif-timezone"
+             name="exif_timezone"
+             class="form-control"
+             maxlength="64"
+             autocomplete="off"
+             spellcheck="false"
+             placeholder="e.g. America/New_York">
+      <span class="form-hint" style="color:var(--color-text-dim);">
+        EXIF times are local clock times. An image that records its own UTC
+        offset uses it; otherwise they are read in this zone, or in the
+        project&#8217;s schedule time zone when this is blank.
+      </span>
+    </div>
 
     <div class="form-group">
       <label class="form-label" for="frames-import-files">Images</label>
@@ -81,7 +98,7 @@
          Works in no-JS too: the <details> simply stays open (acceptable). #}
       <button type="button"
               class="btn btn-ghost btn-sm"
-              onclick="this.closest('details').removeAttribute('open');">
+              data-action="close-details">
         Cancel
       </button>
     </div>

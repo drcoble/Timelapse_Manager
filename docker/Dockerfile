@@ -10,31 +10,41 @@
 #   runtime  -- a slim image containing only the runtime, the pinned FFmpeg, and
 #               the built virtual environment; runs as a non-root user, PID 1.
 #
-# Target platform: linux/amd64 (the pinned FFmpeg is an amd64 static build).
+# Target platform: linux/amd64 (the pinned FFmpeg is an amd64 static build). The
+# FROM lines carry no --platform flag (BuildKit warns about a constant one), so
+# build with `--platform linux/amd64`, as `make image` and the release job do.
 
 # ---------------------------------------------------------------------------
-# Base image, pinned by digest.
+# Base images, pinned by digest.
 # ---------------------------------------------------------------------------
-# Pinning by digest makes rebuilds reproducible and prevents a moving tag from
-# silently changing the runtime. The digest below is a PLACEHOLDER -- resolve the
-# real current linux/amd64 digest before building/release with:
+# Every base is pinned by digest, so rebuilds are reproducible and a moving tag
+# cannot silently change the runtime. The defaults below are real multi-arch
+# index digests resolved from the registries; the build's --platform selects linux/amd64.
+# Refresh them deliberately (and re-run the Trivy gate) -- never float on a tag.
+# Release CI and `make image` resolve the live digests for the same tags and
+# pass them as --build-arg, overriding these defaults. To look one up:
 #
-#   docker buildx imagetools inspect python:3.12-slim-bookworm \
-#     --format '{{json .Manifest}}' | jq -r '.manifest.digest // .digest'
+#   docker buildx imagetools inspect python:3.12-slim-trixie \
+#     --format '{{.Manifest.Digest}}'
 #
-# (or read the `linux/amd64` entry from the image index). The digest below is
-# an all-zeros placeholder that fails the build on purpose: the real digest MUST
-# be supplied at build time via `--build-arg PYTHON_IMAGE=...` so an un-pinned
-# build fails loudly rather than silently floating on a moving tag. Release CI
-# and the `make image` target both resolve the live digest and pass it this way.
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000
+# Debian 13 (trixie) everywhere: it matches the .deb and the Proxmox CT target,
+# and Debian 12 no longer gets regular security updates.
+
+# python:3.12-slim-trixie (resolved 2026-10-29)
+ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+# debian:trixie-slim (resolved 2026-10-29); the ffmpeg download stage only.
+ARG FFMPEG_BASE_IMAGE=debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+# uv 0.12.21 (resolved 2026-10-29). Must equal UV_VERSION in
+# .gitea/workflows/release.yml so `uv sync --frozen` reads the current lock
+# revision; tests/unit/packaging/test_dockerfile.py enforces the match.
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.21@sha256:a7aed3216253ee804de3e2d8afa5073baa1a177335345d43845cd4165e43b711
 
 # ---------------------------------------------------------------------------
 # FFmpeg: download + verify the pinned static build.
 # ---------------------------------------------------------------------------
 # A small, fixed Debian image with curl/tar/xz is enough here; this stage never
-# ships, so its base does not need the digest pin the runtime carries.
-FROM debian:bookworm-slim AS ffmpeg
+# ships, but it is digest-pinned anyway so the build tooling is reproducible.
+FROM ${FFMPEG_BASE_IMAGE} AS ffmpeg
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
         ca-certificates curl xz-utils python3 \
@@ -50,44 +60,79 @@ COPY ffmpeg-pin.json /stage/ffmpeg-pin.json
 # Fetch the tarball, verify its SHA-256 against the pin (a mismatch fails the
 # build), and extract just ffprobe + ffmpeg to a fixed location.
 #
-# Mirror resilience: download_urls() returns mirror_urls (owner mirror first)
-# followed by the upstream url as the final fallback. Each candidate is tried
-# in order; the sha256 from the pin is the trust anchor regardless of source.
-# A placeholder URL (containing "REPLACE_ME") is skipped automatically so a
-# build that hasn't yet populated the owner mirror still works via the fallback.
+# Mirror resilience: an optional private mirror (the TLM_FFMPEG_MIRROR_URL build
+# arg) is tried first with bearer-token auth from the gitea_token buildx secret;
+# the public URLs in the pin are the fallback.  The sha256 from the pin is the
+# trust anchor regardless of source.  When a mirror URL and a token are both
+# supplied the build REQUIRES the mirror to succeed — it aborts rather than
+# silently pulling a mutable upstream artifact.  Without a mirror URL or a token
+# the build warns and uses the public URL from the pin.
+# A placeholder URL (containing "REPLACE_ME") is skipped automatically.
 # A single Dockerfile heredoc (quoted delimiter so the frontend passes the body
 # verbatim to the shell and does not touch the ${...} shell expansions). The
 # candidate URL list is generated by an embedded python3 -c one-liner; an earlier
 # version used a nested `python3 - <<'PYEOF'` shell heredoc, which buildkit's
 # heredoc parser cannot handle inside a RUN and which broke the image build.
-RUN <<'EOF'
+ARG TLM_FFMPEG_MIRROR_URL=
+RUN --mount=type=secret,id=gitea_token <<'EOF'
 set -eu
 sha="$(python3 -c 'import json;print(json.load(open("/stage/ffmpeg-pin.json"))["sha256"])')"
 ffmpeg_rel="$(python3 -c 'import json;print(json.load(open("/stage/ffmpeg-pin.json"))["binaries"]["ffmpeg"])')"
 ffprobe_rel="$(python3 -c 'import json;print(json.load(open("/stage/ffmpeg-pin.json"))["binaries"]["ffprobe"])')"
 python3 -c '
-import json
+import json, os
 pin = json.load(open("/stage/ffmpeg-pin.json"))
-urls = [u for u in pin.get("mirror_urls", []) if u]
+urls = [os.environ.get("TLM_FFMPEG_MIRROR_URL", "")] + list(pin.get("mirror_urls", []))
+urls = [u for u in urls if u]
 primary = pin["url"]
 seen = list(dict.fromkeys(urls))
 if primary not in seen:
     seen.append(primary)
 print("\n".join(seen))
 ' > /tmp/urls.txt
+# Read the Gitea token from the buildx secret mount.  On a build where the
+# secret is not supplied the file will not exist and the token stays empty — in
+# that case a private mirror, if one was named, is skipped with a warning.
+gitea_token=""
+if [ -f /run/secrets/gitea_token ]; then
+    gitea_token="$(cat /run/secrets/gitea_token)"
+fi
 fetched=0
 while IFS= read -r candidate; do
     case "${candidate}" in *REPLACE_ME*) echo "Skipping placeholder: ${candidate}"; continue;; esac
-    echo "Trying: ${candidate}"
-    if curl -fsSL -o /stage/ffmpeg.tar.xz "${candidate}"; then
-        if echo "${sha}  /stage/ffmpeg.tar.xz" | sha256sum --check --strict 2>/dev/null; then
-            fetched=1; break
-        else
-            echo "SHA-256 mismatch from ${candidate}; trying next"
-            rm -f /stage/ffmpeg.tar.xz
-        fi
+    case "${candidate}" in
+        "${TLM_FFMPEG_MIRROR_URL:-}")
+            # Private mirror: auth required; skip if no token is mounted.
+            if [ -z "${gitea_token}" ]; then
+                echo "Skipping private mirror (gitea_token secret absent): ${candidate}"
+                continue
+            fi
+            echo "Trying (mirror, with auth): ${candidate}"
+            curl -fsSL -H "Authorization: token ${gitea_token}" \
+                -o /stage/ffmpeg.tar.xz "${candidate}" \
+                || { rm -f /stage/ffmpeg.tar.xz; echo "Download failed: ${candidate}"; continue; }
+            ;;
+        *)
+            # Upstream or other public URL.  With a token set the mirror should
+            # have succeeded already — reaching here with a token means it is
+            # broken.  Fail loudly rather than silently pulling a mutable artifact.
+            if [ -n "${gitea_token}" ] && [ -n "${TLM_FFMPEG_MIRROR_URL:-}" ]; then
+                echo "ERROR: the private mirror failed despite the gitea_token secret being set."
+                echo "       Refusing to fall back to mutable upstream: ${candidate}"
+                echo "       Check TLM_FFMPEG_MIRROR_URL and the gitea_token secret."
+                exit 1
+            fi
+            echo "WARNING: no immutable mirror available; falling back to mutable upstream."
+            echo "         ${candidate}"
+            curl -fsSL -o /stage/ffmpeg.tar.xz "${candidate}" \
+                || { rm -f /stage/ffmpeg.tar.xz; echo "Download failed: ${candidate}"; continue; }
+            ;;
+    esac
+    if echo "${sha}  /stage/ffmpeg.tar.xz" | sha256sum --check --strict 2>/dev/null; then
+        fetched=1; break
     else
-        echo "Download failed for ${candidate}; trying next"
+        echo "SHA-256 mismatch from ${candidate}; trying next"
+        rm -f /stage/ffmpeg.tar.xz
     fi
 done < /tmp/urls.txt
 [ "${fetched}" = "1" ] || { echo "ERROR: pinned FFmpeg unreachable from all mirrors (sha256=${sha})"; exit 1; }
@@ -101,12 +146,17 @@ chmod 0755 /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe
 EOF
 
 # ---------------------------------------------------------------------------
+# uv: the version-pinned binary, copied into the builder below.
+# ---------------------------------------------------------------------------
+FROM ${UV_IMAGE} AS uv
+
+# ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
-# Copy the uv binary from its official, version-pinned image.
-COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /usr/local/bin/
+# Copy the uv binary from the digest-pinned uv stage above.
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
@@ -131,7 +181,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
+
+# OCI image labels. The release job passes the real values as build args; the
+# defaults mark a hand-built image honestly rather than inventing metadata.
+ARG VERSION=unknown
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="Timelapse Manager" \
+      org.opencontainers.image.source="https://github.com/drcoble/Timelapse_Manager" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 # Only curl is needed at runtime (the HEALTHCHECK uses it). FFmpeg comes from the
 # pinned static build staged above, NOT from apt, so the encoder is the exact
@@ -139,6 +200,14 @@ FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS runtime
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes curl \
     && rm -rf /var/lib/apt/lists/*
+
+# The runtime never installs anything (the venv is copied from the builder), so drop
+# the base image's own pip. It is not ours to patch and a stale one fails the
+# release Trivy gate; removing it clears the finding permanently.
+RUN python -m pip uninstall --yes pip \
+    && rm -rf /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.* \
+       /usr/local/lib/python3.*/site-packages/pip \
+       /usr/local/lib/python3.*/site-packages/pip-*.dist-info
 
 # Bring in the pinned, verified FFmpeg/ffprobe at a fixed path.
 COPY --from=ffmpeg /opt/ffmpeg/bin/ /opt/ffmpeg/bin/

@@ -28,8 +28,13 @@ from .base import Base
 _status_enum = Enum(
     # A frame was captured for this anchor on this day.
     "captured",
-    # The capture was attempted but failed (camera unreachable, etc.).
+    # The capture was attempted but failed (camera unreachable, etc.). Also the
+    # provisional status of a claimed row while its attempt is in flight, so a
+    # crash mid-capture leaves ``failed`` and the anchor is not re-fired.
     "failed",
+    # An attempt failed inside the grace window and another is due at
+    # ``next_attempt_at`` (#69, CAM-R1).
+    "retry_pending",
     # The fire instant was missed by more than the grace window (the app was
     # down when the anchor was due), so no frame was taken.
     "skipped_missed",
@@ -44,7 +49,9 @@ class ExactTimeFire(Base):
     """A per-anchor, per-day fire record for exact-time capture.
 
     A row is claimed at decision time and then its ``status`` is finalised once
-    the capture attempt resolves. The unique constraint on
+    the capture attempt resolves. A failed attempt inside the grace window parks
+    the row at ``retry_pending`` with ``next_attempt_at``; the retry reclaims it
+    with a conditional UPDATE, so only one worker can win it. The unique constraint on
     ``(project_id, anchor_id, local_date)`` is the idempotency guard -- a second
     attempt to fire the same anchor on the same local day hits the constraint and
     is rejected, which is exactly how a restart or clock jitter is prevented from
@@ -82,3 +89,13 @@ class ExactTimeFire(Base):
     )
     # A short human-readable reason for a skip or failure, ``NULL`` on success.
     detail: Mapped[str | None] = mapped_column(String, nullable=True)
+    # How many capture attempts this anchor has made today (#69, CAM-R1). The
+    # claim is attempt 1; each retry claimed from ``retry_pending`` adds one.
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # When the next attempt is due (naive UTC) while ``status`` is
+    # ``retry_pending``; ``NULL`` otherwise.
+    next_attempt_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )

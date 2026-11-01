@@ -52,7 +52,7 @@
   <label class="form-label" for="frame-project-select">Project</label>
   <select id="frame-project-select" name="project_id" class="form-control"
           style="max-width:260px;"
-          onchange="this.form.requestSubmit ? this.form.requestSubmit() : this.form.submit()">
+          data-action="submit-form">
     <option value="" {% if all_projects %}selected{% endif %}>All Projects</option>
     {% for p in projects %}
     <option value="{{ p.id }}"
@@ -128,8 +128,10 @@
             hx-get="/frames/batch{% if not all_projects %}?project_id={{ project.id }}{% endif %}{% if show_deleted %}{{ '&' if not all_projects else '?' }}show_deleted=1{% endif %}"
             hx-target="#frame-grid" hx-swap="innerHTML" hx-push-url="false">Refresh</button>
   </div>
+  {# hx-target / hx-push-url are inherited by every tile (frame_tile.html), whose
+     card opens the drawer; the sentinel overrides the target (#198). #}
   <div class="frame-grid" id="frame-grid" role="grid" aria-label="Captured frames"
-       data-density="comfortable">
+       data-density="comfortable" hx-target="#drawer-main .drawer-body" hx-push-url="false">
     {% include '_partials/frames_batch.html' %}
   </div>
   {# Polite live region: assistive tech hears each scroll-loaded batch append. #}
@@ -150,11 +152,5 @@
   </div>
 {% endif %}
 
-{# Shared panel — HTMX-swapped frame scene metadata loads here on Info click #}
-<div id="frame-meta-panel"
-     role="complementary"
-     aria-label="Frame scene metadata"
-     aria-live="polite"
-     style="margin-top:var(--sp-6);"></div>
 
 {% endblock %}

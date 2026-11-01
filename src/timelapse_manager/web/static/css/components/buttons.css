@@ -13,7 +13,15 @@
   font-family: var(--font-sans);
   cursor: pointer;
   border: 1px solid transparent;
-  transition: all var(--transition-fast);
+  /* Named properties, not "all": with "all", a button inside a modal or drawer
+     animated the visibility it inherits when the panel opens, so it stayed
+     hidden and out of the tab order for the first 120 ms. */
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    opacity var(--transition-fast);
   white-space: nowrap;
   line-height: 1.4;
   text-decoration: none;

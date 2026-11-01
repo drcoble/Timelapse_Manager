@@ -2,30 +2,31 @@
   Partial: active_alerts.html
   Context: alert_count   — int   total active alerts (the full count, not the page)
            alerts        — list[_AlertView {id, level, level_class, message,
-                            scope, scope_id, timestamp, timestamp_raw}]
+                            scope, scope_id, timestamp, timestamp_raw,
+                            scope_label, scope_url}]
            can_operate   — bool  whether the viewer may dismiss / clear-all
 
-  Inner content of the persistent #alerts-area container in base.html. The
-  container owns the polling trigger and swaps THIS fragment's markup into its
-  innerHTML, so the fragment must NOT re-declare a polling trigger of its own.
+  Out-of-band replacements only (#70 F-R6). The alerts toggle and panel in
+  _partials/shell/header.html are static; GET /alerts/summary and both clear
+  actions answer with this fragment, whose three top-level elements replace
+  #alerts-badge, #alerts-count-label and #alerts-panel-body by id. The
+  requesting element swaps nothing itself (hx-swap="none"), so no response can
+  replace the toggle, steal its focus or close an open panel.
+
+  #alerts-badge is always present (empty and unstyled at zero) so the next
+  count has an element to land on.
 
   The clear controls (per-alert Dismiss, Clear all) render only when
   can_operate is true; a viewer sees the same list with no clear affordances,
   matching the operator/admin-only clear routes.
 #}
-<button type="button"
-        class="alerts-toggle"
-        aria-haspopup="true"
-        aria-expanded="false"
-        aria-controls="alerts-panel"
-        aria-label="Active alerts: {{ alert_count }}">
-  <span class="alerts-icon" aria-hidden="true"><svg class="icon"><use href="#icon-alert"></use></svg></span>
-  {% if alert_count and alert_count > 0 %}
-  <span class="alerts-badge" aria-hidden="true">{{ alert_count }}</span>
-  {% endif %}
-</button>
-
-<div id="alerts-panel" class="alerts-panel" role="region" aria-label="Active alerts">
+{% if alert_count and alert_count > 0 %}
+<span id="alerts-badge" class="alerts-badge" aria-hidden="true" hx-swap-oob="true">{{ alert_count }}</span>
+{% else %}
+<span id="alerts-badge" aria-hidden="true" hx-swap-oob="true"></span>
+{% endif %}
+<span id="alerts-count-label" class="visually-hidden" hx-swap-oob="true">Active alerts: {{ alert_count }}</span>
+<div id="alerts-panel-body" hx-swap-oob="true">
   <div class="alerts-panel-head">
     <span class="alerts-panel-title">
       {{ alert_count }} active alert{% if alert_count != 1 %}s{% endif %}
@@ -34,8 +35,7 @@
     <button type="button"
             class="btn btn-ghost btn-xs"
             hx-post="/alerts/clear-all"
-            hx-target="#alerts-area"
-            hx-swap="innerHTML">
+            hx-swap="none">
       Clear all
     </button>
     {% endif %}
@@ -52,7 +52,7 @@
           {{ alert.message }}
         </div>
         <div class="alert-desc">
-          {{ alert.scope }}{% if alert.scope_id is not none %} #{{ alert.scope_id }}{% endif %}
+          {% if alert.scope_url %}<a href="{{ alert.scope_url }}">{{ alert.scope_label }}</a>{% else %}{{ alert.scope_label }}{% endif %}
           &middot;
           <span class="mono">{{ alert.timestamp_raw | localdt if alert.timestamp_raw else (alert.timestamp or '—') }}</span>
         </div>
@@ -61,8 +61,7 @@
       <button type="button"
               class="btn btn-ghost btn-xs alerts-dismiss"
               hx-post="/alerts/{{ alert.id }}/clear"
-              hx-target="#alerts-area"
-              hx-swap="innerHTML"
+              hx-swap="none"
               aria-label="Dismiss alert: {{ alert.message }}">
         Dismiss
       </button>

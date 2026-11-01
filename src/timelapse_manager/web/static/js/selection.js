@@ -16,8 +16,8 @@
  *       <a ...drawer opener...></a>
  *       <label class="frame-tile-select">
  *         <input type="checkbox" class="frame-select-cb visually-hidden"
- *                data-frame-id="{id}" aria-label="Select frame {seq}">
- *         <span class="frame-select-indicator" aria-hidden="true"></span>
+ *                aria-label="Select frame {seq}">
+ *         <span class="frame-select-indicator"></span>
  *       </label>
  *     </div>
  *     ...
@@ -74,21 +74,27 @@
     return g ? g.querySelectorAll(".frame-select-cb") : [];
   }
 
+  // The checkbox carries no id of its own (#198, tile weight): it is the one in
+  // the tile whose id is "frame-tile-<frame id>".
   function idOf(cb) {
-    return cb.getAttribute("data-frame-id");
+    var own = cb.getAttribute("data-frame-id");
+    if (own) return own;
+    var tile = cb.closest(".frame-tile");
+    return tile && tile.id ? tile.id.replace("frame-tile-", "") : null;
   }
 
   // --- selection state -----------------------------------------------------
 
+  // The tile is found by id (getElementById, constant time) and its checkbox
+  // inside it, rather than a document-wide attribute-selector scan per call:
+  // selecting a range of N tiles was O(N^2) in document size. The checkbox
+  // lives in its tile, so an id with no rendered tile has no checkbox either.
   function applyTileState(id, on) {
     var tile = tileForId(id);
-    if (tile) {
-      if (on) tile.setAttribute("data-selected", "true");
-      else tile.removeAttribute("data-selected");
-    }
-    var cb = document.querySelector(
-      '.frame-select-cb[data-frame-id="' + id + '"]'
-    );
+    if (!tile) return;
+    if (on) tile.setAttribute("data-selected", "true");
+    else tile.removeAttribute("data-selected");
+    var cb = tile.querySelector(".frame-select-cb");
     if (cb) cb.checked = on;
   }
 
@@ -131,13 +137,41 @@
   }
 
   // The selection-bar markup, captured before any result swap replaces it, so a
-  // fresh selection can restore the action bar from its result state.
+  // fresh selection can restore the action bar from its result state. It is a
+  // snapshot of the server-rendered bar (never built from response data), which
+  // is why ensureSelectionBar's outerHTML sink is on the allowlist in
+  // tests/web/test_frontend_contracts.py.
   var selectionBarHTML = null;
+
+  // Whether the action bar is in its result state. A server-rendered bulk
+  // result is also recognised by a child marker: while an outerHTML swap
+  // settles, htmx gives the new #frames-action-bar the old bar's attributes
+  // (class included) for a moment, so a fresh result briefly looks like the
+  // selection bar (#122). Result bars built here in JS (offset, export) are
+  // never settled by htmx and carry only the class.
+  function resultMarker(bar) {
+    return bar ? bar.querySelector("[data-bulk-result]") : null;
+  }
+
+  function isResultBar(bar) {
+    return (
+      !!bar &&
+      (bar.classList.contains("frames-action-bar--result") || !!resultMarker(bar))
+    );
+  }
 
   function captureSelectionBar() {
     var bar = actionBar();
-    if (bar && !bar.classList.contains("frames-action-bar--result")) {
-      selectionBarHTML = bar.outerHTML;
+    if (bar && !isResultBar(bar)) {
+      // A button net.js disabled for an in-flight action (Export) must not be
+      // restored disabled with the snapshot.
+      var clone = bar.cloneNode(true);
+      clone.querySelectorAll("[data-tlm-busy]").forEach(function (el) {
+        el.removeAttribute("disabled");
+        el.removeAttribute("aria-busy");
+        el.removeAttribute("data-tlm-busy");
+      });
+      selectionBarHTML = clone.outerHTML;
     }
   }
 
@@ -145,7 +179,7 @@
   // Returns the (possibly replaced) bar element.
   function ensureSelectionBar() {
     var bar = actionBar();
-    if (bar && bar.classList.contains("frames-action-bar--result") && selectionBarHTML) {
+    if (bar && isResultBar(bar) && selectionBarHTML) {
       bar.outerHTML = selectionBarHTML;
       bar = actionBar();
     }
@@ -153,20 +187,29 @@
   }
 
   function updateBar() {
-    var has = selectedIds.size > 0 || inDescriptorMode();
     var bar = actionBar();
     if (!bar) return;
+    // A bulk response re-renders the affected tiles out of band, and their
+    // swap reaches here (via rehighlight) before htmx:afterSwap has processed
+    // the result bar from the same response. The selection is still set then,
+    // so the result bar would be swapped straight back to the selection bar:
+    // its result and Undo lost, and a Delete announced as failed (#122).
+    // Process a fresh result first; that clears the acted selection.
+    maybeProcessBulkResult();
+    bar = actionBar();
+    if (!bar) return;
+    var has = selectedIds.size > 0 || inDescriptorMode();
     // A new selection out of the result state restores the selection bar so its
     // action buttons (not the result's Undo/Retry) are what the user sees.
     if (has) bar = ensureSelectionBar();
     if (!bar) return;
     // Never hide a result bar on a clear-after-success — only the selection bar
     // collapses to empty; the result bar stays until dismissed or superseded.
-    if (!bar.classList.contains("frames-action-bar--result")) {
+    if (!isResultBar(bar)) {
       bar.hidden = !has;
     }
     var countEl = bar.querySelector(".selection-bar-count");
-    if (countEl && !bar.classList.contains("frames-action-bar--result")) {
+    if (countEl && !isResultBar(bar)) {
       countEl.textContent = has ? countText() : "";
     }
   }
@@ -328,7 +371,7 @@
     if (!e.target.closest("[data-selection-clear]")) return;
     e.preventDefault();
     var bar = actionBar();
-    if (bar && bar.classList.contains("frames-action-bar--result")) {
+    if (bar && isResultBar(bar)) {
       clearSelectionState();
       bar.hidden = true;
       announce();
@@ -346,12 +389,14 @@
       // In descriptor mode every tile in the grid is part of the selection
       // except those the user has deselected; re-apply that to whatever tiles
       // are now present (scroll append / jump may have brought in new ones).
-      var deselected = descriptor.deselected_ids;
+      var deselected = new Set(descriptor.deselected_ids);
       var cbs = checkboxes();
       for (var i = 0; i < cbs.length; i++) {
         var cid = idOf(cbs[i]);
-        var off = deselected.indexOf(parseInt(cid, 10)) !== -1;
-        applyTileState(cid, !off);
+        var want = !deselected.has(parseInt(cid, 10));
+        // A grid swap re-runs this over every loaded tile; skip the ones that
+        // already show the right state so only the new tiles are written.
+        if (cbs[i].checked !== want) applyTileState(cid, want);
       }
     } else {
       selectedIds.forEach(function (id) {
@@ -486,10 +531,12 @@
 
   // --- bulk actions --------------------------------------------------------
   // The action-bar buttons serialise the current selection into ONE bulk POST.
-  // The request rides htmx.ajax (never raw fetch) so the per-session CSRF token
-  // on <body hx-headers> is carried; we also pass it explicitly from the meta
-  // tag as a belt-and-braces guarantee. The result partial swaps the action bar
-  // (outerHTML) and re-renders affected tiles out-of-band.
+  // The request rides htmx.ajax (never raw fetch) so csrf.js adds the
+  // X-CSRF-Token header from the page's <meta name="csrf-token"> (read at
+  // request time, so a rotated token is used); we also pass it explicitly from
+  // the same meta tag as a belt-and-braces guarantee. The result partial swaps the action bar
+  // (outerHTML) and re-renders affected tiles out-of-band. One bulk request at a
+  // time: a second click while one is in flight is ignored (net.js).
   var BULK_URL = "/frames/bulk";
 
   function csrfToken() {
@@ -498,6 +545,12 @@
   }
 
   function announceResult(text, assertive) {
+    // A result supersedes a pending debounced selection-count announcement,
+    // which would otherwise overwrite it with "Selection cleared" (#122).
+    if (announceTimer) {
+      window.clearTimeout(announceTimer);
+      announceTimer = null;
+    }
     var region = document.getElementById("frame-action-status");
     if (!region) return;
     region.setAttribute("aria-live", assertive ? "assertive" : "polite");
@@ -522,17 +575,31 @@
 
   function sendBulk(values) {
     var bar = actionBar();
-    htmx
-      .ajax("POST", BULK_URL, {
-        source: bar || document.body,
-        target: "#frames-action-bar",
-        swap: "outerHTML",
-        headers: { "X-CSRF-Token": csrfToken() },
-        values: values,
-      })
-      .catch(function () {
-        announceResult("Bulk action failed to send.", true);
-      });
+    window.tlmExclusive("bulk", null, function () {
+      return htmx
+        .ajax("POST", BULK_URL, {
+          source: bar || document.body,
+          target: "#frames-action-bar",
+          swap: "outerHTML",
+          headers: { "X-CSRF-Token": csrfToken() },
+          values: values,
+        })
+        .then(
+          function () {
+            // htmx.ajax resolves on any HTTP status, and htmx does not swap an
+            // error response. A success always replaces the bar node with a
+            // result bar, so the same node still in place means it failed (the
+            // detailed toast comes from htmx-errors.js).
+            var now = actionBar();
+            if (!now || now === bar || !isResultBar(now)) {
+              announceResult("Action failed; nothing was changed.", true);
+            }
+          },
+          function () {
+            announceResult("Bulk action failed to send.", true);
+          }
+        );
+    });
   }
 
   // After the bulk result partial swaps into #frames-action-bar, reconcile the
@@ -579,8 +646,12 @@
   }
 
   // Delete is destructive: the first click arms an in-bar confirm, the second
-  // (the confirm button) fires. Any other interaction disarms it.
+  // (the confirm button) fires. Any other interaction disarms it. A confirm
+  // click that comes within DELETE_CONFIRM_DELAY_MS of arming is ignored, so
+  // a double click arms the confirm but cannot also fire it (#99).
+  var DELETE_CONFIRM_DELAY_MS = 500;
   var deleteArmed = false;
+  var deleteArmedAt = 0;
 
   function disarmDelete() {
     if (!deleteArmed) return;
@@ -594,6 +665,7 @@
 
   function armDelete() {
     deleteArmed = true;
+    deleteArmedAt = Date.now();
     var btn = document.querySelector('[data-bulk-action="delete"]');
     if (btn) {
       btn.textContent = "Confirm delete";
@@ -616,6 +688,8 @@
           armDelete();
           return;
         }
+        // The second click of a double click: stay armed, do not fire.
+        if (Date.now() - deleteArmedAt < DELETE_CONFIRM_DELAY_MS) return;
         disarmDelete();
       }
       if (inDescriptorMode()) postBulkDescriptor(op);
@@ -668,9 +742,13 @@
   function maybeProcessBulkResult() {
     var bar = actionBar();
     if (!bar) return;
-    if (!bar.classList.contains("frames-action-bar--result")) return;
-    if (bar.getAttribute("data-bulk-processed") === "1") return;
-    bar.setAttribute("data-bulk-processed", "1");
+    if (!isResultBar(bar)) return;
+    // The processed flag lives on the child marker when there is one: htmx's
+    // settle resets the bar's own attributes to the response's, which would
+    // drop it from the bar.
+    var marker = resultMarker(bar) || bar;
+    if (marker.getAttribute("data-bulk-processed") === "1") return;
+    marker.setAttribute("data-bulk-processed", "1");
     onBulkResultSwapped(bar);
   }
   document.body.addEventListener("htmx:afterSwap", maybeProcessBulkResult);
@@ -712,9 +790,13 @@
     return sign + parts.join(" ");
   }
 
+  // Wall-clock time in the viewer's zone (timezone.js), the zone the tiles
+  // show, not the browser's own zone (#70 F-R5).
   function fmtClock(epoch) {
     var d = new Date(epoch * 1000);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    var opts = { hour: "2-digit", minute: "2-digit" };
+    if (typeof window.tlmViewerTz === "function") opts.timeZone = window.tlmViewerTz();
+    return d.toLocaleTimeString([], opts);
   }
 
   function earliestVisibleSelectedEpoch() {
@@ -758,114 +840,185 @@
     if (b) b.setAttribute("aria-expanded", open ? "true" : "false");
   }
 
-  function urlencode(obj) {
-    return Object.keys(obj)
-      .map(function (k) {
-        return k + "=" + encodeURIComponent(obj[k]);
-      })
-      .join("&");
+  // --- guarded requests ------------------------------------------------------
+  // Every mutation below runs through net.js: tlmExclusive holds an action key
+  // (and disables its button) for the whole user action, so a double click runs
+  // it once; tlmRequest does the fetch, sends the Idempotency-Key the server
+  // replays on a repeat, and raises the error toast.
+  function req(key, opts) {
+    // Inner keys are unique per action, so a held key here means a stale
+    // request from an earlier action is still running; treat it as busy.
+    return (
+      window.tlmRequest(key, opts) ||
+      Promise.reject({ status: 0, detail: "busy", duplicate: true })
+    );
   }
 
-  function postForm(url, values) {
-    return fetch(url, {
-      method: "POST",
-      headers: {
-        "X-CSRF-Token": csrfToken(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: urlencode(values),
-    });
+  function failureText(err, fallback) {
+    return err && typeof err.detail === "string" && err.status ? err.detail : fallback;
   }
 
-  function postOffset(ids, secs) {
-    return postForm("/frames/offset", { frame_ids: ids, seconds: secs }).then(function (r) {
-      return r.json().then(function (j) {
-        return { ok: r.ok, j: j };
+  // --- result bar (built with DOM calls; no response text is parsed as HTML) --
+  function countSpan(text) {
+    var span = document.createElement("span");
+    span.className = "selection-bar-count";
+    span.textContent = text;
+    return span;
+  }
+
+  function dismissButton(extraAttr) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn btn-sm btn-ghost";
+    b.setAttribute("data-offset-dismiss", "");
+    if (extraAttr) b.setAttribute(extraAttr, "");
+    b.setAttribute("aria-label", "Dismiss");
+    b.textContent = "×";
+    return b;
+  }
+
+  function positiveIds(values) {
+    return (Array.isArray(values) ? values : [])
+      .map(Number)
+      .filter(function (n) {
+        return Number.isInteger(n) && n > 0;
       });
-    });
+  }
+
+  // Swap the action bar into its result state with the given children.
+  function showResultBar(children) {
+    captureSelectionBar();
+    var bar = actionBar();
+    if (!bar) return null;
+    bar.classList.add("frames-action-bar--result");
+    bar.removeAttribute("data-export-job");
+    bar.hidden = false;
+    bar.replaceChildren.apply(bar, children);
+    return bar;
   }
 
   function showOffsetResult(result) {
-    captureSelectionBar();
-    var bar = actionBar();
-    if (!bar || !result.undo) return;
-    bar.classList.add("frames-action-bar--result");
-    bar.hidden = false;
+    if (!result || !result.undo) return;
+    // A new result supersedes a running export's status (it continues on the
+    // server and is listed under Exports on the project's Frames tab).
+    endExport();
+    var shifted = Number(result.shifted) || 0;
+    var seconds = Number(result.seconds) || 0;
+    var skipped = Number(result.skipped_null) || 0;
     var msg =
-      result.shifted +
+      shifted +
       " frame" +
-      (result.shifted === 1 ? "" : "s") +
+      (shifted === 1 ? "" : "s") +
       " shifted " +
-      humanDur(result.seconds) +
-      (result.skipped_null ? " (" + result.skipped_null + " had no time)" : "");
-    bar.innerHTML =
-      '<span class="selection-bar-count">' +
-      msg +
-      "</span>" +
-      '<button type="button" class="btn btn-sm btn-secondary" data-offset-undo ' +
-      'data-frame-ids="' +
-      result.undo.frame_ids.join(",") +
-      '" data-seconds="' +
-      result.undo.seconds +
-      '">Undo</button>' +
-      '<button type="button" class="btn btn-sm btn-ghost" data-offset-dismiss ' +
-      'aria-label="Dismiss">×</button>';
+      humanDur(seconds) +
+      (skipped ? " (" + skipped + " had no time)" : "");
+
+    var undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "btn btn-sm btn-secondary";
+    undo.setAttribute("data-offset-undo", "");
+    undo.dataset.frameIds = positiveIds(result.undo.frame_ids).join(",");
+    undo.dataset.seconds = String(Number(result.undo.seconds) || 0);
+    undo.textContent = "Undo";
+
+    showResultBar([countSpan(msg), undo, dismissButton()]);
   }
 
+  // Leave the offset/export result state: restore the selection bar markup (so
+  // the next selection shows its action buttons, not the old result) and let
+  // updateBar hide it when nothing is selected.
   function dismissOffsetResult() {
     var bar = actionBar();
-    if (bar && bar.classList.contains("frames-action-bar--result")) {
-      bar.classList.remove("frames-action-bar--result");
-      bar.hidden = true;
+    if (bar && isResultBar(bar)) {
+      bar = ensureSelectionBar();
+      if (bar && isResultBar(bar)) {
+        // No snapshot to restore (the page opened in result state).
+        bar.classList.remove("frames-action-bar--result");
+        bar.hidden = true;
+        return;
+      }
+      updateBar();
     }
   }
 
-  function applyOffset() {
+  function materializedIds() {
+    if (!inDescriptorMode()) {
+      return Promise.resolve(window.frameSelection.ids().join(","));
+    }
+    return req("offset-materialize", {
+      url: "/frames/range/materialize",
+      method: "POST",
+      body: { descriptor: JSON.stringify(descriptor) },
+    }).then(function (j) {
+      return positiveIds(j && j.frame_ids).join(",");
+    });
+  }
+
+  function applyOffset(trigger) {
     var secs = offsetSeconds();
     if (!secs) {
       announceResult("Choose a non-zero shift.", true);
       return;
     }
-    var idsPromise;
-    if (inDescriptorMode()) {
-      idsPromise = postForm("/frames/range/materialize", {
-        descriptor: JSON.stringify(descriptor),
-      })
-        .then(function (r) {
-          return r.json();
+    // One key per user action: a retry of this same POST (by the browser or a
+    // racing tab) replays instead of shifting again.
+    var idempotencyKey = window.tlmIdempotencyKey();
+    window.tlmExclusive("offset", trigger, function () {
+      return materializedIds()
+        .then(function (ids) {
+          if (!ids) {
+            announceResult("No frames to shift.", true);
+            return null;
+          }
+          return req("offset-apply", {
+            url: "/frames/offset",
+            method: "POST",
+            body: { frame_ids: ids, seconds: secs },
+            idempotent: true,
+            idempotencyKey: idempotencyKey,
+          });
         })
         .then(function (j) {
-          return (j.frame_ids || []).join(",");
+          if (!j) return;
+          toggleOffsetPanel(false);
+          clearSelection();
+          showOffsetResult(j);
+          reloadGridWindow();
+          announceResult(
+            (Number(j.shifted) || 0) + " frames shifted " + humanDur(Number(j.seconds) || 0),
+            false
+          );
+        })
+        .catch(function (err) {
+          if (err && err.duplicate) return;
+          announceResult(failureText(err, "Offset failed to send."), true);
         });
-    } else {
-      idsPromise = Promise.resolve(window.frameSelection.ids().join(","));
-    }
-    idsPromise
-      .then(function (ids) {
-        if (!ids) {
-          announceResult("No frames to shift.", true);
-          return null;
-        }
-        return postOffset(ids, secs);
+    });
+  }
+
+  function undoOffset(btn) {
+    var ids = btn.getAttribute("data-frame-ids") || "";
+    var secs = btn.getAttribute("data-seconds") || "";
+    var idempotencyKey = window.tlmIdempotencyKey();
+    window.tlmExclusive("offset-undo", btn, function () {
+      return req("offset-undo-apply", {
+        url: "/frames/offset",
+        method: "POST",
+        body: { frame_ids: ids, seconds: secs },
+        idempotent: true,
+        idempotencyKey: idempotencyKey,
       })
-      .then(function (res) {
-        if (!res) return;
-        if (!res.ok) {
-          announceResult(res.j.error || "Offset failed.", true);
-          return;
-        }
-        toggleOffsetPanel(false);
-        clearSelection();
-        showOffsetResult(res.j);
-        reloadGridWindow();
-        announceResult(
-          res.j.shifted + " frames shifted " + humanDur(res.j.seconds),
-          false
-        );
-      })
-      .catch(function () {
-        announceResult("Offset failed to send.", true);
-      });
+        .then(function () {
+          announceResult("Offset undone.", false);
+          dismissOffsetResult();
+          reloadGridWindow();
+        })
+        .catch(function (err) {
+          // Keep the Undo bar so the user can try again.
+          if (err && err.duplicate) return;
+          announceResult(failureText(err, "Undo failed."), true);
+        });
+    });
   }
 
   document.body.addEventListener("click", function (e) {
@@ -880,25 +1033,21 @@
       toggleOffsetPanel(false);
       return;
     }
-    if (e.target.closest("[data-offset-apply]")) {
+    var apply = e.target.closest("[data-offset-apply]");
+    if (apply) {
       e.preventDefault();
-      applyOffset();
+      applyOffset(apply);
       return;
     }
     var undo = e.target.closest("[data-offset-undo]");
     if (undo) {
       e.preventDefault();
-      postOffset(undo.getAttribute("data-frame-ids"), undo.getAttribute("data-seconds")).then(
-        function (res) {
-          announceResult(res.ok ? "Offset undone." : res.j.error || "Undo failed.", !res.ok);
-          dismissOffsetResult();
-          reloadGridWindow();
-        }
-      );
+      undoOffset(undo);
       return;
     }
     if (e.target.closest("[data-offset-dismiss]")) {
       e.preventDefault();
+      if (e.target.closest("[data-export-dismiss]")) endExport();
       dismissOffsetResult();
       return;
     }
@@ -912,110 +1061,256 @@
 
   // --- bulk export (async zip) ---------------------------------------------
   // Export enqueues a background job that zips the selected frames. The action
-  // bar shows progress (polled every 2s) and, when ready, a download link. The
-  // job is JSON-driven (the routes return JSON, not partials), so the status UI
-  // is built here in the bar's result state.
-  var exportPoll = null;
+  // bar shows progress (polled every 2 s, one request at a time) and, when
+  // ready, a download link. The job is JSON-driven (the routes return JSON, not
+  // partials), so the status UI is built here in the bar's result state.
+  //
+  // The poll stops on a terminal status, after EXPORT_MAX_FAILURES consecutive
+  // failures, at once on 401/403/404, and after EXPORT_MAX_AGE_MS (the job keeps
+  // running on the server, listed under Exports on the project's Frames tab).
+  // The running job is kept in sessionStorage per project, so a reload resumes
+  // the poll.
+  var EXPORT_POLL_MS = 2000;
+  var EXPORT_POLL_TIMEOUT_MS = 10000;
+  var EXPORT_MAX_FAILURES = 3;
+  var EXPORT_MAX_AGE_MS = 30 * 60 * 1000;
+  var exportTimer = null;
+  var exportJob = null; // {jobId, startedAt, failures}
 
-  function stopExportPoll() {
-    if (exportPoll) {
-      window.clearInterval(exportPoll);
-      exportPoll = null;
+  function exportStorageKey() {
+    var pid = new URLSearchParams(window.location.search).get("project_id");
+    return "tlm.export." + (pid && /^\d+$/.test(pid) ? pid : "all");
+  }
+
+  function rememberExport(job) {
+    try {
+      window.sessionStorage.setItem(
+        exportStorageKey(),
+        JSON.stringify({ jobId: job.jobId, startedAt: job.startedAt })
+      );
+    } catch (e) {
+      /* storage disabled: the poll still runs, it just won't survive a reload */
     }
   }
 
-  function exportStatusHtml(state, jobId, progress) {
-    var dismiss =
-      '<button type="button" class="btn btn-sm btn-ghost" data-offset-dismiss ' +
-      'aria-label="Dismiss">×</button>';
+  function forgetExport() {
+    try {
+      window.sessionStorage.removeItem(exportStorageKey());
+    } catch (e) {
+      /* nothing stored */
+    }
+  }
+
+  function storedExport() {
+    try {
+      var raw = window.sessionStorage.getItem(exportStorageKey());
+      if (!raw) return null;
+      var j = JSON.parse(raw);
+      var jobId = Number(j && j.jobId);
+      var startedAt = Number(j && j.startedAt);
+      if (!Number.isInteger(jobId) || jobId <= 0 || !isFinite(startedAt)) return null;
+      return { jobId: jobId, startedAt: startedAt };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function stopExportPoll() {
+    if (exportTimer) {
+      window.clearTimeout(exportTimer);
+      exportTimer = null;
+    }
+    exportJob = null;
+  }
+
+  // Stop tracking the export entirely (terminal state, dismissed, superseded).
+  function endExport() {
+    stopExportPoll();
+    forgetExport();
+  }
+
+  function clampPercent(value) {
+    var n = Number(value);
+    if (!isFinite(n)) return 0;
+    return Math.min(100, Math.max(0, n));
+  }
+
+  var EXPORT_LABELS = {
+    failed: "Export failed",
+    stalled: "Export still running – see Exports on the project page",
+    lost: "Export status unavailable – see Exports on the project page",
+  };
+
+  function renderExportStatus(state, jobId, progress) {
+    var id = Number(jobId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    var children = [];
     if (state === "done") {
-      return (
-        '<span class="selection-bar-count">Export ready</span>' +
-        '<a class="btn btn-sm btn-secondary" download ' +
-        'href="/frames/export/' +
-        jobId +
-        '/download">Download zip</a>' +
-        dismiss
-      );
+      children.push(countSpan("Export ready"));
+      var link = document.createElement("a");
+      link.className = "btn btn-sm btn-secondary";
+      link.setAttribute("download", "");
+      link.href = "/frames/export/" + id + "/download";
+      link.textContent = "Download zip";
+      children.push(link);
+    } else if (EXPORT_LABELS[state]) {
+      children.push(countSpan(EXPORT_LABELS[state]));
+    } else {
+      children.push(countSpan("Preparing export…"));
+      var track = document.createElement("span");
+      track.className = "progress-bar export-progress";
+      var fill = document.createElement("span");
+      fill.className = "progress-fill";
+      fill.style.width = clampPercent(progress) + "%";
+      track.appendChild(fill);
+      children.push(track);
     }
-    if (state === "failed") {
-      return '<span class="selection-bar-count">Export failed</span>' + dismiss;
+    children.push(dismissButton("data-export-dismiss"));
+    var bar = showResultBar(children);
+    if (bar) bar.setAttribute("data-export-job", String(id));
+  }
+
+  // The bar still shows this export (no other result or selection replaced it).
+  function exportBarIsCurrent(jobId) {
+    var bar = actionBar();
+    return !!bar && bar.getAttribute("data-export-job") === String(jobId);
+  }
+
+  function scheduleExportPoll() {
+    exportTimer = window.setTimeout(pollExport, EXPORT_POLL_MS);
+  }
+
+  function stopWithStatus(job, state, message, toastKind) {
+    endExport();
+    renderExportStatus(state, job.jobId);
+    announceResult(message, true);
+    if (toastKind && typeof window.tlmToast === "function") {
+      window.tlmToast(message, { kind: toastKind });
     }
-    return (
-      '<span class="selection-bar-count">Preparing export…</span>' +
-      '<span class="progress-bar export-progress"><span class="progress-fill" ' +
-      'style="width:' +
-      (progress || 0) +
-      '%"></span></span>' +
-      dismiss
+  }
+
+  var EXPORT_STOP_MESSAGES = {
+    401: "Your session has ended. Sign in again to check the export.",
+    403: "You no longer have permission to check this export.",
+    404: "That export no longer exists.",
+  };
+
+  function pollExport() {
+    exportTimer = null;
+    var job = exportJob;
+    if (!job) return;
+    if (!exportBarIsCurrent(job.jobId)) {
+      // The user moved on (a new selection or result replaced the bar). The job
+      // keeps running on the server and is listed on the project's Frames tab.
+      endExport();
+      return;
+    }
+    var pending = req("export-poll", {
+      url: "/frames/export/" + job.jobId,
+      passive: true,
+      quiet: true,
+      timeoutMs: EXPORT_POLL_TIMEOUT_MS,
+    });
+    pending.then(
+      function (j) {
+        if (exportJob !== job) return; // stopped or replaced meanwhile
+        job.failures = 0;
+        var status = j && j.status;
+        if (status === "done") {
+          endExport();
+          renderExportStatus("done", job.jobId);
+          announceResult("Export ready to download.", false);
+        } else if (status === "failed") {
+          endExport();
+          renderExportStatus("failed", job.jobId);
+          announceResult("Export failed.", true);
+        } else if (Date.now() - job.startedAt >= EXPORT_MAX_AGE_MS) {
+          stopWithStatus(
+            job,
+            "stalled",
+            "Export still running. See Exports on the project page.",
+            null
+          );
+        } else {
+          renderExportStatus(status || "pending", job.jobId, j && j.progress);
+          scheduleExportPoll();
+        }
+      },
+      function (err) {
+        if (exportJob !== job) return;
+        var status = err && err.status;
+        if (EXPORT_STOP_MESSAGES[status]) {
+          stopWithStatus(job, "lost", EXPORT_STOP_MESSAGES[status], "error");
+          return;
+        }
+        job.failures += 1;
+        if (job.failures >= EXPORT_MAX_FAILURES) {
+          stopWithStatus(
+            job,
+            "lost",
+            "Export status unavailable. See Exports on the project page.",
+            "error"
+          );
+          return;
+        }
+        scheduleExportPoll();
+      }
     );
   }
 
-  function showExportStatus(html) {
-    captureSelectionBar();
-    var bar = actionBar();
-    if (!bar) return;
-    bar.classList.add("frames-action-bar--result");
-    bar.hidden = false;
-    bar.innerHTML = html;
+  function beginExportPoll(jobId, startedAt) {
+    stopExportPoll();
+    exportJob = { jobId: jobId, startedAt: startedAt, failures: 0 };
+    rememberExport(exportJob);
+    renderExportStatus("pending", jobId, 0);
+    scheduleExportPoll();
   }
 
-  function pollExport(jobId) {
-    fetch("/frames/export/" + jobId)
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (j) {
-        if (j.status === "done") {
-          stopExportPoll();
-          showExportStatus(exportStatusHtml("done", jobId));
-          announceResult("Export ready to download.", false);
-        } else if (j.status === "failed") {
-          stopExportPoll();
-          showExportStatus(exportStatusHtml("failed", jobId));
-          announceResult("Export failed.", true);
-        } else {
-          showExportStatus(exportStatusHtml(j.status, jobId, j.progress));
-        }
-      })
-      .catch(function () {});
+  // After a reload: pick the stored export back up (the first poll settles a
+  // job that finished, failed or went away while the page was gone).
+  function resumeExport() {
+    var stored = storedExport();
+    if (!stored || !actionBar()) return;
+    beginExportPoll(stored.jobId, stored.startedAt);
   }
 
-  function startExport() {
+  function startExport(trigger) {
     var values = inDescriptorMode()
       ? { descriptor: JSON.stringify(descriptor) }
       : { frame_ids: window.frameSelection.ids().join(",") };
     if (!inDescriptorMode() && !values.frame_ids) return;
-    postForm("/frames/export", values)
-      .then(function (r) {
-        return r.json().then(function (j) {
-          return { ok: r.ok, j: j };
+    var idempotencyKey = window.tlmIdempotencyKey();
+    window.tlmExclusive("export", trigger, function () {
+      return req("export-start", {
+        url: "/frames/export",
+        method: "POST",
+        body: values,
+        idempotent: true,
+        idempotencyKey: idempotencyKey,
+      })
+        .then(function (j) {
+          var jobId = Number(j && j.job_id);
+          if (!Number.isInteger(jobId) || jobId <= 0) {
+            announceResult("Export failed to start.", true);
+            return;
+          }
+          clearSelection();
+          beginExportPoll(jobId, Date.now());
+          announceResult("Preparing export…", false);
+        })
+        .catch(function (err) {
+          if (err && err.duplicate) return;
+          announceResult(failureText(err, "Export failed to send."), true);
         });
-      })
-      .then(function (res) {
-        if (!res.ok) {
-          announceResult(res.j.error || "Export failed to start.", true);
-          return;
-        }
-        var jobId = res.j.job_id;
-        clearSelection();
-        showExportStatus(exportStatusHtml("pending", jobId, 0));
-        announceResult("Preparing export…", false);
-        stopExportPoll();
-        exportPoll = window.setInterval(function () {
-          pollExport(jobId);
-        }, 2000);
-      })
-      .catch(function () {
-        announceResult("Export failed to send.", true);
-      });
+    });
   }
 
   document.body.addEventListener("click", function (e) {
     if (!e.target || typeof e.target.closest !== "function") return;
-    if (e.target.closest("[data-export-action]")) {
+    var exportBtn = e.target.closest("[data-export-action]");
+    if (exportBtn) {
       e.preventDefault();
-      startExport();
+      startExport(exportBtn);
     }
   });
 
@@ -1078,29 +1373,20 @@
       deselected_ids: [],
     };
     if (scope === "in_range") upgraded.time_range = descriptor.time_range;
-    var body =
-      "descriptor=" +
-      encodeURIComponent(JSON.stringify(upgraded)) +
-      "&csrf_token=" +
-      encodeURIComponent(csrfToken());
-    fetch("/frames/range/count", {
+    // Shares the scrubber's "range-count" key: the newest count wins and an
+    // older one still in flight is aborted, so a stale estimate never lands.
+    req("range-count", {
+      url: "/frames/range/count",
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-CSRF-Token": csrfToken(),
-        "HX-Request": "true",
-      },
-      body: body,
+      body: { descriptor: JSON.stringify(upgraded) },
+      supersede: true,
     })
-      .then(function (r) {
-        return r.ok ? r.json() : null;
-      })
       .then(function (data) {
         if (!data || typeof data.count !== "number") return;
         setDescriptor(upgraded, data.count, label);
       })
       .catch(function () {
-        /* leave the current descriptor in place on a failed re-count */
+        /* leave the current descriptor in place; net.js showed the error */
       });
   }
 
@@ -1158,6 +1444,7 @@
     captureSelectionBar();
     rehighlight();
     refresh();
+    resumeExport();
   }
 
   if (document.readyState === "loading") {

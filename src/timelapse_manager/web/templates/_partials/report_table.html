@@ -1,0 +1,116 @@
+{#
+  Partial: report_table.html -- Settings > Problem reports (#8). Admin-only.
+
+  Loaded into the Settings tab by HTMX and rendered inside the full page
+  (/settings/reports). Every row action re-renders this fragment (root
+  id="report-admin", outerHTML) so the delivery badges refresh.
+
+  Context:
+    reports           -- Report rows, newest first
+    destinations      -- the configured optional destinations
+    gitea_configured  -- whether "Create issue" is offered
+    areas             -- {value: label}
+    notice            -- an acknowledgement for the last action, or None
+#}
+{% set delivery_labels = {"local": "Saved", "email": "Email", "webhook": "Webhook", "gitea": "Issue"} %}
+{% set status_classes = {"ok": "running", "failed": "error", "pending": "paused"} %}
+<div id="report-admin">
+
+  {% if notice %}
+  <div class="alert info" role="status" style="margin-bottom:var(--sp-4);">
+    <div class="alert-body">{{ notice }}</div>
+  </div>
+  {% endif %}
+
+  <p class="form-hint" style="margin-bottom:var(--sp-4);">
+    Reports are kept on this server under the state directory and pruned by
+    retention. Delivery:
+    {% if destinations %}{{ destinations | map("capitalize") | join(", ") }}{% else %}local only{% endif %}.
+  </p>
+
+  <div id="confirm-slot"></div>
+
+  {% if reports %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th scope="col">Report</th>
+        <th scope="col">Title</th>
+        <th scope="col">Filed by</th>
+        <th scope="col">Area</th>
+        <th scope="col">Filed</th>
+        <th scope="col">Delivery</th>
+        <th scope="col"><span class="visually-hidden">Actions</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for report in reports %}
+      {% set deliveries = report.deliveries or {} %}
+      <tr id="report-row-{{ report.id }}">
+        <td class="mono">{{ report.report_key }}</td>
+        <td>
+          {{ report.title }}
+          {% if report.anonymized %}<span class="status-badge stopped" title="Filed anonymized: the stored zip, title and description are the anonymized ones.">Anonymized</span>{% endif %}
+          {% if report.gitea_issue_url %}
+          <div class="form-hint"><a href="{{ report.gitea_issue_url }}" rel="noopener noreferrer" target="_blank">Issue #{{ report.gitea_issue_number }}</a></div>
+          {% endif %}
+        </td>
+        <td class="mono">{{ report.username or "unknown" }}{% if report.anonymized and report.user_id %} <span class="form-hint">(user #{{ report.user_id }})</span>{% endif %}</td>
+        <td>{{ areas.get(report.area, report.area) }}{% if report.project_id %} <span class="mono">#{{ report.project_id }}</span>{% endif %}</td>
+        <td class="mono">{{ report.created_at | localdt }}</td>
+        <td>
+          {% for name, entry in deliveries.items() %}
+          <span class="status-badge {{ status_classes.get(entry.status, 'stopped') }}"
+                {% if entry.error %}title="{{ entry.error }}"{% endif %}>
+            {{ delivery_labels.get(name, name) }}: {{ entry.status }}
+          </span>
+          {% if entry.error %}<div class="form-hint">{{ delivery_labels.get(name, name) }}: {{ entry.error }}</div>{% endif %}
+          {% endfor %}
+        </td>
+        <td style="text-align:right;">
+          <div class="row-actions-menu">
+            <button type="button" class="btn btn-ghost btn-sm row-actions-trigger"
+                    aria-haspopup="menu" aria-label="Actions for {{ report.report_key }}">&#8943;</button>
+            <div class="row-actions-popover" role="menu">
+              {% if report.zip_path %}
+              <a role="menuitem" href="/settings/reports/{{ report.report_key }}/download">Download</a>
+              {% endif %}
+              {% if destinations and report.zip_path %}
+              <form method="post" action="/settings/reports/{{ report.report_key }}/resend"
+                    hx-post="/settings/reports/{{ report.report_key }}/resend"
+                    hx-target="#report-admin" hx-swap="outerHTML"
+                    style="margin:0;padding:var(--sp-2) var(--sp-3) 0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label class="visually-hidden" for="resend-{{ report.id }}">Resend to</label>
+                <select id="resend-{{ report.id }}" name="destination" class="form-control">
+                  <option value="all">All destinations</option>
+                  {% for name in destinations %}
+                  <option value="{{ name }}">{{ delivery_labels.get(name, name) }}</option>
+                  {% endfor %}
+                </select>
+                <button type="submit" role="menuitem">Resend</button>
+              </form>
+              {% endif %}
+              {% if gitea_configured and not report.gitea_issue_number %}
+              <form method="post" action="/settings/reports/{{ report.report_key }}/create-issue"
+                    hx-post="/settings/reports/{{ report.report_key }}/create-issue"
+                    hx-target="#report-admin" hx-swap="outerHTML" style="margin:0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" role="menuitem">Create issue</button>
+              </form>
+              {% endif %}
+              <a role="menuitem" class="danger"
+                 href="/settings/reports/{{ report.report_key }}/delete-confirm"
+                 hx-get="/settings/reports/{{ report.report_key }}/delete-confirm"
+                 hx-target="#confirm-slot" hx-swap="innerHTML">Delete</a>
+            </div>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="form-hint">No problem reports have been filed.</p>
+  {% endif %}
+</div>

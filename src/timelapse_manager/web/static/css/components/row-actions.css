@@ -45,3 +45,11 @@
 .row-actions-popover .danger {
   color: var(--color-error);
 }
+
+/* Under 600px the Actions cell is sticky (responsive.css), which makes each row's
+   cell its own stacking context: raise the one holding the open menu so a later
+   row's sticky cell does not paint over the popover. */
+.data-table td:has(> .row-actions-menu:hover),
+.data-table td:has(> .row-actions-menu:focus-within) {
+  z-index: 2;
+}

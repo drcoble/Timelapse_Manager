@@ -26,10 +26,10 @@
    The backend uses exact_time_present to distinguish "fieldset absent" from
    "fieldset present but empty".
 
-   Inline-script pattern mirrors capture_schedule_fields.html: a hidden
-   <template> row is cloned by tlmExactTimeAddRow(); kind reveal is handled by
-   tlmExactTimeKindChange(). Both are exposed on window so inline onchange=/
-   onclick= handlers can reach them.
+   Behaviour lives in static/js/project-forms.js, reached through data-action
+   (actions.js): a hidden <template> row is cloned by `exact-add`, a row is
+   dropped by `exact-remove`, and the kind <select> (`exact-kind`) shows or
+   hides the clock time. A new row's checkbox value is stamped "new:<index>".
 #}
 
 {# Presence marker — emitted once whenever this partial renders. #}
@@ -104,7 +104,7 @@
             <select id="{{ _row_uid }}-kind"
                     name="anchor_kind"
                     class="form-control"
-                    onchange="tlmExactTimeKindChange(this);"
+                    data-action="exact-kind"
                     {% if not camera_has_geolocation %}aria-describedby="{{ _row_uid }}-kind-desc"{% endif %}>
               <option value="clock"
                       {% if _kind == 'clock' %}selected{% endif %}>Clock time</option>
@@ -191,7 +191,7 @@
             <button type="button"
                     class="btn btn-ghost btn-sm"
                     aria-label="Remove this capture time"
-                    onclick="tlmExactTimeRemoveRow(this);">
+                    data-action="exact-remove">
               &times; Remove
             </button>
           </div>
@@ -215,14 +215,14 @@
   <div style="margin-top:var(--sp-3);">
     <button type="button"
             class="btn btn-secondary btn-sm"
-            onclick="tlmExactTimeAddRow();">
+            data-action="exact-add">
       &#43; Add capture time
     </button>
   </div>
 
 </fieldset>
 
-{# ── Hidden template row — cloned by tlmExactTimeAddRow() ───────────────────
+{# ── Hidden template row — cloned by the `exact-add` action ───────────────────
    All name attributes are present so the server receives them in the POST.
    anchor_id is blank (new row). anchor_enabled value uses "new:<idx>" pattern.
    The template element is inert and never submitted itself. #}
@@ -241,7 +241,7 @@
              style="font-size:var(--text-sm);">Type</label>
       <select name="anchor_kind"
               class="form-control"
-              onchange="tlmExactTimeKindChange(this);"
+              data-action="exact-kind"
               aria-label="Capture type">
         <option value="clock" selected>Clock time</option>
         <option value="solar_noon"
@@ -300,124 +300,10 @@
       <button type="button"
               class="btn btn-ghost btn-sm"
               aria-label="Remove this capture time"
-              onclick="tlmExactTimeRemoveRow(this);">
+              data-action="exact-remove">
         &times; Remove
       </button>
     </div>
 
   </div>
 </template>
-
-{# ── Inline controller ────────────────────────────────────────────────────────
-   Mirrors the inline-script pattern in capture_schedule_fields.html:
-   functions exposed on window so inline onchange=/onclick= can reach them.
-
-   tlmExactTimeAddRow():
-     - Counts existing .exact-time-row elements to build the "new:<idx>" value.
-     - Clones #exact-time-row-template, stamps the checkbox value, appends
-       to #exact-time-rows, and hides the empty-state paragraph.
-     - Assigns unique id/for pairs to all labelled inputs in the new row.
-
-   tlmExactTimeKindChange(selectEl):
-     - Finds the sibling time-input <div> and toggles its [hidden] attribute.
-     - When kind = solar_noon, clears anchor_time to "" so it POSTs blank
-       (keeping lists aligned). When switching back to clock, the field is
-       unhidden but left blank for the user to fill.
-
-   tlmExactTimeRemoveRow(buttonEl):
-     - Removes the nearest .exact-time-row ancestor.
-     - Renumbers all remaining new-row checkbox values ("new:0", "new:1", …)
-       to keep them contiguous.
-     - Shows the empty-state paragraph if no rows remain.
-#}
-<script>
-(function () {
-
-  /* ── Kind reveal ─────────────────────────────────────────────────────── */
-  function tlmExactTimeKindChange(selectEl) {
-    var row       = selectEl.closest('.exact-time-row');
-    if (!row) return;
-    var timeGroup = row.querySelector('[data-time-group]');
-    var timeInput = row.querySelector('input[name="anchor_time"]');
-    if (!timeGroup || !timeInput) return;
-    var isSolar = (selectEl.value === 'solar_noon'
-                   || selectEl.value === 'sunrise'
-                   || selectEl.value === 'sunset');
-    timeGroup.hidden = isSolar;
-    if (isSolar) { timeInput.value = ''; }
-  }
-
-  /* ── Add row ─────────────────────────────────────────────────────────── */
-  function tlmExactTimeAddRow() {
-    var container = document.getElementById('exact-time-rows');
-    var template  = document.getElementById('exact-time-row-template');
-    var emptyMsg  = document.getElementById('exact-time-empty-state');
-    if (!container || !template) return;
-
-    /* Count all rows (existing + previously added) for the index. */
-    var existingRows = container.querySelectorAll('.exact-time-row');
-    var newIdx = existingRows.length;
-
-    /* Clone the template content (DocumentFragment → first element child). */
-    var fragment = template.content.cloneNode(true);
-    var row      = fragment.querySelector('.exact-time-row');
-
-    /* Stamp the checkbox value with "new:<index>". */
-    var chk = row.querySelector('input[name="anchor_enabled"]');
-    if (chk) { chk.value = 'new:' + newIdx; }
-
-    /* Assign unique id/for pairs so labels are correctly associated. */
-    var uid = 'anchor-row-new-' + newIdx;
-    var kindSelect  = row.querySelector('select[name="anchor_kind"]');
-    var timeInput   = row.querySelector('input[name="anchor_time"]');
-    var offsetInput = row.querySelector('input[name="anchor_offset"]');
-
-    if (kindSelect)  { kindSelect.id  = uid + '-kind';   }
-    if (timeInput)   { timeInput.id   = uid + '-time';   }
-    if (offsetInput) { offsetInput.id = uid + '-offset'; }
-
-    /* Update for= on labels to match the new ids. */
-    row.querySelectorAll('label.form-label').forEach(function (lbl) {
-      var ctrl = lbl.closest('.form-group').querySelector('[id]');
-      if (ctrl) { lbl.setAttribute('for', ctrl.id); }
-    });
-
-    container.appendChild(fragment);
-
-    /* Hide the empty-state message once we have at least one row. */
-    if (emptyMsg) { emptyMsg.hidden = true; }
-  }
-
-  /* ── Remove row ──────────────────────────────────────────────────────── */
-  function tlmExactTimeRemoveRow(buttonEl) {
-    var row       = buttonEl.closest('.exact-time-row');
-    var container = document.getElementById('exact-time-rows');
-    var emptyMsg  = document.getElementById('exact-time-empty-state');
-    if (!row || !container) return;
-
-    container.removeChild(row);
-
-    /* Renumber checkbox values for all remaining new-row entries so indices
-       stay contiguous and predictable for the server. Existing rows (whose
-       checkbox value is a numeric DB id) are left untouched. */
-    var newRowIdx = 0;
-    container.querySelectorAll('.exact-time-row').forEach(function (r) {
-      var chk = r.querySelector('input[name="anchor_enabled"]');
-      if (chk && chk.value.indexOf('new:') === 0) {
-        chk.value = 'new:' + newRowIdx;
-        newRowIdx++;
-      }
-    });
-
-    /* Show the empty-state message when no rows remain. */
-    var remaining = container.querySelectorAll('.exact-time-row');
-    if (emptyMsg && remaining.length === 0) { emptyMsg.hidden = false; }
-  }
-
-  /* Expose on window so inline onchange=/onclick= handlers can reach them. */
-  window.tlmExactTimeKindChange = tlmExactTimeKindChange;
-  window.tlmExactTimeAddRow     = tlmExactTimeAddRow;
-  window.tlmExactTimeRemoveRow  = tlmExactTimeRemoveRow;
-
-}());
-</script>

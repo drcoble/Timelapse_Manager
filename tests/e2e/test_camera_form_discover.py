@@ -106,7 +106,9 @@ class TestDiscoverModal:
         )
         page.keyboard.press("Escape")  # type: ignore[union-attr]
         page.wait_for_selector(  # type: ignore[union-attr]
-            "#discover-modal[aria-hidden='true']", timeout=10000
+            "#discover-modal[aria-hidden='true']",
+            state="attached",  # a closed modal is visibility: hidden (#277)
+            timeout=10000,
         )
         assert (
             page.locator("#discover-modal").get_attribute(  # type: ignore[union-attr]
@@ -129,7 +131,9 @@ class TestDiscoverModal:
             ".modal-backdrop", position={"x": 5, "y": 5}
         )
         page.wait_for_selector(  # type: ignore[union-attr]
-            "#discover-modal[aria-hidden='true']", timeout=10000
+            "#discover-modal[aria-hidden='true']",
+            state="attached",  # a closed modal is visibility: hidden (#277)
+            timeout=10000,
         )
         assert (
             page.locator("#discover-modal").get_attribute(  # type: ignore[union-attr]

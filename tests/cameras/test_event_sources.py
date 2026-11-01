@@ -11,16 +11,22 @@ CameraEvent contract, not the wire bytes (those are covered elsewhere).
 from __future__ import annotations
 
 import asyncio
+import re
+import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+from timelapse_manager.cameras import onvif
 from timelapse_manager.cameras.base import (
     CameraEvent,
     EventNotSupportedError,
     OtherCaptureError,
+    TimeoutCaptureError,
 )
 from timelapse_manager.cameras.onvif import OnvifAdapter
 from timelapse_manager.capture.event_listener import EventListenerFactory
@@ -70,12 +76,27 @@ def _response(text: str) -> MagicMock:
     return resp
 
 
+def _post_client(fake_post: Any) -> httpx.AsyncClient:
+    """Return a real httpx client whose transport answers through ``fake_post``.
+
+    ``fake_post(url, content=..., **kwargs)`` returns an object with
+    ``status_code`` and ``text``, as the tests' stand-ins do. A real client over
+    a mock transport keeps the adapter's streamed, size-capped read in the path.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        canned = await fake_post(str(request.url), content=request.content.decode())
+        return httpx.Response(canned.status_code, text=canned.text)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
 @pytest.fixture(autouse=True)
 def _stub_ssrf_context() -> Any:
     """Stub the runtime context so the event SSRF guard resolves without an app.
 
     The guard reads ``get_context().settings.ssrf.allowed_private_subnets`` and
-    calls ``assert_allowed_url``; both are patched so the source logic is tested
+    calls ``check_camera_url_async``; both are patched so the source logic is tested
     without standing up the application context or doing DNS.
     """
     ctx = SimpleNamespace(
@@ -84,11 +105,11 @@ def _stub_ssrf_context() -> Any:
     with (
         patch("timelapse_manager.runtime.get_context", return_value=ctx),
         patch(
-            "timelapse_manager.cameras.onvif.assert_allowed_url",
+            "timelapse_manager.cameras.onvif.check_camera_url_async",
             side_effect=lambda url, **_: url,
         ),
         patch(
-            "timelapse_manager.cameras.vapix.assert_allowed_url",
+            "timelapse_manager.cameras.vapix.check_camera_url_async",
             side_effect=lambda url, **_: url,
         ),
     ):
@@ -112,8 +133,7 @@ async def test_onvif_pullpoint_yields_and_unsubscribes() -> None:
             return _response(_UNSUBSCRIBE_RESPONSE)
         return _response("<s:Envelope/>")
 
-    client = MagicMock()
-    client.post = AsyncMock(side_effect=fake_post)
+    client = _post_client(fake_post)
     adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
 
     source = adapter.open_event_source()
@@ -137,8 +157,8 @@ async def test_onvif_pullpoint_subscribe_pull_yield_echoes_reference() -> None:
 
     async def fake_post(url: str, **kwargs: Any) -> MagicMock:
         body = kwargs.get("content", "")
-        if "GetServices" in body:
-            return _response("<s:Envelope/>")  # resolve events URL -> fallback
+        if "GetServices" in body or "GetSystemDateAndTime" in body:
+            return _response("<s:Envelope/>")  # events URL -> fallback; clock: none
         if "CreatePullPointSubscription" in body:
             sent.append("create")
             return _response(_CREATE_RESPONSE)
@@ -149,8 +169,7 @@ async def test_onvif_pullpoint_subscribe_pull_yield_echoes_reference() -> None:
         sent.append("unsubscribe")
         return _response(_UNSUBSCRIBE_RESPONSE)
 
-    client = MagicMock()
-    client.post = AsyncMock(side_effect=fake_post)
+    client = _post_client(fake_post)
     adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
 
     source = adapter.open_event_source()
@@ -188,8 +207,7 @@ async def test_onvif_pullpoint_unsubscribes_on_task_cancellation() -> None:
             return _response(_UNSUBSCRIBE_RESPONSE)
         return _response("<s:Envelope/>")
 
-    client = MagicMock()
-    client.post = AsyncMock(side_effect=fake_post)
+    client = _post_client(fake_post)
     adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
 
     async def consume() -> None:
@@ -204,9 +222,55 @@ async def test_onvif_pullpoint_unsubscribes_on_task_cancellation() -> None:
     assert "unsubscribe" in posts  # teardown released the subscription
 
 
+async def test_onvif_pullpoint_watchdog_resubscribes_on_wedged_pull() -> None:
+    # A PullMessages cycle that never completes (a half-open / wedged camera, or a
+    # slow trickle that defeats httpx's per-read timeout) must not hang the
+    # listener forever. The idle watchdog bounds the cycle and raises out of the
+    # generator. That raise IS the re-subscribe trigger: the supervisor's listener
+    # catches any source exception and re-subscribes after backoff. Here we assert
+    # the trigger fires (the typed, watchdog-attributed error) -- not the loop.
+    posts: list[str] = []
+
+    async def fake_post(url: str, **kwargs: Any) -> MagicMock:
+        body = kwargs.get("content", "")
+        if "CreatePullPointSubscription" in body:
+            posts.append("create")
+            return _response(_CREATE_RESPONSE)
+        if "PullMessages" in body:
+            posts.append("pull")
+            # Wedged long-poll: the cycle never completes. The stub AsyncMock
+            # ignores the timeout kwarg, so only the watchdog can interrupt this --
+            # proving the raise is the watchdog's, not httpx's.
+            await asyncio.sleep(2.0)
+            return _response(_PULL_RESPONSE)  # pragma: no cover - watchdog fires
+        # Teardown Unsubscribe returns immediately so the finally never stalls.
+        posts.append("unsubscribe")
+        return _response(_UNSUBSCRIBE_RESPONSE)
+
+    client = _post_client(fake_post)
+    adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
+
+    with patch(
+        "timelapse_manager.cameras.onvif._resolve_watchdog_seconds",
+        return_value=0.05,
+    ):
+        source = adapter.open_event_source()
+        with pytest.raises(TimeoutCaptureError) as excinfo:
+            await source.__anext__()
+        await source.aclose()
+
+    # The error is attributed to the watchdog (not some other timeout) and is in
+    # the CaptureError family the supervisor's listener catches to re-subscribe.
+    assert "pull cycle did not complete" in str(excinfo.value)
+    # The watchdog fired only after a subscription was up and a pull attempted,
+    # and teardown still released the subscription.
+    assert "create" in posts
+    assert "pull" in posts
+    assert "unsubscribe" in posts
+
+
 async def test_onvif_pullpoint_raises_without_subscription_reference() -> None:
-    client = MagicMock()
-    client.post = AsyncMock(return_value=_response("<s:Envelope/>"))
+    client = _post_client(AsyncMock(return_value=_response("<s:Envelope/>")))
     adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
     source = adapter.open_event_source()
     with pytest.raises(OtherCaptureError):  # no subscription reference returned
@@ -440,3 +504,203 @@ async def test_factory_vapix_does_not_fall_back_after_first_event() -> None:
 
     assert len(collected) == 1  # the one event before the drop was delivered
     onvif_adapter.open_event_source.assert_not_called()  # no downgrade to PullPoint
+
+
+# -- Camera clock offset, minimum pull cycle, bounded teardown (#69 CAM-R9/R14) -
+
+
+def _system_time_response(when: Any) -> str:
+    return f"""<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+  xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body><tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>
+    <tt:DateTimeType>NTP</tt:DateTimeType>
+    <tt:UTCDateTime>
+      <tt:Time><tt:Hour>{when.hour}</tt:Hour><tt:Minute>{when.minute}</tt:Minute>
+        <tt:Second>{when.second}</tt:Second></tt:Time>
+      <tt:Date><tt:Year>{when.year}</tt:Year><tt:Month>{when.month}</tt:Month>
+        <tt:Day>{when.day}</tt:Day></tt:Date>
+    </tt:UTCDateTime>
+  </tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse></s:Body></s:Envelope>"""
+
+
+def _created_of(body: str) -> datetime:
+    match = re.search(r"<wsu:Created>([^<]+)</wsu:Created>", body)
+    assert match is not None, "the request carried no WS-Security token"
+    return datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+class _ClockCamera:
+    """A fake camera whose clock is ``skew`` seconds ahead of ours."""
+
+    def __init__(self, skew: float) -> None:
+        self.skew = timedelta(seconds=skew)
+        self.requests: list[tuple[str, str]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> MagicMock:
+        body = kwargs.get("content", "")
+        if "GetSystemDateAndTime" in body:
+            self.requests.append(("time", body))
+            return _response(_system_time_response(datetime.now(UTC) + self.skew))
+        if "GetServices" in body:
+            return _response("<s:Envelope/>")
+        if "CreatePullPointSubscription" in body:
+            self.requests.append(("create", body))
+            return _response(_CREATE_RESPONSE)
+        if "PullMessages" in body:
+            self.requests.append(("pull", body))
+            return _response(_PULL_RESPONSE)
+        self.requests.append(("unsubscribe", body))
+        return _response(_UNSUBSCRIBE_RESPONSE)
+
+
+async def test_onvif_security_header_carries_the_cameras_clock() -> None:
+    camera = _ClockCamera(skew=30)
+    client = _post_client(camera.post)
+    adapter = OnvifAdapter(client, "10.0.0.5", credentials=("u", "p"))
+
+    source = adapter.open_event_source()
+    await source.__anext__()
+    await source.aclose()
+
+    time_request = next(body for kind, body in camera.requests if kind == "time")
+    # The clock itself is asked for without credentials: it is how the offset is
+    # learned, and most firmware answers it unauthenticated.
+    assert "wsse:Security" not in time_request
+    created = _created_of(next(b for k, b in camera.requests if k == "create"))
+    shift = (created - datetime.now(UTC)).total_seconds()
+    assert 27 <= shift <= 33
+
+
+async def test_onvif_clock_offset_is_measured_once_per_session() -> None:
+    from timelapse_manager.capture.camera_sessions import TtlCache
+
+    camera = _ClockCamera(skew=-45)
+    client = _post_client(camera.post)
+    cache = TtlCache()
+    for _ in range(2):
+        adapter = OnvifAdapter(
+            client, "10.0.0.5", credentials=("u", "p"), uri_cache=cache
+        )
+        source = adapter.open_event_source()
+        await source.__anext__()
+        await source.aclose()
+
+    assert [kind for kind, _ in camera.requests].count("time") == 1
+    pulls = [body for kind, body in camera.requests if kind == "pull"]
+    assert all(
+        -48 <= (_created_of(body) - datetime.now(UTC)).total_seconds() <= -42
+        for body in pulls
+    )
+
+
+async def test_onvif_camera_with_an_accurate_clock_gets_no_offset() -> None:
+    camera = _ClockCamera(skew=0)
+    adapter = OnvifAdapter(
+        _post_client(camera.post), "10.0.0.5", credentials=("u", "p")
+    )
+    assert await adapter._clock_offset() == timedelta(0)
+
+
+async def test_onvif_unreadable_camera_clock_means_no_offset() -> None:
+    async def fake_post(url: str, **kwargs: Any) -> MagicMock:
+        resp = _response("denied")
+        resp.status_code = 401
+        return resp
+
+    adapter = OnvifAdapter(_post_client(fake_post), "10.0.0.5", credentials=("u", "p"))
+    assert await adapter._clock_offset() == timedelta(0)
+
+
+async def test_onvif_login_failure_remeasures_only_an_old_offset() -> None:
+    from timelapse_manager.capture.camera_sessions import TtlCache
+
+    cache = TtlCache()
+    adapter = OnvifAdapter(
+        _post_client(_ClockCamera(0).post),
+        "10.0.0.5",
+        credentials=("u", "p"),
+        uri_cache=cache,
+    )
+    cache.put(onvif._CLOCK_OFFSET_KEY, (12.0, time.monotonic()))
+    adapter._note_auth_failure()
+    assert cache.get(onvif._CLOCK_OFFSET_KEY) is not None  # measured just now
+
+    cache.put(
+        onvif._CLOCK_OFFSET_KEY,
+        (12.0, time.monotonic() - onvif._CLOCK_OFFSET_REFRESH_SECONDS - 1),
+    )
+    adapter._note_auth_failure()
+    assert cache.get(onvif._CLOCK_OFFSET_KEY) is None
+
+
+async def test_onvif_empty_pulls_are_at_least_a_second_apart() -> None:
+    pulled_at: list[float] = []
+    empty = _PULL_RESPONSE.split("<wsnt:NotificationMessage>")[0] + (
+        "</tev:PullMessagesResponse></s:Body></s:Envelope>"
+    )
+
+    async def fake_post(url: str, **kwargs: Any) -> MagicMock:
+        body = kwargs.get("content", "")
+        if "CreatePullPointSubscription" in body:
+            return _response(_CREATE_RESPONSE)
+        if "PullMessages" in body:
+            pulled_at.append(time.monotonic())
+            return _response(empty)  # a camera that ignores the long-poll hold
+        return _response(_UNSUBSCRIBE_RESPONSE)
+
+    adapter = OnvifAdapter(_post_client(fake_post), "10.0.0.5", credentials=("u", "p"))
+    source = adapter.open_event_source()
+    task = asyncio.ensure_future(source.__anext__())
+    try:
+        while len(pulled_at) < 3:
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await source.aclose()
+
+    gaps = [b - a for a, b in zip(pulled_at, pulled_at[1:], strict=False)]
+    assert all(gap >= 0.95 for gap in gaps), gaps
+
+
+async def test_onvif_unsubscribe_is_bounded_and_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wedged camera cannot hold teardown past the unsubscribe budget."""
+    monkeypatch.setattr(onvif, "_UNSUBSCRIBE_TIMEOUT", 0.2)
+    pulled = asyncio.Event()
+
+    async def fake_post(url: str, **kwargs: Any) -> MagicMock:
+        body = kwargs.get("content", "")
+        if "CreatePullPointSubscription" in body:
+            return _response(_CREATE_RESPONSE)
+        if "PullMessages" in body:
+            pulled.set()
+            await asyncio.sleep(60)
+        if "Unsubscribe" in body:
+            await asyncio.sleep(60)  # the camera never answers
+        return _response("<s:Envelope/>")
+
+    adapter = OnvifAdapter(_post_client(fake_post), "10.0.0.5", credentials=("u", "p"))
+
+    async def consume() -> None:
+        async for _event in adapter.open_event_source():
+            pass
+
+    task = asyncio.ensure_future(consume())
+    await pulled.wait()
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert time.monotonic() - started < 1.5
+
+
+async def test_onvif_implausible_clock_offset_is_ignored() -> None:
+    camera = _ClockCamera(skew=3 * 86400)
+    adapter = OnvifAdapter(
+        _post_client(camera.post), "10.0.0.5", credentials=("u", "p")
+    )
+    assert await adapter._clock_offset() == timedelta(0)

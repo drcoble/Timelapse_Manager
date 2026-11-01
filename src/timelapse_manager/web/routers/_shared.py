@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy.orm import Session as DbSession
+from starlette.concurrency import run_in_threadpool
 
 from ...cameras.base import PTZPresetsResult, StreamProfileResult
 from ...capture import anchors as anchors_mod
@@ -30,16 +31,22 @@ from ...security.camera_defaults_service import (
 from ...security.camera_defaults_service import (
     resolve_default_credentials,
 )
+from ...security.credential_binding import (
+    bound_default_credentials,
+    camera_credential_targets,
+)
 from ...security.ldap_directory import (
     LdapOutcome,
 )
 from ...security.ldap_settings_service import load_settings as load_ldap_settings
+from ...security.sessions import _has_other_writes
 from ...security.ssrf_settings_service import load_settings as load_ssrf_settings
 from .. import dependencies as deps
 from ..dependencies import (
     AdminUser,
     DbDep,
 )
+from ._values import Geolocated
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +179,15 @@ def _parse_render_settings_field(
     the marker present, an absent checkbox means off; without the marker the stored
     default (enabled) is kept, so a create has its auto-prune default preserved.
     """
-    fps_value, fps_error = _parse_render_fps_field(form)
+    # "Auto (suggested)" (#301): store the sentinel; the rate is resolved from
+    # the project's frames when the scheduled render fires. It wins over any
+    # number left in the field.
+    fps_auto = form.get("render_fps_auto") is not None
+    fps_value: int | str | None
+    if fps_auto:
+        fps_value, fps_error = render_settings.FPS_AUTO, None
+    else:
+        fps_value, fps_error = _parse_render_fps_field(form)
     if fps_error is not None:
         return {}, fps_error
 
@@ -195,6 +210,9 @@ def _parse_render_settings_field(
     warning = render_settings.combination_warning(view["encoder"], view["container"])
     if warning is not None:
         return {}, warning
+    # Display-only flag; the stored form of auto is ``fps == "auto"``.
+    if view.pop("fps_auto"):
+        view["fps"] = render_settings.FPS_AUTO
     return view, None
 
 
@@ -580,7 +598,7 @@ EXACT_TIME_MARKER = "exact_time_present"
 
 
 async def _build_exact_time_anchors_from_form(
-    request: Request, camera: Camera | None
+    request: Request, camera: Geolocated | None
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Map the exact-time anchor form rows to a stored anchor list.
 
@@ -588,19 +606,45 @@ async def _build_exact_time_anchors_from_form(
     friendly inline message when a row is invalid (bad ``HH:MM`` clock, bad
     offset, or a solar-noon anchor selected for a camera that has no
     geolocation). The repeated row fields are read from the raw request body via
-    :func:`_form_getlist`.
+    :func:`_form_getlist`; :func:`exact_time_anchors_from_rows` does the parsing.
 
     *camera* is the camera the project will be bound to (the submitted camera, not
     necessarily the previously-bound one); its geolocation gates whether a
     solar-noon anchor may be saved. An empty fieldset (no rows) yields ``([],
     None)`` -- the project simply has no anchors.
     """
-    ids = await _form_getlist(request, "anchor_id")
-    kinds = await _form_getlist(request, "anchor_kind")
-    times = await _form_getlist(request, "anchor_time")
-    offsets = await _form_getlist(request, "anchor_offset")
-    enabled_values = set(await _form_getlist(request, "anchor_enabled"))
+    return exact_time_anchors_from_rows(
+        ids=await _form_getlist(request, "anchor_id"),
+        kinds=await _form_getlist(request, "anchor_kind"),
+        times=await _form_getlist(request, "anchor_time"),
+        offsets=await _form_getlist(request, "anchor_offset"),
+        enabled_values=set(await _form_getlist(request, "anchor_enabled")),
+        camera=camera,
+    )
 
+
+def exact_time_anchors_from_rows(
+    *,
+    ids: list[str],
+    kinds: list[str],
+    times: list[str],
+    offsets: list[str],
+    enabled_values: set[str],
+    camera: Geolocated | None,
+    reject_solar_without_geo: bool = True,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Parse the exact-time anchor rows (parallel lists) into a stored anchor list.
+
+    The one parser for the anchor rows, shared by the create and settings forms
+    (rows read from the POST body) and the create-time storage pre-flight (rows
+    read from the GET query string, #22). Returns ``(anchors_json, None)`` or
+    ``(None, error)`` as :func:`_build_exact_time_anchors_from_form` describes.
+
+    *reject_solar_without_geo* (default) refuses a solar row when *camera* has no
+    coordinates, because such an anchor could never fire. The pre-flight passes
+    ``False``: an estimate keeps the row, and the captures-per-day count gives it
+    0 (no coordinates, no sun event), exactly as the runner would.
+    """
     row_count = max(len(ids), len(kinds), len(times), len(offsets))
     has_geo = (
         camera is not None
@@ -626,7 +670,11 @@ async def _build_exact_time_anchors_from_form(
 
         if kind == "clock" and not clock_time:
             return None, "Set a time (HH:MM) for each exact-time clock anchor."
-        if kind in ("solar_noon", "sunrise", "sunset") and not has_geo:
+        if (
+            reject_solar_without_geo
+            and kind in ("solar_noon", "sunrise", "sunset")
+            and not has_geo
+        ):
             return None, (
                 "Solar anchors (solar noon, sunrise, sunset) need the camera's "
                 "location; set the camera's geolocation or remove the solar anchor."
@@ -1019,6 +1067,81 @@ def _event_triggers_to_form(
     ]
 
 
+async def _resolve_camera_host_async(address: str) -> None:
+    """Validate ``address`` against the camera deny-list without blocking the loop.
+
+    Mirrors the synchronous ``resolve_camera_host`` chokepoint exactly -- same
+    admin opt-in for private subnets and the same "unresolvable at add time is
+    allowed through, deferred to the fetch/probe path" rule -- but performs the
+    DNS resolution on a worker thread so a slow or wedged resolver cannot stall
+    the event loop (which would stall every concurrent request). Returns nothing;
+    raises :class:`SsrfError` when the address (or a name it resolves to) is
+    denied, matching the synchronous chokepoint's contract.
+    """
+    import socket
+
+    from ...security.ssrf import resolve_and_check_async
+
+    if not address:
+        return
+
+    ssrf = get_context().settings.ssrf
+    try:
+        await resolve_and_check_async(
+            address,
+            allow_private=True,
+            allowed_private_subnets=ssrf.allowed_private_subnets,
+        )
+    except socket.gaierror:
+        # Unresolvable at add time: defer enforcement to the fetch/probe path,
+        # which re-validates fail-closed before connecting.
+        return
+
+
+def _release_request_connection(db: DbSession) -> None:
+    """End the request's read-only transaction and return its pooled connection.
+
+    Call it as the last step of the sync hop that precedes a network await (a
+    camera probe or a DNS lookup), so the request holds neither a pooled
+    connection nor any SQLite lock while it waits on the network (#66 C1/C11).
+    ``commit`` rather than ``rollback``: the session factory disables
+    ``expire_on_commit``, so the rows the route already loaded stay readable
+    without new SQL, whereas a rollback would expire them. The next database hop
+    simply checks out a connection again.
+
+    Skipped when the request has already written (pending ORM changes or an open
+    driver transaction): committing there would publish a half-done unit of work
+    early, so such a request keeps its transaction and commits at the end as
+    before.
+    """
+    if _has_other_writes(db):
+        return
+    db.commit()
+
+
+def _default_credentials_detaching(
+    db: DbSession, camera: Camera
+) -> tuple[str, str] | None:
+    """Resolve the camera-default credentials, detach *camera*, release the DB (#46).
+
+    The Session work the camera probes need before contacting the camera. Each
+    probe awaits it through ``run_in_threadpool`` so the query never runs on the
+    event loop; detaching the row keeps the probe from lazy-loading on the loop.
+    It is the last database hop before the probe's network awaits, so it also
+    releases the request's connection (:func:`_release_request_connection`).
+    The default is returned only when every host the camera's credentials can
+    reach is inside the allowed private subnets (owner decision OD-1).
+    """
+    default_credentials = resolve_default_credentials(db)
+    targets = camera_credential_targets(camera)
+    db.expunge(camera)
+    _release_request_connection(db)
+    # Bound after the release: the check resolves names. An inheriting camera
+    # edited onto a host outside the allowed private subnets gets no default
+    # from any probe built from this (#67-S3, OD-1).
+    return bound_default_credentials(targets, default_credentials)
+
+
 async def _enumerate_event_topics(db: DbSession, camera: Camera) -> EventTopicsResult:
     """Best-effort enumerate a camera's event topics, never raising.
 
@@ -1036,25 +1159,28 @@ async def _enumerate_event_topics(db: DbSession, camera: Camera) -> EventTopicsR
     empty list, so an empty success ("no events available") cannot always be told
     apart from an unreachable camera -- both surface as ``ok=True`` with no events.
     """
-    from ...cameras import build_adapter, resolve_camera_host
+    from ...cameras import build_adapter
     from ...security.ssrf import SsrfError
 
     supervisor = get_context().capture_supervisor
     if supervisor is None:
         return EventTopicsResult(events=[], ok=False, message="engine unavailable")
 
+    # The database hop comes first so the request's connection is released
+    # before any network await, the DNS lookup included (#66).
+    default_credentials = await run_in_threadpool(
+        _default_credentials_detaching, db, camera
+    )
+
     if camera.address:
         try:
-            resolve_camera_host(camera.address)
+            await _resolve_camera_host_async(camera.address)
         except SsrfError:
             return EventTopicsResult(events=[], ok=False, message="address rejected")
-
-    default_credentials = resolve_default_credentials(db)
-    db.expunge(camera)
     try:
         adapter = build_adapter(
             camera,
-            supervisor.http_client,
+            supervisor.client_for("probe", camera.tls_pinned_cert_pem),
             ffmpeg_binary=supervisor.ffmpeg_binary,
             default_credentials=default_credentials,
         )
@@ -1128,30 +1254,33 @@ async def _enumerate_stream_profiles(
     validation does not stand in for it). The camera row is detached before the
     probe, matching the manual-validate path; the adapter is always closed.
     """
-    from ...cameras import build_adapter, resolve_camera_host
+    from ...cameras import build_adapter
     from ...security.ssrf import SsrfError
 
     supervisor = get_context().capture_supervisor
     if supervisor is None:
         return StreamProfileResult(profiles=[], ok=False, message="engine unavailable")
 
-    # SSRF chokepoint before contacting the camera, mirroring detect-protocol. A
+    # The database hop comes first so the request's connection is released
+    # before any network await, the DNS lookup included (#66).
+    default_credentials = await run_in_threadpool(
+        _default_credentials_detaching, db, camera
+    )
+
+    # SSRF chokepoint before contacting the camera, mirroring the camera query route. A
     # camera may carry only snapshot/stream URIs and no address; skip the resolve
     # in that case rather than crash (matching the create path's `if address`).
     if camera.address:
         try:
-            resolve_camera_host(camera.address)
+            await _resolve_camera_host_async(camera.address)
         except SsrfError:
             return StreamProfileResult(
                 profiles=[], ok=False, message="address rejected"
             )
-
-    default_credentials = resolve_default_credentials(db)
-    db.expunge(camera)
     try:
         adapter = build_adapter(
             camera,
-            supervisor.http_client,
+            supervisor.client_for("probe", camera.tls_pinned_cert_pem),
             ffmpeg_binary=supervisor.ffmpeg_binary,
             default_credentials=default_credentials,
         )
@@ -1183,7 +1312,7 @@ async def _enumerate_ptz_presets(db: DbSession, camera: Camera) -> PTZPresetsRes
     chokepoint here (the guard is check-time). The camera row is detached before
     the probe and the adapter is always closed.
     """
-    from ...cameras import build_adapter, resolve_camera_host
+    from ...cameras import build_adapter
     from ...security.ssrf import SsrfError
 
     supervisor = get_context().capture_supervisor
@@ -1192,20 +1321,23 @@ async def _enumerate_ptz_presets(db: DbSession, camera: Camera) -> PTZPresetsRes
             presets=[], ptz_supported=False, ok=False, message="engine unavailable"
         )
 
+    # The database hop comes first so the request's connection is released
+    # before any network await, the DNS lookup included (#66).
+    default_credentials = await run_in_threadpool(
+        _default_credentials_detaching, db, camera
+    )
+
     if camera.address:
         try:
-            resolve_camera_host(camera.address)
+            await _resolve_camera_host_async(camera.address)
         except SsrfError:
             return PTZPresetsResult(
                 presets=[], ptz_supported=False, ok=False, message="address rejected"
             )
-
-    default_credentials = resolve_default_credentials(db)
-    db.expunge(camera)
     try:
         adapter = build_adapter(
             camera,
-            supervisor.http_client,
+            supervisor.client_for("probe", camera.tls_pinned_cert_pem),
             ffmpeg_binary=supervisor.ffmpeg_binary,
             default_credentials=default_credentials,
         )

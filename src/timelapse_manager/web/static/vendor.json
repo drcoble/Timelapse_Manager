@@ -1,0 +1,47 @@
+{
+  "_comment": "Provenance of third-party files vendored under web/static (#67 S25, #70 F-S7). Each sha256 is checked by tests/unit/packaging/test_sbom_integrity.py and copied into the release SBOM by dev/gen_sbom.py. Update an entry in the same commit as the file.",
+  "schema": 1,
+  "assets": [
+    {
+      "path": "js/htmx.min.js",
+      "name": "htmx",
+      "type": "library",
+      "supplier": "Big Sky Software",
+      "version": "1.9.12",
+      "purl": "pkg:npm/htmx.org@1.9.12",
+      "upstream": "https://github.com/bigskysoftware/htmx/releases/download/v1.9.12/htmx.min.js",
+      "license": "0BSD",
+      "license_file": null,
+      "origin": "byte-identical to the upstream v1.9.12 release asset (also npm htmx.org@1.9.12 dist/htmx.min.js)",
+      "sha256": "449317ade7881e949510db614991e195c3a099c4c791c24dacec55f9f4a2a452"
+    },
+    {
+      "path": "fonts/Geist-Variable.woff2",
+      "name": "Geist",
+      "type": "file",
+      "supplier": "Vercel",
+      "version": "1.7.2",
+      "upstream": "https://registry.npmjs.org/geist/-/geist-1.7.2.tgz",
+      "license": "OFL-1.1",
+      "license_file": "fonts/OFL.txt",
+      "origin": "byte-identical to dist/fonts/geist-sans/Geist-Variable.woff2 in the official npm geist@1.7.2 tarball (sha256 88cbfaca51646078f3172802643691bb8fe2df15ca4c455b1b101e49b7d469a6, npm integrity sha512-Gu5lDFa3pLRyoBlBPf0QIFHVdWAnpco7fS1bJm41jyLPFoguBgiubseUN2oLXMgqZ7uxAxDoXcHMhCY/fOTTgg==); checked against 1.2.0-1.8.2 on 2026-10-29, #105. Licence text kept from the font repository (OFL.txt); the npm LICENSE.txt is the same licence with a different copyright line and minor wording.",
+      "sha256": "a369fcf5628ea2aa4e1b9e2ec6a5b3624e365bda588e1f0f2f12b564f728fbb8",
+      "purl": "pkg:npm/geist@1.7.2",
+      "archive_sha256": "88cbfaca51646078f3172802643691bb8fe2df15ca4c455b1b101e49b7d469a6"
+    },
+    {
+      "path": "fonts/GeistMono-Variable.woff2",
+      "name": "Geist Mono",
+      "type": "file",
+      "supplier": "Vercel",
+      "version": "1.7.2",
+      "upstream": "https://registry.npmjs.org/geist/-/geist-1.7.2.tgz",
+      "license": "OFL-1.1",
+      "license_file": "fonts/OFL.txt",
+      "origin": "byte-identical to dist/fonts/geist-mono/GeistMono-Variable.woff2 in the official npm geist@1.7.2 tarball (sha256 88cbfaca51646078f3172802643691bb8fe2df15ca4c455b1b101e49b7d469a6, npm integrity sha512-Gu5lDFa3pLRyoBlBPf0QIFHVdWAnpco7fS1bJm41jyLPFoguBgiubseUN2oLXMgqZ7uxAxDoXcHMhCY/fOTTgg==); checked against 1.2.0-1.8.2 on 2026-10-29, #105. Licence text kept from the font repository (OFL.txt); the npm LICENSE.txt is the same licence with a different copyright line and minor wording.",
+      "sha256": "fba8f577f38a2bbcbe818efa6348dd58f36303a10b8737c42fefad275be563ab",
+      "purl": "pkg:npm/geist@1.7.2",
+      "archive_sha256": "88cbfaca51646078f3172802643691bb8fe2df15ca4c455b1b101e49b7d469a6"
+    }
+  ]
+}

@@ -21,7 +21,15 @@
 
 {#
   ===== ACTIVE PROJECTS =====
-  Polled every 30 s via HTMX (innerHTML swap).
+  Polled every 30 s via HTMX (innerHTML swap). data-poll makes it a background
+  poll (poll.js): passive for the idle timeout, paused while the tab is hidden,
+  refreshed once by tlm:visible when the tab comes back. No `load` trigger: the
+  grid is already server-rendered.
+
+  data-poll-version seeds poll.js with the version of the cards rendered here;
+  the poll sends it back and an unchanged grid is answered 204, not swapped
+  (#70 F-P1). Each card's ribbon slot is hx-preserve, so a swap keeps the
+  loaded ribbons too.
 
   Engineer B — GET /partials/projects must return the *full inner content*
   of this div: i.e. the `<div class="project-grid">…</div>` wrapper (or the
@@ -30,8 +38,10 @@
   first swap.
 #}
 <div id="projects-grid"
+     data-poll
+     data-poll-version="{{ grid_version }}"
      hx-get="/partials/projects"
-     hx-trigger="every 30s"
+     hx-trigger="every 30s, tlm:visible from:document"
      hx-swap="innerHTML">
 
   {% set active_projects = projects | selectattr('lifecycle_state', 'equalto', 'active') | list %}

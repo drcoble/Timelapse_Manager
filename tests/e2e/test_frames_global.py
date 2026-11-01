@@ -27,6 +27,26 @@ class TestAllProjectsGrid:
         )
         assert selected == ""  # All Projects
 
+    def test_choosing_all_projects_in_the_picker_loads_the_global_grid(
+        self, logged_in_data_page: tuple[object, str]
+    ) -> None:
+        """Choosing "All Projects" submits an empty ``project_id`` (#226)."""
+        page, base = logged_in_data_page  # type: ignore[misc]
+        page.goto(f"{base}/frames?project_id=1")  # type: ignore[union-attr]
+        page.wait_for_selector(".frame-grid .frame-tile", timeout=30000)  # type: ignore[union-attr]
+        with page.expect_navigation() as navigation:  # type: ignore[union-attr]
+            page.select_option("#frame-project-select", "")  # type: ignore[union-attr]
+        response = navigation.value
+        assert response is not None and response.status == 200
+        page.wait_for_selector(".frame-grid .frame-tile", timeout=30000)  # type: ignore[union-attr]
+        assert page.locator(".frames-allprojects-hint").count() == 1  # type: ignore[union-attr]
+        assert (
+            page.eval_on_selector(  # type: ignore[union-attr]
+                "#frame-project-select", "el => el.value"
+            )
+            == ""
+        )
+
     def test_global_scroll_appends_to_end_cap(
         self, logged_in_data_page: tuple[object, str]
     ) -> None:

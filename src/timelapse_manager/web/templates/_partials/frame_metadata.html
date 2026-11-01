@@ -1,7 +1,8 @@
 {#
   Partial: frame_metadata.html
-  Swapped into #frame-meta-panel by HTMX on GET /projects/{pid}/frames/{fid}/metadata.
-  Also rendered as a full frame-detail page when JS is absent (fallback link target).
+  The scene-metadata card of the full frame-detail page (frame_detail.html), the
+  no-JS fallback for the frame card. The drawer shows the same groups in
+  drawer_frame_detail.html.
 
   Context:
     frame          — {id, sequence_index, capture_timestamp_raw}
@@ -18,16 +19,6 @@
         </span>
       {% endif %}
     </div>
-    {# Close button: clears the panel without a round-trip. Only meaningful in
-       the HTMX panel; the standalone frame-detail page has its own back link,
-       and the panel element it would target does not exist there. #}
-    {% if in_panel | default(true) %}
-    <button type="button"
-            class="btn btn-xs btn-ghost"
-            onclick="document.getElementById('frame-meta-panel').innerHTML=''"
-            aria-label="Close metadata panel"
-            title="Close">&#10005;</button>
-    {% endif %}
   </div>
 
   <div class="card-body">

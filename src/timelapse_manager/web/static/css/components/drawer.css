@@ -23,6 +23,11 @@
 .drawer.open {
   transform: translateX(0);
 }
+/* Closed and finished sliding out (drawer.js): out of the tab order and the
+   accessibility tree. Not set while open or sliding, so the transition shows. */
+.drawer--hidden {
+  visibility: hidden;
+}
 
 .drawer-backdrop {
   position: fixed;

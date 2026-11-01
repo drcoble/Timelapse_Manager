@@ -1,0 +1,60 @@
+{#
+  Partial: export_card.html — the frame-export card
+  (GET /frames/export/{id}/card), opened from the project Frames tab's Exports
+  list in the same dialog as the render card.
+
+  Context: card — _JobCardView; can_operate — bool; csrf_token — str.
+  Download and Delete are operator/admin only (the export download route is
+  operator-gated); a viewer sees the details.
+#}
+<header class="discover-modal-header">
+  <h2 class="card-title" id="job-card-title">
+    <span class="kind-badge export">Export</span>
+    Export #{{ card.id }}
+  </h2>
+  <button type="button" class="drawer-close" data-modal-close
+          aria-label="Close">&times;</button>
+</header>
+<div class="discover-modal-body job-card">
+  {% include '_partials/job_card_status.html' %}
+
+  <dl class="job-card-fields">
+    <dt>Project</dt>
+    <dd><a href="/projects/{{ card.project_id }}">{{ card.project_name }}</a></dd>
+
+    <dt>Started by</dt>
+    <dd>{{ card.triggered_by }}</dd>
+
+    {% include '_partials/job_card_times.html' %}
+
+    <dt>Frames</dt>
+    <dd>
+      {% if card.frame_count is not none %}
+        {{ card.frame_count }} frame{{ '' if card.frame_count == 1 else 's' }} in the zip
+        {% if card.first_frame_at_raw %}
+          <br>{{ card.first_frame_at_raw | localdt }}
+          &ndash; {{ card.last_frame_at_raw | localdt }}
+        {% endif %}
+      {% elif card.requested_frame_count is not none %}
+        {{ card.requested_frame_count }} selected
+        <span class="text-muted">(bundled count not recorded)</span>
+      {% else %}
+        <span class="text-muted">not recorded</span>
+      {% endif %}
+    </dd>
+
+    {% include '_partials/job_card_file.html' %}
+  </dl>
+
+  {% if can_operate %}
+    <div class="job-card-actions">
+      {% if card.download_url %}
+        <a href="{{ card.download_url }}" class="btn btn-secondary btn-sm" download>
+          &#8659; Download
+        </a>
+      {% endif %}
+    </div>
+    {% set noun = 'export' %}
+    {% include '_partials/job_card_delete.html' %}
+  {% endif %}
+</div>

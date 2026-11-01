@@ -16,6 +16,7 @@ from .base import (
     CaptureError,
     DiscoveredCamera,
     GeoLocation,
+    GeolocationAccessDenied,
     OtherCaptureError,
     StreamProfile,
     StreamProfileResult,
@@ -66,6 +67,7 @@ __all__ = [
     "TimeoutCaptureError",
     "UnsupportedCodecCaptureError",
     "OtherCaptureError",
+    "GeolocationAccessDenied",
     # Concrete adapters.
     "HttpJpegAdapter",
     "RtspAdapter",

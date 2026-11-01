@@ -80,7 +80,7 @@ class TestResolveCameraHostPrivate:
 
     def test_192_168_allowed_when_subnet_opted_in(self) -> None:
         with _patch_context(["192.168.0.0/16"]):
-            assert resolve_camera_host("192.168.100.200") == "192.168.100.200"
+            assert resolve_camera_host("192.168.1.200") == "192.168.1.200"
 
     def test_rfc1918_address_denied_when_no_subnet_opted_in(self) -> None:
         with _patch_context([]), pytest.raises(SsrfError):

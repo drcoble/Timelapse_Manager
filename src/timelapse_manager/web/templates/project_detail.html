@@ -163,7 +163,7 @@
     </div>
     {% endif %}
 
-    <!-- Latest frame — polled every 60s while running -->
+    <!-- Latest frame (click to play the latest render, #24) -->
     <div class="card mb-6">
       <div class="card-header">
         <div class="card-title">Latest Frame</div>
@@ -174,17 +174,44 @@
         {% endif %}
       </div>
       {#
-        Latest frame: polled every 60s when running.
-        The status-card partial (GET /partials/projects/{id}/status) returns the
-        full project card fragment, not a standalone frame element. We therefore
-        poll that endpoint, swap the entire card in #project-status-widget, and
-        pull the thumbnail from it — keeping one polling source of truth.
-        Engineer B: if you add a dedicated frame-only endpoint later, wire
-        hx-get to it here and set hx-swap="innerHTML" without hx-select.
+        The latest frame is rendered with the page and is NOT polled: nothing
+        refreshes #latest-frame-container today (reload the page for a newer
+        frame). With a finished render the frame is a play link
+        (_partials/latest_frame.html, latest-render.js).
+
+        The inline player lives in its own element, #latest-render-player,
+        beside the frame container rather than inside it. A future poll that
+        swaps #latest-frame-container therefore cannot replace or reset a
+        playing video; such a poll should target the container only.
       #}
       <div id="latest-frame-container">
         {% include '_partials/latest_frame.html' %}
       </div>
+      {% if latest_render %}
+        <div id="latest-render-player" class="latest-render-player"
+             data-latest-render-player hidden>
+          <div class="latest-render-video" data-latest-render-video></div>
+          <div class="latest-render-caption">
+            <span>
+              Render #{{ latest_render.id }}
+              {% if latest_render.completed_at_raw %}&middot; {{ latest_render.completed_at_raw | localdt }}{% endif %}
+              {% if latest_render.length_display %}&middot; {{ latest_render.length_display }}{% endif %}
+              &middot;
+              <a href="{{ latest_render.card_url }}"
+                 data-modal-open="#job-card-modal"
+                 hx-get="{{ latest_render.card_url }}"
+                 hx-target="#job-card-content"
+                 hx-swap="innerHTML">Render card</a>
+            </span>
+            <button type="button" class="btn btn-ghost btn-sm"
+                    data-latest-render-close>Close</button>
+          </div>
+        </div>
+        <p class="form-hint latest-render-note" data-latest-render-note hidden>
+          This browser can't play {{ latest_render.playback.label }};
+          <a href="{{ latest_render.download_url }}" download>download it</a> to watch.
+        </p>
+      {% endif %}
     </div>
 
     {# Recent activity — the latest operational events for this project. #}
@@ -231,38 +258,45 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="field-row">
               <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Encoder
-                <select name="render_encoder" id="render_encoder" class="form-control"
+                <select name="render_encoder" id="trigger-render-encoder" class="form-control"
                         hx-get="/renders/combo-check" hx-trigger="change"
-                        hx-target="#render-combo-warning"
-                        hx-include="#render_encoder,#render_container">
+                        hx-target="#trigger-render-combo-warning"
+                        hx-include="#trigger-render-encoder,#trigger-render-container">
                   {% for value, label in render_encoder_options %}
                   <option value="{{ value }}" {{ 'selected' if value == render_view.encoder else '' }}>{{ label }}</option>
                   {% endfor %}
                 </select>
               </label>
               <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Container
-                <select name="render_container" id="render_container" class="form-control"
+                <select name="render_container" id="trigger-render-container" class="form-control"
                         hx-get="/renders/combo-check" hx-trigger="change"
-                        hx-target="#render-combo-warning"
-                        hx-include="#render_encoder,#render_container">
+                        hx-target="#trigger-render-combo-warning"
+                        hx-include="#trigger-render-encoder,#trigger-render-container">
                   {% for value, label in render_container_options %}
                   <option value="{{ value }}" {{ 'selected' if value == render_view.container else '' }}>{{ label }}</option>
                   {% endfor %}
                 </select>
               </label>
               <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">Resolution
-                <select name="render_resolution" id="render_resolution" class="form-control">
+                <select name="render_resolution" id="trigger-render-resolution" class="form-control">
                   {% for value, label in render_resolution_options %}
                   <option value="{{ value }}" {{ 'selected' if value == render_view.resolution else '' }}>{{ label }}</option>
                   {% endfor %}
                 </select>
               </label>
               <label class="form-label" style="display:flex;flex-direction:column;gap:4px;">FPS
-                <input type="number" name="render_fps" id="render_fps" class="form-control"
-                       min="1" max="240" value="{{ render_view.fps }}" style="width:6rem;">
+                <input type="number" name="render_fps" id="trigger-render-fps" class="form-control"
+                       min="1" max="240" value="{{ render_view.fps }}" style="width:6rem;"
+                       data-action="fps-touched">
               </label>
             </div>
-            <div class="chip-group" data-chip-target="#render_fps" style="margin-top:var(--sp-2);">
+            {# Suggested frame rate (#301): fetched when the panel is first opened,
+               pre-fills the field unless the user already typed in it. #}
+            <div id="trigger-fps-suggest" style="margin-top:var(--sp-2);"
+                 hx-get="/projects/{{ project.id }}/renders/suggested-fps"
+                 hx-trigger="toggle from:closest details once"
+                 hx-swap="innerHTML"></div>
+            <div class="chip-group" data-chip-target="#trigger-render-fps" style="margin-top:var(--sp-2);">
               {% for f in render_fps_suggestions %}
               <button type="button" class="chip" data-value="{{ f }}">{{ f }} fps</button>
               {% endfor %}
@@ -270,7 +304,11 @@
             {% if fps_hint %}
             <p class="form-hint" style="margin-top:var(--sp-2);">{{ fps_hint }}</p>
             {% endif %}
-            <div id="render-combo-warning"></div>
+            {# Ids carry a trigger- prefix: the Settings tab's render form (loaded into
+               this page) uses render_encoder, render_container, render_fps and
+               render-combo-warning, and duplicate ids made this panel's
+               combo-check read the other form's selects (#34). #}
+            <div id="trigger-render-combo-warning"></div>
             <div style="margin-top:var(--sp-3);">
               <button type="submit" class="btn btn-primary btn-sm">Start render</button>
             </div>
@@ -326,6 +364,27 @@
            hx-trigger="load" hx-swap="innerHTML">
         <p class="form-hint">Loading frames&hellip;</p>
       </div>
+
+      {# Frame exports (zips made from a frame selection), newest first. Each
+         opens the export card in the job-card dialog. #}
+      <div class="card mb-6 exports-card" style="margin-top:var(--sp-4);">
+        <div class="card-header">
+          <div class="card-title">Exports</div>
+        </div>
+        <div class="card-body" style="padding:var(--sp-4);">
+          {% if exports %}
+            <div class="job-list" id="exports-list" role="list">
+              {% for export in exports %}
+                {% include '_partials/export_row.html' %}
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="form-hint" style="margin:0;">
+              No exports yet. Zips made from a frame selection are listed here.
+            </p>
+          {% endif %}
+        </div>
+      </div>
     </div>{# /tab-frames #}
 
     <div id="tab-milestones" class="tab-panel" role="tabpanel" hidden>
@@ -370,9 +429,9 @@
           <div class="info-cell">
             <dt class="info-label">Next Capture</dt>
             <dd class="info-value">
-              {% if project.next_capture_at_raw and project.operational_status == 'running' %}
+              {% if project.next_capture_at_raw %}
                 {{ project.next_capture_at_raw | localdt }}
-              {% elif project.next_capture_at and project.operational_status == 'running' %}
+              {% elif project.next_capture_at %}
                 {{ project.next_capture_at }}
               {% else %}
                 &mdash;
@@ -397,12 +456,15 @@
             <dd class="info-value">{{ project.disk_used_display | default('0 B', true) }}</dd>
           </div>
 
-          {# Row 2: growth rate — always shown #}
+          {# Row 2: growth rate — always shown. No rate while the project is not
+             set to capture (paused, low disk, stopped: #22 D12). #}
           <div class="info-cell">
             <dt class="info-label">Growth Rate</dt>
             {% if project.growth_rate_display %}
               <dd class="info-value">&approx; {{ project.growth_rate_display }}</dd>
-              <div style="font-size:0.7rem;color:var(--color-text-dim);margin-top:2px;">based on average frame size</div>
+              <div style="font-size:0.7rem;color:var(--color-text-dim);margin-top:2px;">average frame size &times; captures the schedule plans per day</div>
+            {% elif not project.capture_planned %}
+              <dd class="info-value normal" style="color:var(--color-text-dim);">None while not capturing</dd>
             {% else %}
               <dd class="info-value normal" style="color:var(--color-text-dim);">Not enough data yet</dd>
             {% endif %}
@@ -472,5 +534,9 @@
   </div>{# /detail-sidebar #}
 
 </div>{# /detail-layout #}
+
+{# One dialog for both the render card (Renders tab) and the export card
+   (Frames tab). #}
+{% include '_partials/job_card_modal.html' %}
 
 {% endblock %}

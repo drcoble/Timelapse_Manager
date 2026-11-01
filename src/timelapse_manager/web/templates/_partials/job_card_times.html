@@ -1,0 +1,12 @@
+{#
+  Partial: job_card_times.html — created/started/completed/took rows of a job
+  card's <dl>, in the viewer's time zone. Context: card.
+#}
+<dt>Created</dt>
+<dd>{{ card.created_at_raw | localdt if card.created_at_raw else '—' }}</dd>
+<dt>Started</dt>
+<dd>{{ card.started_at_raw | localdt if card.started_at_raw else '—' }}</dd>
+<dt>Completed</dt>
+<dd>{{ card.completed_at_raw | localdt if card.completed_at_raw else '—' }}</dd>
+<dt>Took</dt>
+<dd>{{ card.took_display or '—' }}</dd>

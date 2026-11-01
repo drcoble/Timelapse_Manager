@@ -1,13 +1,12 @@
 """SMTP email notification channel.
 
 Delivers a notification as a plain-text email through a configured SMTP server.
-The channel is constructed once at startup from the stored notification settings;
-changing the server configuration in the UI takes effect on the next restart (the
-dispatcher does not hot-reload channel transport configuration -- only the routing
-rules are re-read per poll cycle).
+The channel is built from the stored notification settings, and the dispatcher
+rebuilds it when those settings change, so a server edited in the UI applies
+without a restart.
 
 Two timeout layers protect shutdown (see the channel contract): the dispatcher
-wraps :meth:`send` in an outer ``asyncio.wait_for``, but the blocking
+wraps :meth:`send` in an outer ``asyncio.timeout``, but the blocking
 ``smtplib`` calls run inside a worker thread and are *not* interruptible by that
 cancellation. The channel therefore sets its own socket ``timeout`` on every
 connection, which is the only bound on a wedged synchronous send.
@@ -18,10 +17,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import smtplib
+import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import TYPE_CHECKING
 
+from ...logging import redact_text
 from .base import ChannelSendError, NotificationChannel, NotificationMessage
 
 if TYPE_CHECKING:
@@ -69,7 +70,7 @@ class SMTPChannel(NotificationChannel):
         :param config: the SMTP transport configuration.
         :param send_timeout_seconds: the per-connection socket timeout. This is
             the only bound on a blocking synchronous send (the dispatcher's outer
-            ``wait_for`` cannot interrupt a thread), so it is mandatory.
+            ``asyncio.timeout`` cannot interrupt a thread), so it is mandatory.
         """
         self._config = config
         self._timeout = max(0.1, send_timeout_seconds)
@@ -95,6 +96,32 @@ class SMTPChannel(NotificationChannel):
                 f"SMTP delivery failed: {exc.__class__.__name__}"
             ) from exc
 
+    @property
+    def config(self) -> SMTPConfig:
+        """The transport configuration (holds the password; never log it)."""
+        return self._config
+
+    async def send_email(self, email: EmailMessage) -> None:
+        """Deliver a prebuilt message over the channel's transport.
+
+        The same TLS/authentication/timeout path as :meth:`send`, for a caller
+        that composes its own message (the problem-report delivery, which sets
+        its own recipients and may attach a zip). ``From`` and ``To`` are filled
+        from the configuration when the message does not set them.
+
+        :raises ChannelSendError: on any recoverable SMTP/transport failure.
+        """
+        if email["From"] is None:
+            email["From"] = self._config.from_address
+        if email["To"] is None:
+            email["To"] = ", ".join(self._config.recipients)
+        try:
+            await asyncio.to_thread(self._send_blocking, email)
+        except (OSError, smtplib.SMTPException) as exc:
+            raise ChannelSendError(
+                f"SMTP delivery failed: {exc.__class__.__name__}"
+            ) from exc
+
     def _build_email(self, message: NotificationMessage) -> EmailMessage:
         """Render a notification into a plain-text :class:`EmailMessage`."""
         email = EmailMessage()
@@ -114,11 +141,13 @@ class SMTPChannel(NotificationChannel):
     def _body(message: NotificationMessage) -> str:
         """Build the plain-text email body.
 
-        The message is already redacted at the source (``log_event`` scrubs it
-        before persisting), so it is safe to include verbatim.
+        The message is normally redacted at the source (``log_event`` scrubs it
+        before persisting); it is redacted again here, before it is mailed, so
+        an event written by another path cannot send a camera URL's login to a
+        mailbox (#69 CAM-S2, #67-S14).
         """
         lines = [
-            message.message,
+            redact_text(message.message),
             "",
             f"Level: {message.level}",
             f"Scope: {message.scope}"
@@ -135,10 +164,19 @@ class SMTPChannel(NotificationChannel):
         Every connection is opened with the channel's socket timeout. STARTTLS
         and implicit-TLS (SMTPS) variants are selected by the configured
         security mode; ``none`` connects in the clear (for a local relay).
+
+        Both TLS variants verify the server certificate chain and hostname via a
+        default SSL context (``ssl.create_default_context()``), so a relay
+        presenting an invalid or mismatched certificate is rejected rather than
+        trusted silently. The ``none`` path is unencrypted and uses no context.
         """
         if self._config.security == "tls":
+            context = ssl.create_default_context()
             client: smtplib.SMTP = smtplib.SMTP_SSL(
-                self._config.server, self._config.port, timeout=self._timeout
+                self._config.server,
+                self._config.port,
+                timeout=self._timeout,
+                context=context,
             )
         else:
             client = smtplib.SMTP(
@@ -146,7 +184,7 @@ class SMTPChannel(NotificationChannel):
             )
         try:
             if self._config.security == "starttls":
-                client.starttls()
+                client.starttls(context=ssl.create_default_context())
             if self._config.username and self._config.password:
                 client.login(self._config.username, self._config.password)
             client.send_message(email)

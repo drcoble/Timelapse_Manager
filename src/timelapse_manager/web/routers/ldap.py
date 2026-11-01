@@ -12,6 +12,7 @@ from fastapi.responses import (
     Response,
 )
 
+from ...runtime import get_context
 from ...security.camera_defaults_service import (
     CameraDefaultsUpdate,
 )
@@ -24,9 +25,15 @@ from ...security.ldap_directory import (
 from ...security.ldap_directory import (
     resolve_directory_state as ldap_resolve_directory_state,
 )
-from ...security.ldap_settings_service import LdapSettingsUpdate, resolve_bind_password
+from ...security.ldap_settings_service import (
+    LdapSettingsError,
+    LdapSettingsUpdate,
+    resolve_bind_password,
+)
 from ...security.ldap_settings_service import load_settings as load_ldap_settings
 from ...security.ldap_settings_service import update_settings as update_ldap_settings
+from ...security.session_revalidation import breaker_for
+from ...services._base import Effect, run_effects
 from .. import dependencies as deps
 from ..dependencies import (
     AdminUser,
@@ -59,7 +66,13 @@ def ldap_settings_submit(
     Validation gate: when ``enabled`` is checked the form must supply at least
     one server URL, a user search base, and a username attribute, or the save is
     refused and the partial is re-rendered with an inline error.  A disabled
-    configuration may be saved incomplete (no live logins use it).
+    configuration may be saved incomplete (no live logins use it).  An unknown
+    TLS mode is refused the same way.
+
+    Retargeting the directory (servers, TLS mode or bind DN) drops the stored
+    bind password unless a new one is typed (see the settings service). After the
+    save is committed the directory circuit breaker is reset (#203): what it
+    remembered was about the previous configuration.
     """
     enabled = bool(form.get("ldap_enabled"))
     server_urls = _parse_lines(form.get("ldap_server_urls"))
@@ -90,7 +103,7 @@ def ldap_settings_submit(
     update = LdapSettingsUpdate(
         enabled=enabled,
         server_urls=server_urls,
-        tls_mode=form.get("ldap_tls_mode", "none"),
+        tls_mode=form.get("ldap_tls_mode", "ldaps"),
         tls_ca_cert_path=(form.get("ldap_tls_ca_cert_path") or "").strip() or None,
         bind_dn=form.get("ldap_bind_dn") or None,
         bind_password=form.get("ldap_bind_password"),
@@ -108,7 +121,11 @@ def ldap_settings_submit(
         viewer_group_dn=form.get("ldap_viewer_group_dn") or None,
         viewer_group_filter=form.get("ldap_viewer_group_filter") or None,
     )
-    update_ldap_settings(db, update)
+    try:
+        update_ldap_settings(db, update)
+    except LdapSettingsError as exc:
+        ctx = _ldap_context(request, db, user, error=str(exc))
+        return templates.TemplateResponse(request, "settings.html", ctx)
     _audit(
         db,
         scope="system",
@@ -116,6 +133,10 @@ def ldap_settings_submit(
         actor_user_id=user.id,
         message="LDAP settings updated",
     )
+    # Commit first, then reset: a probe racing the reset must read the new
+    # settings, or its failure against the old ones would re-open the breaker.
+    db.commit()
+    breaker_for(db).reset()
     return RedirectResponse(url="/settings#ldap", status_code=303)
 
 
@@ -128,7 +149,9 @@ def camera_defaults_submit(
     The password follows the masked write-back rule delegated entirely to the
     settings service: a blank, ``None``, or ``***`` submission preserves the
     stored encrypted secret without re-encrypting it. The password is never
-    echoed back to the page (only the mask sentinel is rendered).
+    echoed back to the page (only the mask sentinel is rendered). After the
+    commit the capture supervisor is woken to reload cameras that inherit the
+    defaults (#152).
     """
     update = CameraDefaultsUpdate(
         enabled=bool(form.get("camera_defaults_enabled")),
@@ -143,6 +166,11 @@ def camera_defaults_submit(
         actor_user_id=user.id,
         message="default camera credentials updated",
     )
+    db.commit()
+    # Cameras that inherit the defaults have them in their cached capture
+    # session; the reconcile pass sees the changed fingerprint and reloads them
+    # now rather than up to one reconcile interval later (#152).
+    run_effects((Effect.CAPTURE_RECONCILE,), get_context())
     return RedirectResponse(url="/settings#camera-credentials", status_code=303)
 
 
@@ -154,7 +182,10 @@ def ldap_test_connection(request: Request, db: DbDep, user: AdminUser) -> Respon
     database via :func:`resolve_bind_password` — the form's masked value is
     never submitted here.  The test performs only a service bind and a directory
     lookup probe; no user credentials are checked and the bind password is
-    never echoed back.
+    never echoed back. Because a retarget save clears the stored password unless a
+    new one is typed, the saved password always belongs to the saved target.
+
+    A successful test resets the directory circuit breaker.
 
     Returns an HTML fragment (the result banner) for HTMX injection.
     """
@@ -171,6 +202,11 @@ def ldap_test_connection(request: Request, db: DbDep, user: AdminUser) -> Respon
 
     message = _LDAP_CONNECTION_MESSAGES.get(result.outcome, "Unknown result")
     ok = result.outcome in (LdapOutcome.AUTHENTICATED, LdapOutcome.NO_SUCH_USER)
+    if ok:
+        # The directory just answered with the saved settings: an open breaker
+        # (#203) is stale. Deliberately not gated on the breaker: the test is
+        # most needed while it is open.
+        breaker_for(db).reset()
     status_class = "success" if ok else "error"
 
     return templates.TemplateResponse(

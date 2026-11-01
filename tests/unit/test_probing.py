@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Iterator
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -324,11 +324,18 @@ class TestNoCredentialInUri:
         """
         from timelapse_manager.cameras.probing import _probe_rtsp
 
-        # Patch the blocking socket call so the test stays in-process.
-        with patch(
-            f"{_PROBE}.asyncio.to_thread", new_callable=AsyncMock
-        ) as mock_thread:
-            mock_thread.return_value = None  # successful connect
+        # Keep the test in-process: the address validates, the connect succeeds.
+        writer = MagicMock()
+        with (
+            patch(
+                f"{_PROBE}.pinned_addresses_async",
+                new=AsyncMock(return_value=(_ADDRESS,)),
+            ),
+            patch(
+                f"{_PROBE}.asyncio.open_connection",
+                new=AsyncMock(return_value=(MagicMock(), writer)),
+            ),
+        ):
             candidate = await _probe_rtsp(_ADDRESS, timeout=2.0)
 
         assert candidate.ok is True
@@ -356,7 +363,11 @@ class TestNoCredentialInUri:
         from timelapse_manager.cameras.probing import _probe_http
 
         async def _fake_get_image(
-            client: object, url: str, creds: object, timeout: float
+            client: object,
+            url: str,
+            creds: object,
+            timeout: float,
+            auth_state: object = None,
         ) -> bytes:
             return b"\xff\xd8\xff\xe0jpeg-bytes"
 
@@ -505,3 +516,57 @@ class TestRecommendedPrimaryFragmentStates:
         assert by_proto["http"].ok is True
         # Recommended follows priority among the ok ones.
         assert outcome.recommended_primary == "rtsp"
+
+
+class TestHostOf:
+    """``_host_of`` returns the bare host, including for IPv6 literals (#249)."""
+
+    @pytest.mark.parametrize(
+        ("address", "host"),
+        [
+            ("192.0.2.10", "192.0.2.10"),
+            ("192.0.2.10:8080", "192.0.2.10"),
+            ("cam.example", "cam.example"),
+            ("cam.example:554/path", "cam.example"),
+            ("http://192.0.2.10:80/x", "192.0.2.10"),
+            ("rtsp://user:pw@192.0.2.10:554/s", "192.0.2.10"),
+            ("fd00::1", "fd00::1"),
+            ("2001:db8::10", "2001:db8::10"),
+            ("fd00::1/path", "fd00::1"),
+            ("[fd00::1]", "fd00::1"),
+            ("[fd00::1]:554", "fd00::1"),
+            ("[fd00::1]:554/path", "fd00::1"),
+            ("https://[fd00::1]:8443/x", "fd00::1"),
+            ("::1", "::1"),
+        ],
+    )
+    def test_extracts_the_host(self, address: str, host: str) -> None:
+        from timelapse_manager.cameras.probing import _host_of
+
+        assert _host_of(address) == host
+
+    def test_a_malformed_bracket_does_not_raise(self) -> None:
+        from timelapse_manager.cameras.probing import _host_of
+
+        assert _host_of("[fd00::1") == "[fd00::1"
+
+    async def test_the_rtsp_probe_dials_an_ipv6_literal_and_brackets_the_uri(
+        self,
+    ) -> None:
+        from timelapse_manager.cameras.probing import _probe_rtsp
+
+        dialled: list[str] = []
+
+        async def open_connection(host: str, port: int) -> tuple[object, MagicMock]:
+            dialled.append(host)
+            return object(), MagicMock()
+
+        with (
+            patch(f"{_PROBE}.camera_allowed_subnets", return_value=("fd00::/8",)),
+            patch("asyncio.open_connection", open_connection),
+        ):
+            candidate = await _probe_rtsp("[fd00::1]:8554", timeout=2.0)
+
+        assert dialled == ["fd00::1"]
+        assert candidate.ok is True
+        assert candidate.stream_uri == "rtsp://[fd00::1]:554/"

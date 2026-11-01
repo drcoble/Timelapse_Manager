@@ -80,7 +80,8 @@
         </select>
         <span class="form-hint">
           Choose <em>LDAPS</em> for port 636, <em>StartTLS</em> to upgrade a
-          plain connection on port 389.
+          plain connection on port 389. <em>None</em> sends passwords in clear
+          text; use it only on a trusted network.
         </span>
       </div>
 
@@ -121,6 +122,10 @@
             {% if ldap.bind_password_set %}
               A password is stored (shown masked). Leave as
               <span class="mono">***</span> to keep it; type a new value to change it.
+            {% elif ldap.bind_dn %}
+              <strong>No password is stored for this bind DN. Re-enter the bind
+              password</strong> (it is cleared whenever the server URLs, TLS mode
+              or bind DN change).
             {% else %}
               No password stored. Leave blank for an unauthenticated bind.
             {% endif %}
@@ -320,6 +325,7 @@
 
         <button type="button" class="btn btn-secondary"
                 hx-post="/settings/ldap/test-connection"
+                hx-request='{"timeout":300000}'
                 hx-target="#ldap-test-result"
                 hx-swap="innerHTML">
           Test connection

@@ -149,6 +149,15 @@ a = Analysis(
     noarchive=False,
 )
 
+# System runtime libraries the bundle must NOT carry. PyInstaller collects
+# libgcc_s.so.1 from the build host, and on Enterprise Linux 9 that copy imports
+# GLIBC_2.35 symbols (Red Hat backports _dl_find_object into its glibc 2.34), so
+# shipping it would break hosts running an earlier EL9 minor release. Every target
+# (EL9, Debian, the container and CT images) has its own libgcc_s matching its own
+# glibc, which the frozen executable then loads from the system.
+_SYSTEM_LIBS = {"libgcc_s.so.1"}
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]) not in _SYSTEM_LIBS]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
@@ -159,6 +168,9 @@ exe = EXE(
     name="timelapse-manager",
     debug=False,
     bootloader_ignore_signals=False,
+    # strip/upx must stay off: py-spy (docs/operations/debugging.md) needs the
+    # unstripped libpython symbols to find the interpreter state. The release
+    # CI's py-spy smoke step catches a regression.
     strip=False,
     upx=False,
     console=True,
@@ -174,6 +186,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
+    # Keep off for py-spy, as on the EXE above.
     strip=False,
     upx=False,
     upx_exclude=[],

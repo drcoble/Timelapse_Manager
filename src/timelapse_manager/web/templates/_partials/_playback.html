@@ -1,0 +1,28 @@
+{#
+  Macros: the per-browser playback check (#25), run by static/js/playability.js.
+
+  A player slot is any element carrying playback_attrs(p): p is a
+  _PlaybackView (codec string, MIME type, label, size, fps, bitrate). The
+  label names codec and container ("H.264 in MKV"): Safari plays H.264 in MP4
+  but not in MKV, so the note must not blame the codec alone (#36).
+  Inside it:
+    - [data-play-ok] elements (the Play link or the <video>) are shown when
+      this browser can play the render;
+    - [data-play-no] elements (the "can't play" note) are shown when it can't.
+
+  Without JavaScript the server's choice stands: the caller renders
+  [data-play-ok] visible only where browser_streamable is true (H.264/MP4), and
+  the note stays hidden, so those viewers get the Download link as before.
+#}
+{% macro playback_attrs(p) -%}
+data-playability data-codec="{{ p.codec }}" data-mime="{{ p.mime }}" data-codec-label="{{ p.label }}"
+{%- if p.width %} data-width="{{ p.width }}"{% endif %}
+{%- if p.height %} data-height="{{ p.height }}"{% endif %}
+{%- if p.fps %} data-fps="{{ '%g' | format(p.fps) }}"{% endif %}
+{%- if p.bitrate %} data-bitrate="{{ p.bitrate }}"{% endif %}
+{%- endmacro %}
+
+{% macro cant_play_note(p, download_url=none, tag='span', css='playability-note') -%}
+<{{ tag }} class="{{ css }}" data-play-no hidden>This browser can't play {{ p.label }}
+{%- if download_url %}; <a href="{{ download_url }}" download>download it</a> to watch{% endif %}.</{{ tag }}>
+{%- endmacro %}

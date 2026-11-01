@@ -261,9 +261,11 @@ CSS-grid app shell: `header` / `nav` / `main`.
 - **Mechanism.** `:root` is light by default. `@media (prefers-color-scheme:
   dark)` provides auto-dark; `[data-theme="light"]` / `[data-theme="dark"]` on
   `<html>` force a choice. A user with no explicit choice follows the system.
-- **No flash.** An inline script in `<head>` sets `[data-theme]` **before** the
-  stylesheet loads, so the correct theme paints on first frame. Don't move theme
-  resolution after first paint.
+- **No flash.** `theme-init.js`, a blocking external script in `<head>` ahead of
+  the stylesheet, sets `[data-theme]` **before** the stylesheet loads, so the
+  correct theme paints on first frame. It reads `<html data-theme-pref>` and
+  falls back to `localStorage`. There is no inline script: the policy is
+  `script-src 'self'`. Don't move theme resolution after first paint.
 - **Toggle.** `theme.js` cycles light → dark → system, POSTs to `/account/theme`,
   and mirrors to `localStorage`. The control is a `.segmented` radio group.
 - **Parity rule.** Every token has both a light and a dark value. When you add a
@@ -297,7 +299,7 @@ swaps — no re-binding needed.
 | Persistent in-page notice | Alert | `.alert.{warning,error,info,success}` |
 | Transient action feedback | Toast | `.toast.{success,error,info,warning}` |
 | Create/edit, keep list visible | Drawer | `.drawer` + `.drawer-backdrop` |
-| Camera discovery only | Modal | `.discover-modal` |
+| Camera discovery; render/export card | Modal | `.discover-modal` |
 | Preset value entry | Suggestion chip | `.chip` (writes to a target input) |
 | Multi-select filter | Filter chip | `.chip[aria-pressed]` |
 | Related views of one place | Tabs | `.tabs[role=tablist]` + `.tab-item` + `.tab-panel` |
@@ -369,6 +371,17 @@ A `.card` groups fields/metadata about **one** object. A `.data-table` compares
 **many** objects of the same type (rows hover to `--color-surface-2`; `th` is
 uppercase). Fewer than ~3 comparable objects → a card may read better.
 
+**Clickable rows.** When a row's main action is "open this object", make the row
+the target and drop the Actions column (Projects) or keep it only for secondary
+actions (Cameras' `⋯` menu). Put `data-row-click="<selector>"` on the `<tbody>`,
+naming the row's own opener: a real `<a href>` or `<button>`. That opener carries
+the action, so Tab, Enter, the no-JavaScript fallback and new-tab clicks work
+without script; `row-click.js` adds the mouse path by forwarding a click on the
+rest of the row. It ignores clicks on controls, modified or non-primary clicks
+and clicks that end a text selection. The frame card in the Frames grid follows
+the same idea: the whole card opens the drawer, while its checkbox and
+Remove/Restore keep their own actions.
+
 ### 6.7 Tabs
 
 Client-side (`tabs.js`, no server round-trip). Contract:
@@ -395,14 +408,34 @@ These are the in-context surfaces. The decision rule for *which* is
   `.app-nav` + `.app-main` `inert`, closes on Esc/backdrop, restores focus to the
   opener. Opener is a real `<a href>` that HTMX-loads a fragment into
   `.drawer-body`. **Single-column forms only** — the width won't hold two
-  columns.
+  columns. Closing sets `inert`, then (after the transition, a 400 ms fallback,
+  or at once under reduced motion) adds `.drawer--hidden` and **empties the
+  body**, so unsaved drawer input is discarded on Escape or backdrop close; opening
+  reverses it. A failed or timed-out drawer load clears the pending-open state.
 - **Modal** (`modal.js`): centered `.discover-modal` (radius-xl). Reserved for
-  **Camera Discover**. Don't repurpose it — reach for a drawer instead.
+  **Camera Discover** and the **render / export card** (owner decision, issue
+  #9: the card is opened from a self-refreshing list and must sit outside it).
+  Don't repurpose it further — reach for a drawer instead. The card's Delete
+  still confirms with `.inline-confirm` inside the card, not a second overlay. A
+  closed modal's backdrop is `visibility: hidden` (set after the fade-out), so
+  its buttons are out of the keyboard tab order while it is closed (#277).
 - **Inline-confirm** (`.inline-confirm`): an error-background banner HTMX-swapped
   in to *replace* a destructive trigger; the confirm button is the real form
   submit. This is the standard for delete/wipe — **not** a modal "Are you sure?".
 - **Row-actions popover** (`.row-actions-popover`): CSS `:hover`/`:focus-within`,
   no JS, with `.danger` items for destructive entries.
+- **Header user menu** (`.user-menu`): opens on `:focus-within` (click or
+  keyboard) only, **not hover**, so it can never sit under a resting pointer.
+- **Touch and mobile.** On a coarse pointer, tile actions, selects, chips, `.btn`,
+  form controls and header controls are at least 44 px; under 600 px the Actions
+  column of a table is sticky. The page starts with a skip link to `main`
+  (`tabindex="-1"`), and only the current nav item carries `aria-current="page"`.
+- **Scripts and CSP.** The policy is `script-src 'self'`: no inline `<script>`,
+  no `on*=` and no `<style>` in a template. New behaviour registers a
+  `data-action` handler in `static/js/actions.js` (one event type per action:
+  click, change or input) and is attached with `data-action="..."`; per-request
+  values travel as `data-*` attributes. `tests/web/test_frontend_contracts.py`
+  fails on any inline code.
 
 ### 6.9 Time ribbon
 
@@ -463,7 +496,7 @@ Use only these levels — never an arbitrary value. A new sticky element slots i
 | 60 | Frames selection / action bar |
 | 90 | Mobile bottom nav (≤600px) |
 | 100 | Header (sticky) |
-| 200 | Hover panels (user menu, alerts panel) |
+| 200 | Header panels (user menu, alerts panel) |
 | 299 | Drawer / modal backdrop |
 | 300 | Drawer / modal |
 | 500 | Toasts |
@@ -499,7 +532,7 @@ from the table; don't improvise.
 |---|---|---|---|
 | **Full navigation** | New page | The target is a *place* the user dwells in | Opening a project's detail page |
 | **Drawer** | Right slide-in, focus-trapped | A create/detail flow that benefits from keeping the originating list visible | New Project; Frame detail |
-| **Modal** | Centered, focus-trapped | A self-contained action that must own the screen briefly (rare — justify it) | Camera Discover scan |
+| **Modal** | Centered, focus-trapped | A self-contained action that must own the screen briefly (rare — justify it) | Camera Discover scan; render/export card |
 | **Inline expansion** | In-page, no overlay | Editing/adding inside a table where neighboring rows are useful reference | Add / Edit Camera |
 | **Inline-confirm** | Error-bg banner replacing the trigger | A destructive confirmation; confirm = real form submit | Delete project/camera/render |
 | **Row-actions popover** | CSS hover/focus menu | A per-row menu of secondary actions | "⋯" Archive/Delete on a row |
@@ -536,9 +569,13 @@ lot of content — if it shares the same place, it's a tab.
 **Header.** Logo + breadcrumb + theme toggle + alerts panel + role badge + user
 menu. The **breadcrumb is the primary "where am I"** signal (the nav is flat);
 set it on every screen, and on detail views show the parent → child path. The
-**alerts panel** polls `/alerts/summary` every 30s with a badge count, opening on
-hover/focus. The **role badge** shows admin/viewer; **operator is hidden** because
-it is the default role — a badge for the normal case is noise.
+**alerts panel** is a disclosure: a static button (`aria-expanded`, accessible
+name "Active alerts: N") opens a static panel by click, tap, Enter or Space;
+Escape or a click outside closes it. A separate background poller fetches
+`/alerts/summary` every 30 s and updates only the badge, the count label and
+the panel body (out-of-band swaps), and pauses while the panel is open. The
+**role badge** shows admin/viewer; **operator is hidden** because it is the default
+role — a badge for the normal case is noise.
 
 ---
 
@@ -548,11 +585,14 @@ Require the minimum, infer the rest, and make the first action move the user
 forward. These patterns apply to any new create/configure form.
 
 - **Query-first golden path.** When form content can be *discovered*, make
-  discovery the first and most prominent action. On Add Camera, Address + "Query
-  camera" comes first; the device response populates protocol, hostname,
-  geolocation, URIs, and profiles, and one **"Accept all"** button fills the
-  form. *Rule:* detected-then-confirmed beats typed-from-scratch — lead with the
-  detect action, let one button accept, leave every field editable after.
+  discovery the first and most prominent action. On Add Camera, the form runs in
+  fill order: Address, credentials, the Basic-over-HTTP opt-in, then "Query
+  camera" (so the credentials Query needs are already entered), then the
+  name, hostname and protocol it proposes, with Advanced last. The device
+  response populates protocol, hostname, geolocation, URIs, and profiles, and
+  one **"Accept all"** button fills the form. *Rule:* detected-then-confirmed
+  beats typed-from-scratch — lead with the detect action once its inputs exist,
+  let one button accept, leave every field editable after.
 - **Provenance chips.** Any pre-filled value shows its origin —
   `[device-reported]` (green), `[manual]`, or `[env]` — and the chip updates the
   instant a user overrides it. Never silently pre-fill.
@@ -560,8 +600,10 @@ forward. These patterns apply to any new create/configure form.
   live under a `▸ Advanced` disclosure, **pre-populated and collapsed**. The
   default surface is everything a novice needs; depth is filled-in, not blank.
 - **Conditional reveal.** Hide a field set until a non-default choice makes it
-  relevant — e.g. "Use global default" credentials is pre-checked; per-camera
-  fields appear only when unchecked.
+  relevant — e.g. "Use default credentials" is pre-checked; per-camera
+  fields appear only when unchecked. When there is no default to inherit
+  (none configured in Settings), do not show the checkbox at all: show the
+  fields directly.
 - **Suggestion chips with consequence labels.** Offer common-good values as
   chips. When a value's meaning is non-obvious, label the chip with its
   real-world consequence (e.g. *"At 5m interval, 30fps = 2.5h real-time per 1s

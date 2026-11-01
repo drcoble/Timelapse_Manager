@@ -19,7 +19,10 @@ What is and is not covered here:
 
 from __future__ import annotations
 
+import socket
 import ssl
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -27,9 +30,16 @@ from pathlib import Path
 import ldap3
 import pytest
 from ldap3 import MOCK_SYNC, Connection, Server
-from ldap3.core.exceptions import LDAPSocketOpenError
+from ldap3.core.exceptions import (
+    LDAPException,
+    LDAPResponseTimeoutError,
+    LDAPSocketOpenError,
+    LDAPSocketReceiveError,
+    communication_exception_factory,
+)
 
 from timelapse_manager.security.ldap_directory import (
+    DETAIL_NO_SERVER_REACHABLE,
     LdapOutcome,
     _build_server_pool,
     authenticate,
@@ -459,3 +469,519 @@ def test_replace_view_keeps_other_fields(mode: str) -> None:
     view = replace(_base_view(), membership_mode=mode)
     assert view.membership_mode == mode
     assert view.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Every connection is unbound on every outcome (#67 R3)
+# ---------------------------------------------------------------------------
+
+
+class _UnbindLedger:
+    """Wrap a connection factory, counting each opened connection's unbinds."""
+
+    def __init__(
+        self,
+        inner: Callable[[object, str | None, str | None], Connection],
+        *,
+        fail_unbind: bool = False,
+        raise_on_search: bool = False,
+    ) -> None:
+        self._inner = inner
+        self._fail_unbind = fail_unbind
+        self._raise_on_search = raise_on_search
+        self.connections: list[Connection] = []
+        self.unbinds: list[int] = []
+
+    def __call__(
+        self, pool: object, user: str | None, password: str | None
+    ) -> Connection:
+        conn = self._inner(pool, user, password)
+        index = len(self.connections)
+        self.connections.append(conn)
+        self.unbinds.append(0)
+        real_unbind = conn.unbind
+
+        def unbind(*args: object, **kwargs: object) -> object:
+            self.unbinds[index] += 1
+            if self._fail_unbind:
+                raise OSError("socket already closed")
+            return real_unbind(*args, **kwargs)
+
+        conn.unbind = unbind  # type: ignore[method-assign]
+        if self._raise_on_search:
+
+            def search(*_a: object, **_k: object) -> bool:
+                raise LDAPSocketOpenError("lost mid-flight")
+
+            conn.search = search  # type: ignore[method-assign]
+        return conn
+
+    def every_connection_unbound_once(self) -> bool:
+        return bool(self.unbinds) and all(n == 1 for n in self.unbinds)
+
+
+def _auth(ledger: _UnbindLedger, *, username: str = "alice", password: str = _USER_PW):
+    return authenticate(
+        settings=_base_view(),
+        username=username,
+        password=password,
+        bind_password=_SVC_PW,
+        connection_factory=ledger,
+    )
+
+
+class TestUnbindOnEveryOutcome:
+    def test_authenticated(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()))
+        assert _auth(ledger).outcome is LdapOutcome.AUTHENTICATED
+        assert len(ledger.connections) == 2  # service + user bind
+        assert ledger.every_connection_unbound_once()
+
+    def test_service_bind_failed(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()))
+        result = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password="wrong-service-pw",
+            connection_factory=ledger,
+        )
+        assert result.outcome is LdapOutcome.CONFIG_ERROR
+        assert ledger.every_connection_unbound_once()
+
+    def test_user_not_found(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()))
+        assert _auth(ledger, username="nobody").outcome is LdapOutcome.NO_SUCH_USER
+        assert ledger.every_connection_unbound_once()
+
+    def test_user_bind_rejected(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()))
+        assert _auth(ledger, password="wrong").outcome is (
+            LdapOutcome.INVALID_CREDENTIALS
+        )
+        assert len(ledger.connections) == 2
+        assert ledger.every_connection_unbound_once()
+
+    def test_exception_mid_flight(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()), raise_on_search=True)
+        assert _auth(ledger).outcome is LdapOutcome.SERVER_UNREACHABLE
+        assert ledger.every_connection_unbound_once()
+
+    def test_a_failing_unbind_does_not_replace_the_result(self) -> None:
+        ledger = _UnbindLedger(_make_factory(_memberof_entries()), fail_unbind=True)
+        assert _auth(ledger).outcome is LdapOutcome.AUTHENTICATED
+
+    def test_resolve_directory_state_unbinds_on_every_outcome(self) -> None:
+        cases = [
+            ("alice", _SVC_PW, False, LdapOutcome.AUTHENTICATED),
+            ("nobody", _SVC_PW, False, LdapOutcome.NO_SUCH_USER),
+            ("alice", "wrong-service-pw", False, LdapOutcome.CONFIG_ERROR),
+            ("alice", _SVC_PW, True, LdapOutcome.SERVER_UNREACHABLE),
+        ]
+        for username, bind_pw, raises, expected in cases:
+            ledger = _UnbindLedger(
+                _make_factory(_memberof_entries()), raise_on_search=raises
+            )
+            state = resolve_directory_state(
+                settings=_base_view(),
+                username=username,
+                bind_password=bind_pw,
+                connection_factory=ledger,
+            )
+            assert state.outcome is expected
+            assert ledger.every_connection_unbound_once(), expected
+
+
+# ---------------------------------------------------------------------------
+# A directory that accepts the connection and then stalls (#202)
+# ---------------------------------------------------------------------------
+
+
+def _receive_timeout() -> LDAPSocketReceiveError:
+    """The exception ldap3 raises when ``receive_timeout`` expires on a read."""
+    return communication_exception_factory(
+        LDAPSocketReceiveError, TimeoutError("timed out")
+    )("error receiving data: timed out")
+
+
+def _stall_factory(
+    inner: Callable[[object, str | None, str | None], Connection],
+    *,
+    on: str,
+    exc: Callable[[], Exception] = _receive_timeout,
+) -> Callable[[object, str | None, str | None], Connection]:
+    """Wrap ``inner`` so connection method ``on`` raises ``exc()`` (a stall)."""
+
+    def factory(pool: object, user: str | None, password: str | None) -> Connection:
+        conn = inner(pool, user, password)
+        if on == "service-bind" and user == _SVC_DN:
+            conn.bind = lambda *a, **k: (_ for _ in ()).throw(exc())  # type: ignore[method-assign]
+        elif on == "search" and user == _SVC_DN:
+            conn.search = lambda *a, **k: (_ for _ in ()).throw(exc())  # type: ignore[method-assign]
+        elif on == "user-bind" and user == _USER_DN:
+            conn.bind = lambda *a, **k: (_ for _ in ()).throw(exc())  # type: ignore[method-assign]
+        return conn
+
+    return factory
+
+
+def _request_specific_stall_factory(
+    inner: Callable[[object, str | None, str | None], Connection],
+    calls: list[str] | None = None,
+) -> Callable[[object, str | None, str | None], Connection]:
+    """Stall only searches whose filter carries a client-chosen name.
+
+    The configured (client-independent) searches keep answering, as a healthy
+    directory does when one crafted query is slow.
+    """
+
+    def factory(pool: object, user: str | None, password: str | None) -> Connection:
+        conn = inner(pool, user, password)
+        real_search = conn.search
+
+        def search(*args: object, **kwargs: object) -> object:
+            filt = str(kwargs.get("search_filter", args[1] if len(args) > 1 else ""))
+            if calls is not None:
+                calls.append(filt)
+            if "uid=" in filt:
+                raise _receive_timeout()
+            return real_search(*args, **kwargs)
+
+        conn.search = search  # type: ignore[method-assign,assignment]
+        return conn
+
+    return factory
+
+
+class TestStalledDirectory:
+    """A stall is "unreachable" only if no request could have caused it.
+
+    Before the service bind completes nothing a client chose has been sent. After
+    it, a slow user search may be the client's doing (a crafted name), so it only
+    counts when a client-independent canary search stalls too (#216); a stall the
+    canary does not reproduce must stay a plain "directory error".
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [_receive_timeout, lambda: LDAPResponseTimeoutError("no response")],
+        ids=["receive-timeout", "response-timeout"],
+    )
+    def test_stall_during_service_bind_is_no_server_reachable(
+        self, exc: Callable[[], Exception]
+    ) -> None:
+        factory = _stall_factory(
+            _make_factory(_memberof_entries()), on="service-bind", exc=exc
+        )
+        auth = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        for result in (auth, state):
+            assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+            assert result.detail == DETAIL_NO_SERVER_REACHABLE
+
+    def test_hang_after_the_service_bind_is_no_server_reachable(self) -> None:
+        """Bind-then-hang: every search stalls, the canary included (#216)."""
+        factory = _stall_factory(_make_factory(_memberof_entries()), on="search")
+        auth = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        for result in (auth, state):
+            assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+            assert result.detail == DETAIL_NO_SERVER_REACHABLE
+
+    def test_the_canary_carries_nothing_a_request_chose(self) -> None:
+        """The confirming search is built from configuration alone."""
+        calls: list[str] = []
+        inner = _request_specific_stall_factory(
+            _make_factory(_memberof_entries()), calls
+        )
+        authenticate(
+            settings=_base_view(),
+            username="alice*)(uid=*",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=inner,
+        )
+        assert calls[-1] == "(objectClass=*)"
+        assert "alice" not in calls[-1]
+
+    def test_a_request_specific_stall_stays_a_directory_error(self) -> None:
+        """A slow crafted search the canary does not reproduce never opens it."""
+        factory = _request_specific_stall_factory(_make_factory(_memberof_entries()))
+        auth = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        for result in (auth, state):
+            assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+            assert result.detail == "directory error"
+
+    def test_a_non_stall_search_fault_stays_a_directory_error(self) -> None:
+        factory = _stall_factory(
+            _make_factory(_memberof_entries()),
+            on="search",
+            exc=lambda: LDAPException("bad packet"),
+        )
+        auth = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=factory,
+        )
+        for result in (auth, state):
+            assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+            assert result.detail == "directory error"
+
+    def test_stall_during_the_user_bind_stays_a_directory_error(self) -> None:
+        """The user bind follows a client-chosen name and password."""
+        result = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=_stall_factory(
+                _make_factory(_memberof_entries()), on="user-bind"
+            ),
+        )
+        assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+        assert result.detail == "directory error"
+
+    def test_a_non_stall_fault_before_the_bind_is_not_unreachable(self) -> None:
+        """A protocol error is still only a "directory error"."""
+        result = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=_stall_factory(
+                _make_factory(_memberof_entries()),
+                on="service-bind",
+                exc=lambda: LDAPException("bad packet"),
+            ),
+        )
+        assert result.detail == "directory error"
+
+    def test_a_server_that_accepts_and_never_answers(self) -> None:
+        """The real default factory against a socket that accepts and stays silent.
+
+        A local listener standing in for a hung directory (no real server is
+        contacted). The receive timeout derived from ``connect_timeout`` turns the
+        stall into the typed "no server reachable" result, quickly.
+        """
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        accepted: list[socket.socket] = []
+        stop = threading.Event()
+
+        def accept_and_hold() -> None:
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    accepted.append(listener.accept()[0])
+                except OSError:
+                    continue
+
+        thread = threading.Thread(target=accept_and_hold, daemon=True)
+        thread.start()
+        try:
+            view = _base_view(
+                server_urls=[f"ldap://127.0.0.1:{listener.getsockname()[1]}"],
+                connect_timeout_seconds=1.0,
+            )
+            started = time.monotonic()
+            result = authenticate(
+                settings=view,
+                username="alice",
+                password=_USER_PW,
+                bind_password=_SVC_PW,
+            )
+            state = resolve_directory_state(
+                settings=view, username="alice", bind_password=_SVC_PW
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+            for held in accepted:
+                held.close()
+            listener.close()
+        assert result.outcome is LdapOutcome.SERVER_UNREACHABLE
+        assert result.detail == DETAIL_NO_SERVER_REACHABLE
+        assert state.outcome is LdapOutcome.SERVER_UNREACHABLE
+        assert state.detail == DETAIL_NO_SERVER_REACHABLE
+        assert elapsed < 10
+
+
+# ---------------------------------------------------------------------------
+# Account-lock attribute (#67 S10)
+# ---------------------------------------------------------------------------
+
+
+def _locked_entries(value: object, *, attr: str = "nsAccountLock"):
+    entries = _memberof_entries()
+    entries[_USER_DN][attr] = value
+    return entries
+
+
+class TestLockAttribute:
+    @pytest.mark.parametrize("value", ["TRUE", "true", "True"])
+    def test_a_locked_account_resolves_as_locked(self, value: str) -> None:
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_locked_entries(value)),
+            lock_attribute="nsAccountLock",
+        )
+        assert state.outcome is LdapOutcome.LOCKED
+        assert state.found is False
+        assert state.groups == frozenset()
+
+    def test_the_attribute_name_is_matched_case_insensitively(self) -> None:
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(
+                _locked_entries("TRUE", attr="nsaccountlock")
+            ),
+            lock_attribute="nsAccountLock",
+        )
+        assert state.outcome is LdapOutcome.LOCKED
+
+    @pytest.mark.parametrize("value", ["FALSE", "false", "", "no"])
+    def test_other_values_do_not_lock(self, value: str) -> None:
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_locked_entries(value)),
+            lock_attribute="nsAccountLock",
+        )
+        assert state.outcome is LdapOutcome.AUTHENTICATED
+
+    def test_an_absent_attribute_changes_nothing(self) -> None:
+        """A bind account that cannot read the flag simply never sees it."""
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_memberof_entries()),
+            lock_attribute="nsAccountLock",
+        )
+        assert state.outcome is LdapOutcome.AUTHENTICATED
+
+    def test_an_empty_attribute_disables_the_check(self) -> None:
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_locked_entries("TRUE")),
+            lock_attribute="",
+        )
+        assert state.outcome is LdapOutcome.AUTHENTICATED
+
+    def test_the_default_comes_from_settings(self) -> None:
+        """No explicit argument and no app context: ``nsAccountLock``."""
+        state = resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_locked_entries("TRUE")),
+        )
+        assert state.outcome is LdapOutcome.LOCKED
+
+    def test_the_lock_attribute_is_requested_by_name(self) -> None:
+        """It is operational: ``*`` alone does not return it."""
+        seen: list[object] = []
+
+        def spying(pool: object, user: str | None, password: str | None):
+            conn = _make_factory(_memberof_entries())(pool, user, password)
+            real = conn.search
+
+            def search(*args: object, **kwargs: object) -> object:
+                seen.append(kwargs.get("attributes"))
+                return real(*args, **kwargs)
+
+            conn.search = search  # type: ignore[method-assign]
+            return conn
+
+        resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=spying,
+            lock_attribute="nsAccountLock",
+        )
+        assert seen[0] == ["*", "nsAccountLock"]
+        seen.clear()
+        resolve_directory_state(
+            settings=_base_view(),
+            username="alice",
+            bind_password=_SVC_PW,
+            connection_factory=spying,
+            lock_attribute="",
+        )
+        assert seen[0] == "*"
+
+    def test_a_locked_account_cannot_log_in_and_looks_like_a_wrong_password(
+        self,
+    ) -> None:
+        locked = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password=_USER_PW,
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_locked_entries("TRUE")),
+            lock_attribute="nsAccountLock",
+        )
+        wrong = authenticate(
+            settings=_base_view(),
+            username="alice",
+            password="wrong-password",
+            bind_password=_SVC_PW,
+            connection_factory=_make_factory(_memberof_entries()),
+            lock_attribute="nsAccountLock",
+        )
+        assert locked.outcome is LdapOutcome.INVALID_CREDENTIALS
+        assert locked.outcome is wrong.outcome
+        assert locked.authenticated is False
+        assert locked.groups == frozenset()

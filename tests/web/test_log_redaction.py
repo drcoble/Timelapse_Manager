@@ -23,7 +23,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of, login, seed_admin
+from tests.presession_support import session_cookie
 from timelapse_manager.runtime import get_context
+from timelapse_manager.security.login import read_setup_code
 from timelapse_manager.security.token import ensure_local_token
 
 _LOG = logging.getLogger(__name__)
@@ -108,9 +110,14 @@ class TestPasswordNotLogged:
         password = "SetupPassword99!!"
         with caplog.at_level(logging.DEBUG):
             _emit_sentinel(caplog)
-            web_client.post(
+            # Loading the page creates the one-time setup code (#67 S11).
+            web_client.get("/first-run")
+            setup_code = read_setup_code(get_context().settings.paths.data_dir)
+            assert setup_code is not None
+            resp = web_client.post(
                 "/first-run",
                 data={
+                    "setup_code": setup_code,
                     "username": "setupadmin",
                     "password": password,
                     "password_confirm": password,
@@ -118,8 +125,11 @@ class TestPasswordNotLogged:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 follow_redirects=False,
             )
+        assert resp.status_code == 303
         _assert_caplog_active(caplog)
-        _assert_no_secret_in_logs(caplog, [password], description="first-run password")
+        _assert_no_secret_in_logs(
+            caplog, [password, setup_code], description="first-run password or code"
+        )
 
 
 class TestSessionTokenNotLogged:
@@ -130,8 +140,7 @@ class TestSessionTokenNotLogged:
         with caplog.at_level(logging.DEBUG):
             _emit_sentinel(caplog)
             login(web_client)
-        cookie_name = get_context().settings.session.cookie_name
-        raw_token = web_client.cookies.get(cookie_name)
+        raw_token = session_cookie(web_client)
         assert raw_token  # sanity check
         _assert_caplog_active(caplog)
         _assert_no_secret_in_logs(caplog, [raw_token], description="session token")
@@ -139,8 +148,7 @@ class TestSessionTokenNotLogged:
     def test_session_token_not_in_logs_after_logout(
         self, admin_client: TestClient, caplog: pytest.LogCaptureFixture
     ) -> None:
-        cookie_name = get_context().settings.session.cookie_name
-        raw_token = admin_client.cookies.get(cookie_name)
+        raw_token = session_cookie(admin_client)
         csrf = csrf_of(admin_client, "/")
         with caplog.at_level(logging.DEBUG):
             _emit_sentinel(caplog)

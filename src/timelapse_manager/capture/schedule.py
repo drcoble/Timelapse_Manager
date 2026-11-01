@@ -58,6 +58,7 @@ __all__ = [
     "parse_schedule",
     "is_within_window",
     "next_transition",
+    "open_stretches",
     "compute_sun_times",
     "compute_solar_noon",
 ]
@@ -514,19 +515,72 @@ def next_transition(
     return (open_now, None)
 
 
+def open_stretches(
+    schedule: Schedule,
+    start: datetime,
+    end: datetime,
+    *,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> list[tuple[datetime, datetime]]:
+    """Return the gate's open stretches within ``[start, end)``, in order.
+
+    Each item is an aware-UTC ``(opens, closes)`` pair, clipped to the range;
+    adjacent open pieces are merged, so every boundary inside the range is a
+    real gate change -- exactly the instants :func:`next_transition` would
+    report walking forward from *start*. It builds the candidate set once for
+    the range instead of once per change, which matters to a caller that walks
+    a week of changes on every page render: a sun window costs one sun
+    computation per day and candidate, not a year's worth per change.
+    """
+    start_utc = start.astimezone(UTC)
+    end_utc = end.astimezone(UTC)
+    if end_utc <= start_utc:
+        return []
+    if schedule.is_always_open:
+        return [(start_utc, end_utc)]
+
+    span_days = (end_utc - start_utc).days + 1
+    edges = [
+        candidate
+        for candidate in _iter_candidates(
+            schedule, start_utc, schedule.tzinfo(), latitude, longitude, span_days
+        )
+        if candidate < end_utc
+    ]
+    stretches: list[tuple[datetime, datetime]] = []
+    opened: datetime | None = None
+    for instant in (start_utc, *edges):
+        # Evaluating at a candidate yields the post-change state (half-open
+        # ranges), the same rule next_transition relies on.
+        state = is_within_window(
+            schedule, instant, latitude=latitude, longitude=longitude
+        )
+        if state and opened is None:
+            opened = instant
+        elif not state and opened is not None:
+            stretches.append((opened, instant))
+            opened = None
+    if opened is not None:
+        stretches.append((opened, end_utc))
+    return stretches
+
+
 def _iter_candidates(
     schedule: Schedule,
     now_utc: datetime,
     tz: ZoneInfo,
     latitude: float | None,
     longitude: float | None,
+    horizon_days: int = _MAX_SCAN_DAYS,
 ) -> list[datetime]:
     """Build the sorted, de-duplicated set of candidate transition instants.
 
     Candidates are every instant at which the gate *could* flip within the scan
-    horizon: each local midnight (catches day-mask flips), each clock window's
-    start and end on each local day, each resolved sun anchor on each local day,
-    and the campaign's ``start_date``/``end_date``. Sun times are computed at
+    horizon (*horizon_days* after *now_utc*): each local midnight (catches
+    day-mask flips), each clock window's start and end on each local day, each
+    resolved sun anchor on each local day, and the campaign's
+    ``start_date``/``end_date``. Sun times are computed at
     most once per local day. Instants that fall in a nonexistent or ambiguous
     wall-clock slot (spring-forward / fall-back) are tolerated by ``zoneinfo``'s
     fold/normalisation and never raise.
@@ -539,7 +593,7 @@ def _iter_candidates(
         candidates.add(schedule.end_date)
 
     local_start_day = now_utc.astimezone(tz).date()
-    for day_offset in range(_MAX_SCAN_DAYS + 1):
+    for day_offset in range(horizon_days + 1):
         local_day = local_start_day + timedelta(days=day_offset)
 
         # Local midnight: the day-mask flips here.
@@ -563,7 +617,7 @@ def _iter_candidates(
                 for anchor in schedule.sun_window:
                     candidates.add(_anchor_instant(anchor, sunrise_utc, sunset_utc))
 
-    horizon = now_utc + timedelta(days=_MAX_SCAN_DAYS)
+    horizon = now_utc + timedelta(days=horizon_days)
     return sorted(c for c in candidates if now_utc < c <= horizon)
 
 

@@ -7,6 +7,8 @@ admin login's operational 'signed in' event (scope=system) never skews counts.
 from __future__ import annotations
 
 import datetime
+import html as html_lib
+import re
 
 from fastapi.testclient import TestClient
 
@@ -93,6 +95,19 @@ def _row_count(html: str) -> int:
     return html.count('class="event-row')
 
 
+# The message cell of one event row (``_partials/event_row.html``).
+_MESSAGE_CELL = re.compile(r'<td class="event-message">(.*?)</td>', re.S)
+
+
+def _messages(html: str) -> list[str]:
+    """The messages of the event rows in ``html``, in display order.
+
+    Assert on these, not on bare substrings of the page: a short message such
+    as ``e0`` also turns up inside the random CSRF token (#34).
+    """
+    return [html_lib.unescape(m).strip() for m in _MESSAGE_CELL.findall(html)]
+
+
 def test_batch_first_page_and_sentinel(admin_client: TestClient) -> None:
     _seed_events([("info", f"msg {i}") for i in range(80)])
     html = admin_client.get("/events/batch?scope=camera").text
@@ -136,6 +151,49 @@ def test_search_filter(admin_client: TestClient) -> None:
     html = admin_client.get("/events/batch?scope=camera&q=alpha").text
     assert _row_count(html) == 2
     assert "beta event" not in html
+
+
+def test_search_percent_is_literal_not_wildcard(admin_client: TestClient) -> None:
+    """A ``%`` in the search term matches literally, not as a LIKE wildcard.
+
+    Unescaped, ``q=%`` becomes the pattern ``%%%`` which matches every row (an
+    unbounded scan). Escaped, it matches only messages literally containing ``%``.
+    """
+    _seed_events([("info", "alpha event"), ("info", "beta"), ("info", "50% off")])
+    html = admin_client.get("/events/batch?scope=camera&q=%25").text  # %25 == '%'
+    assert _row_count(html) == 1
+    assert "50% off" in html
+    assert "alpha event" not in html
+
+
+def test_search_underscore_is_literal_not_wildcard(admin_client: TestClient) -> None:
+    """An ``_`` in the search term matches literally, not as a single-char wildcard.
+
+    Unescaped, ``q=a_b`` matches ``axb``/``ayb`` (``_`` = any one char). Escaped,
+    it matches only the message literally containing ``a_b``.
+    """
+    _seed_events([("info", "a_b hit"), ("info", "axb miss"), ("info", "ayb miss")])
+    html = admin_client.get("/events/batch?scope=camera&q=a_b").text
+    assert _row_count(html) == 1
+    assert "a_b hit" in html
+    assert "axb miss" not in html
+    assert "ayb miss" not in html
+
+
+def test_search_term_is_length_bounded(admin_client: TestClient) -> None:
+    """An over-long search term is truncated to the cap before it hits the query.
+
+    Seeds a 200-char message and searches for that message plus a trailing suffix
+    (203 chars). Only if the term is truncated to the 200-char cap does the
+    remaining ``%needle%`` still match the seeded row; an un-truncated 203-char
+    term would not match. Finding the row proves the bound is applied.
+    """
+    needle = "q" * 200
+    _seed_events([("info", needle), ("info", "unrelated")])
+    over_long = needle + "EXTRA"  # 205 chars; truncates back to `needle`
+    html = admin_client.get(f"/events/batch?scope=camera&q={over_long}").text
+    assert _row_count(html) == 1
+    assert "unrelated" not in html
 
 
 def test_events_page_has_grid_and_filters(admin_client: TestClient) -> None:
@@ -203,10 +261,9 @@ def test_events_at_returns_events_at_or_before_instant(
     # Jump to the instant of e5 -> e5 and older (e0..e5) are at-or-before it.
     at = (base + datetime.timedelta(minutes=5)).isoformat()
     html = admin_client.get(f"/events?scope=camera&at={at}").text
-    assert "e5" in html  # the boundary event itself is included
-    assert "e4" in html  # older events page from there
-    assert "e6" not in html  # newer events are excluded by the jump
-    assert "e9" not in html
+    # The boundary event itself is included, older events page from there,
+    # and newer events (e6..e9) are excluded by the jump.
+    assert _messages(html) == ["e5", "e4", "e3", "e2", "e1", "e0"]
 
 
 def test_events_at_has_usable_continuation_cursor(
@@ -236,8 +293,8 @@ def test_events_window_empty_when_anchor_precedes_log(
     )
     before_all = (base - datetime.timedelta(days=1)).isoformat()
     html = admin_client.get(f"/events?scope=camera&at={before_all}").text
-    assert "e0" not in html
-    assert "e4" not in html
+    assert _row_count(html) == 0
+    assert _messages(html) == []
     assert "No events match" in html
 
 
@@ -253,7 +310,7 @@ def test_events_at_hx_request_returns_batch_fragment(
     html = admin_client.get(
         f"/events?scope=camera&at={at}", headers={"HX-Request": "true"}
     ).text
-    assert "e5" in html
+    assert _messages(html)[0] == "e5"
     assert 'id="events-tbody"' not in html  # fragment only, no page chrome
 
 

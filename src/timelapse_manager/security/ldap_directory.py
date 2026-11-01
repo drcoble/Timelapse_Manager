@@ -27,7 +27,6 @@ group matching and the "is this the same user" check are reliable.
 
 from __future__ import annotations
 
-import contextlib
 import enum
 import logging
 import math
@@ -37,11 +36,15 @@ from typing import TYPE_CHECKING, Protocol
 
 import ldap3
 from ldap3.core.exceptions import (
+    LDAPCommunicationError,
     LDAPException,
+    LDAPResponseTimeoutError,
     LDAPServerPoolExhaustedError,
     LDAPSocketOpenError,
 )
 from ldap3.utils.conv import escape_filter_chars
+
+from ..runtime import get_context
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -61,6 +64,10 @@ logger = logging.getLogger(__name__)
 _POOLING_LOOP_TIMEOUT_SECONDS = 1
 ldap3.set_config_parameter("POOLING_LOOP_TIMEOUT", _POOLING_LOOP_TIMEOUT_SECONDS)
 
+# ``auth.ldap_lock_attribute`` default, used when no application context is
+# installed (a bare unit test).
+_DEFAULT_LOCK_ATTRIBUTE = "nsAccountLock"
+
 # Role precedence, lowest to highest. A user who matches multiple mapped groups
 # is granted the most privileged of them (highest-privilege-wins).
 _ROLE_PRECEDENCE: tuple[str, ...] = ("viewer", "operator", "admin")
@@ -79,6 +86,11 @@ class LdapOutcome(enum.Enum):
     NO_SUCH_USER = "no_such_user"
     SERVER_UNREACHABLE = "server_unreachable"
     CONFIG_ERROR = "config_error"
+    # The directory affirmatively reports the account as locked (``nsAccountLock``
+    # or the configured ``auth.ldap_lock_attribute``). Only the password-less
+    # re-evaluation reports it as such; a login for a locked account is a plain
+    # ``INVALID_CREDENTIALS`` so it cannot be told from a wrong password.
+    LOCKED = "locked"
     # Directory auth is switched off entirely. Distinct from CONFIG_ERROR so the
     # login flow can cleanly fall through to local authentication rather than
     # surfacing a misconfiguration error.
@@ -124,6 +136,8 @@ class LdapDirectoryState:
       directory affirmatively resolved this account", not as a fresh credential
       check).
     * :attr:`LdapOutcome.NO_SUCH_USER` -- the account is gone (deprovisioned).
+    * :attr:`LdapOutcome.LOCKED` -- the account exists but the directory marks it
+      locked (disabled); access is withdrawn like a deprovisioned account.
     * :attr:`LdapOutcome.SERVER_UNREACHABLE` / :attr:`LdapOutcome.CONFIG_ERROR` /
       :attr:`LdapOutcome.DISABLED` -- transient or configuration faults the caller
       must treat as "cannot decide" (fail-safe: keep the session).
@@ -140,12 +154,142 @@ class LdapDirectoryState:
         return self.outcome is LdapOutcome.AUTHENTICATED
 
 
+# ``LdapAuthResult.detail`` when no directory server could be reached *before*
+# the user search, so nothing about the submitted name was learned (#67 S7).
+# That covers a server that accepts the connection and then goes silent or drops
+# it before the service-account bind completes (a receive timeout, #202): that
+# fault happens before any client-supplied value is sent, so no request can
+# provoke it and it says nothing about a name. A stall *after* the service bind
+# (user search, group search) follows client input, so on its own it stays
+# "directory error"; it earns this detail only when a client-independent canary
+# search stalls as well (:func:`_canary_unanswered`, #216), and so never lets a
+# crafted login open the breaker. A stall after the user was found (user re-bind)
+# never does, so the answer cannot confirm the name.
+DETAIL_NO_SERVER_REACHABLE = "no server reachable"
+# ``LdapAuthResult.detail`` when the connection was lost *after* the user search
+# found the name. Callers must treat it like any failed login: a distinct answer
+# would confirm the name exists.
+DETAIL_LOST_AFTER_USER_SEARCH = "server lost after user search"
+
+
 @dataclass(frozen=True)
 class _LocatedUser:
     """The user entry located by the service-account search."""
 
     dn: str
     attributes: dict[str, list[str]]
+
+
+# Failures that, before the service bind completes, mean the directory is not
+# answering: a receive timeout (ldap3 raises ``LDAPSocketReceiveError``, a
+# ``TimeoutError``), a dropped connection, or no response at all.
+_PRE_BIND_FAULTS = (LDAPCommunicationError, LDAPResponseTimeoutError)
+
+
+def _directory_not_answering(exc: LDAPException, *, service_bound: bool) -> bool:
+    """Return whether ``exc`` proves the directory is unresponsive (#202).
+
+    True only while the service-account bind has not yet completed. Up to that
+    point the conversation carries nothing a client chose (the bind DN and
+    password are the administrator's), so every request meets the same fault and
+    a crafted login cannot force it; after it, the search filter and the user's
+    own bind follow client input and a slow answer there is not evidence.
+    """
+    return not service_bound and isinstance(exc, _PRE_BIND_FAULTS)
+
+
+def _directory_unanswering_after_bind(
+    exc: LDAPException,
+    *,
+    service_bound: bool,
+    settings: LdapSettingsView,
+    bind_password: str | None,
+    connection_factory: _ConnectionFactory,
+    start_tls: bool,
+) -> bool:
+    """Return whether a stall *after* the service bind proves a hung directory.
+
+    A stall on the user search, the user re-bind or the group search follows a
+    value the client chose (the username goes into the search filter), so on its
+    own it is no evidence: a crafted name could make one search slow and, if that
+    opened the breaker, defer every deprovisioned account's revocation (#201,
+    #202). The fault is therefore *confirmed* with :func:`_canary_unanswered`, an
+    operation built only from administrator configuration. If that stalls too, the
+    directory is hung for everyone and no request is responsible; if it answers,
+    the slow operation was specific to the request and the breaker stays shut.
+    """
+    if not service_bound or not isinstance(exc, _PRE_BIND_FAULTS):
+        return False
+    return _canary_unanswered(
+        settings=settings,
+        bind_password=bind_password,
+        connection_factory=connection_factory,
+        start_tls=start_tls,
+    )
+
+
+def _canary_unanswered(
+    *,
+    settings: LdapSettingsView,
+    bind_password: str | None,
+    connection_factory: _ConnectionFactory,
+    start_tls: bool,
+) -> bool:
+    """Return whether the directory fails to answer a client-independent search.
+
+    Opens a *fresh* connection (a connection that timed out mid-operation is out
+    of sync), binds as the service account and runs a base-scope, one-entry,
+    no-attributes search of the configured search base. No part of it comes from
+    a request, so a login cannot influence the result. Both phases are bounded by
+    the same connect and receive timeouts as the conversation it confirms. Any
+    answer at all, including an error result or a rejected bind, means the
+    directory is alive and returns ``False``. Never raises; the connection is
+    always unbound.
+    """
+    conn: ldap3.Connection | None = None
+    try:
+        pool = _build_server_pool(settings)
+        conn = connection_factory(pool, settings.bind_dn or None, bind_password)
+        if not _open_connection(conn, start_tls=start_tls):
+            return False
+        conn.search(
+            search_base=settings.search_base,
+            search_filter="(objectClass=*)",
+            search_scope=ldap3.BASE,
+            attributes=ldap3.NO_ATTRIBUTES,
+            size_limit=1,
+        )
+        return False
+    except (LDAPSocketOpenError, LDAPServerPoolExhaustedError):
+        return True
+    except LDAPException as exc:
+        return isinstance(exc, _PRE_BIND_FAULTS)
+    finally:
+        _safe_unbind(conn)
+
+
+def _configured_lock_attribute() -> str:
+    """Return ``auth.ldap_lock_attribute`` (the default without a context)."""
+    try:
+        return get_context().settings.auth.ldap_lock_attribute.strip()
+    except RuntimeError:
+        return _DEFAULT_LOCK_ATTRIBUTE
+
+
+def _is_locked(attributes: dict[str, list[str]], lock_attribute: str) -> bool:
+    """Return whether the located entry carries ``lock_attribute`` = ``TRUE``.
+
+    The attribute name is matched case-insensitively (servers differ in the case
+    they return) and so is the value. An absent attribute, or an empty
+    ``lock_attribute`` (check disabled), is "not locked".
+    """
+    if not lock_attribute:
+        return False
+    wanted = lock_attribute.casefold()
+    for name, values in attributes.items():
+        if name.casefold() == wanted:
+            return any(v.strip().casefold() == "true" for v in values)
+    return False
 
 
 class _ConnectionFactory(Protocol):
@@ -345,6 +489,7 @@ def authenticate(
     password: str,
     bind_password: str | None,
     connection_factory: _ConnectionFactory = _default_connection_factory,
+    lock_attribute: str | None = None,
 ) -> LdapAuthResult:
     """Authenticate ``username``/``password`` against the configured directory.
 
@@ -360,6 +505,10 @@ def authenticate(
         band via
         :func:`timelapse_manager.security.ldap_settings_service.resolve_bind_password`,
         or ``None`` for an anonymous service bind. Never logged.
+    :param lock_attribute: the account-lock attribute (default
+        ``auth.ldap_lock_attribute``; empty disables). A locked account whose
+        password verifies is refused as ``INVALID_CREDENTIALS``, the answer a
+        wrong password gets, after the same user bind, so it cannot be told apart.
     :returns: a typed :class:`LdapAuthResult`; never raises a raw ``ldap3`` error.
     """
     if not settings.enabled:
@@ -376,6 +525,17 @@ def authenticate(
         return LdapAuthResult(LdapOutcome.INVALID_CREDENTIALS, detail="empty password")
 
     start_tls = settings.tls_mode == "starttls"
+    lock_attr = (
+        _configured_lock_attribute() if lock_attribute is None else lock_attribute
+    )
+    located: _LocatedUser | None = None
+    service_bound = False
+    # Every connection opened below is unbound on every outcome (the ``finally``),
+    # not only on success: a rejected bind or a mid-flight error used to leave the
+    # socket to the garbage collector, so a burst of failed logins (or an outage)
+    # leaked directory connections.
+    service: ldap3.Connection | None = None
+    user_conn: ldap3.Connection | None = None
 
     try:
         # Built inside the guard: a configured-but-missing CA path makes ldap3 raise
@@ -389,8 +549,9 @@ def authenticate(
             return LdapAuthResult(
                 LdapOutcome.CONFIG_ERROR, detail="service bind failed"
             )
+        service_bound = True
 
-        located = _find_user(service, settings, username)
+        located = _find_user(service, settings, username, lock_attribute=lock_attr)
         if located is None:
             return LdapAuthResult(LdapOutcome.NO_SUCH_USER, detail="user not found")
 
@@ -401,10 +562,15 @@ def authenticate(
                 LdapOutcome.INVALID_CREDENTIALS, detail="user bind rejected"
             )
         _safe_unbind(user_conn)
+        user_conn = None
+
+        if _is_locked(located.attributes, lock_attr):
+            return LdapAuthResult(
+                LdapOutcome.INVALID_CREDENTIALS, detail="account locked"
+            )
 
         groups = _resolve_groups(service, settings, located)
         display_name = _extract_display_name(settings, located, username)
-        _safe_unbind(service)
         return LdapAuthResult(
             LdapOutcome.AUTHENTICATED,
             dn=located.dn,
@@ -416,15 +582,43 @@ def authenticate(
         # Every configured server in the pool was unreachable: either a single
         # server refused the socket, or the failover pool exhausted every server.
         logger.warning("LDAP servers unreachable during authentication")
-        return LdapAuthResult(
-            LdapOutcome.SERVER_UNREACHABLE, detail="no server reachable"
+        detail = (
+            DETAIL_NO_SERVER_REACHABLE
+            if located is None
+            else DETAIL_LOST_AFTER_USER_SEARCH
         )
-    except LDAPException:
+        return LdapAuthResult(LdapOutcome.SERVER_UNREACHABLE, detail=detail)
+    except LDAPException as exc:
+        if _directory_not_answering(exc, service_bound=service_bound):
+            # Silent or dropped before the service bind finished (#202): the same
+            # fault for every request, so it counts as "no server reachable".
+            logger.warning("LDAP directory not answering during authentication")
+            return LdapAuthResult(
+                LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
+            )
         # Any other protocol-level fault: surface as unreachable/infra rather than
         # leaking an ldap3 exception type. The message may embed a DN, so it is not
         # logged at info; the typed detail stays generic.
+        if located is None and _directory_unanswering_after_bind(
+            exc,
+            service_bound=service_bound,
+            settings=settings,
+            bind_password=bind_password,
+            connection_factory=connection_factory,
+            start_tls=start_tls,
+        ):
+            # Bind-then-hang: the user search stalled and so did the canary, so
+            # every request meets the same fault (not a crafted name). After the
+            # user was found the detail stays generic, as for a lost server.
+            logger.warning("LDAP directory hung after bind during authentication")
+            return LdapAuthResult(
+                LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
+            )
         logger.warning("LDAP protocol error during authentication")
         return LdapAuthResult(LdapOutcome.SERVER_UNREACHABLE, detail="directory error")
+    finally:
+        _safe_unbind(user_conn)
+        _safe_unbind(service)
 
 
 def resolve_directory_state(
@@ -433,6 +627,7 @@ def resolve_directory_state(
     username: str,
     bind_password: str | None,
     connection_factory: _ConnectionFactory = _default_connection_factory,
+    lock_attribute: str | None = None,
 ) -> LdapDirectoryState:
     """Re-read a user's directory state without a password (re-evaluation seam).
 
@@ -448,7 +643,9 @@ def resolve_directory_state(
     :returns: a typed :class:`LdapDirectoryState`; never raises a raw ``ldap3``
         error. Infrastructure faults map to ``SERVER_UNREACHABLE`` so the caller
         can fail safe (keep the session) on a transient outage rather than locking
-        a user out.
+        a user out. An account whose ``lock_attribute`` (default
+        ``auth.ldap_lock_attribute``) is ``TRUE`` returns
+        :attr:`LdapOutcome.LOCKED`.
     """
     if not settings.enabled:
         return LdapDirectoryState(
@@ -464,6 +661,11 @@ def resolve_directory_state(
         )
 
     start_tls = settings.tls_mode == "starttls"
+    lock_attr = (
+        _configured_lock_attribute() if lock_attribute is None else lock_attribute
+    )
+    service: ldap3.Connection | None = None
+    service_bound = False
 
     try:
         # Built inside the guard: a configured-but-missing CA path makes ldap3 raise
@@ -475,14 +677,16 @@ def resolve_directory_state(
             return LdapDirectoryState(
                 LdapOutcome.CONFIG_ERROR, detail="service bind failed"
             )
+        service_bound = True
 
-        located = _find_user(service, settings, username)
+        located = _find_user(service, settings, username, lock_attribute=lock_attr)
         if located is None:
             return LdapDirectoryState(LdapOutcome.NO_SUCH_USER, detail="user not found")
+        if _is_locked(located.attributes, lock_attr):
+            return LdapDirectoryState(LdapOutcome.LOCKED, detail="account locked")
 
         groups = _resolve_groups(service, settings, located)
         display_name = _extract_display_name(settings, located, username)
-        _safe_unbind(service)
         return LdapDirectoryState(
             LdapOutcome.AUTHENTICATED,
             groups=frozenset(groups),
@@ -491,23 +695,49 @@ def resolve_directory_state(
     except (LDAPSocketOpenError, LDAPServerPoolExhaustedError):
         logger.warning("LDAP servers unreachable during re-evaluation")
         return LdapDirectoryState(
-            LdapOutcome.SERVER_UNREACHABLE, detail="no server reachable"
+            LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
         )
-    except LDAPException:
+    except LDAPException as exc:
+        if _directory_not_answering(exc, service_bound=service_bound):
+            logger.warning("LDAP directory not answering during re-evaluation")
+            return LdapDirectoryState(
+                LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
+            )
+        if _directory_unanswering_after_bind(
+            exc,
+            service_bound=service_bound,
+            settings=settings,
+            bind_password=bind_password,
+            connection_factory=connection_factory,
+            start_tls=start_tls,
+        ):
+            logger.warning("LDAP directory hung after bind during re-evaluation")
+            return LdapDirectoryState(
+                LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
+            )
         logger.warning("LDAP protocol error during re-evaluation")
         return LdapDirectoryState(
             LdapOutcome.SERVER_UNREACHABLE, detail="directory error"
         )
+    finally:
+        _safe_unbind(service)
 
 
 def _find_user(
-    conn: ldap3.Connection, settings: LdapSettingsView, username: str
+    conn: ldap3.Connection,
+    settings: LdapSettingsView,
+    username: str,
+    *,
+    lock_attribute: str = "",
 ) -> _LocatedUser | None:
     """Search for the user entry by username attribute; return its DN + attributes.
 
     The search filter combines the configured ``search_filter`` (an object-class
     or scope restriction) with an equality match on ``username_attribute``. The
     submitted username is escaped so it cannot inject LDAP filter syntax.
+
+    ``lock_attribute`` is requested by name next to ``*``: the lock flag is an
+    operational attribute that a bare ``*`` does not return (#67 S10).
     """
     safe_username = escape_filter_chars(username)
     user_clause = f"({settings.username_attribute}={safe_username})"
@@ -518,7 +748,9 @@ def _find_user(
         search_base=settings.search_base,
         search_filter=combined,
         search_scope=ldap3.SUBTREE,
-        attributes=ldap3.ALL_ATTRIBUTES,
+        attributes=[ldap3.ALL_ATTRIBUTES, lock_attribute]
+        if lock_attribute
+        else ldap3.ALL_ATTRIBUTES,
     )
     if not ok or not conn.entries:
         return None
@@ -615,10 +847,21 @@ def _attributes_as_str_lists(entry: object) -> dict[str, list[str]]:
     return result
 
 
-def _safe_unbind(conn: ldap3.Connection) -> None:
-    """Unbind a connection, swallowing any teardown error."""
-    with contextlib.suppress(LDAPException):  # pragma: no cover - best-effort
+def _safe_unbind(conn: ldap3.Connection | None) -> None:
+    """Unbind a connection (``None`` is a no-op), swallowing any teardown error.
+
+    Called from ``finally`` blocks, so it must never raise: an error escaping here
+    would replace the typed result the connector is about to return. That covers a
+    socket-level ``OSError`` on a connection the peer already dropped, not only
+    ``LDAPException``. Nothing about the failure is logged beyond its type, since
+    the message may embed a DN.
+    """
+    if conn is None:
+        return
+    try:
         conn.unbind()
+    except Exception as exc:
+        logger.debug("LDAP unbind failed (%s)", type(exc).__name__)
 
 
 def provision_user(
@@ -641,14 +884,25 @@ def provision_user(
         collision is refused rather than converting the row to ``auth_source="ldap"``.
     """
     from ..db.models import User
+    from ..usernames import username_key
 
-    existing = session.query(User).filter(User.username == username).one_or_none()
+    # One row per person (#4): match case-insensitively, so ``Alice.smith`` and
+    # ``alice.smith`` resolve to the same account -- and so a directory name that
+    # differs from a local account only by case is still refused below.
+    existing = (
+        session.query(User)
+        .filter(User.username_key == username_key(username))
+        .one_or_none()
+    )
     if existing is not None:
         if existing.auth_source != "ldap":
             raise LdapProvisioningError(
                 f"username '{username}' is already a local account"
             )
-        # Refresh the directory-derived fields on each login.
+        # Refresh the directory-derived fields on each login, including the
+        # stored spelling (callers pass the directory's canonical value).
+        if existing.username != username:
+            existing.username = username
         existing.role = role
         existing.auth_source = "ldap"
         existing.password_hash = None

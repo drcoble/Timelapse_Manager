@@ -1,28 +1,41 @@
 """Frame routes: the frame browser plus per-project frame image, thumbnail,
-detail, metadata, edit, soft-delete, and restore."""
+detail, edit, soft-delete, and restore."""
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
     Response,
 )
+from pydantic import BeforeValidator
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
+from sqlalchemy.orm import sessionmaker
+from starlette.concurrency import run_in_threadpool
 
+from ...config import SessionSettings, Settings
 from ...db.models import Frame, Project, RenderJob, User
+from ...executors import run_in
 from ...runtime import get_context
+from ...security.sessions import reauthorize_after_body
+from ...services import frames as frame_service
+from ...services import renders as render_service
+from ...services._base import Actor, Result, run_effects
+from ...services.errors import ValidationError
+from ...storage import paths
+from ...storage.frames import ImportResult, distinct_project_ids
 from .. import dependencies as deps
 from ..dependencies import (
     CurrentUser,
@@ -31,12 +44,22 @@ from ..dependencies import (
     OperatorUser,
     templates,
 )
+from ..idempotency import run_idempotent
+from ..multipart import (
+    BodyTooLargeError,
+    InsufficientSpoolSpaceError,
+    MultipartError,
+    TooManyFilesError,
+    UploadSpool,
+    stream_multipart,
+    upload_spool,
+)
+from ._jobs import card_response, delete_response
 from ._shared import (
     _get_project_or_404,
     _settings,
 )
 from ._viewmodels import (
-    _dt_input,
     _fmt_bytes,
     _fmt_dt,
 )
@@ -47,6 +70,12 @@ router = APIRouter()
 
 
 _FRAMES_PER_PAGE = 60
+
+# A scroll session appends at most this many batches (10 x 60 = 600 tiles) before
+# the grid shows an end-cap with a "Jump further back" link instead of another
+# sentinel. Every appended tile costs DOM nodes, observers and selection work, so
+# an unbounded scroll slowly degrades the page (#70 F-P4).
+_MAX_GRID_BATCHES = 10
 
 
 @dataclass(frozen=True)
@@ -75,8 +104,6 @@ class _FrameView:
     file_size_bytes: int | None = None
     file_size_display: str | None = None
     origin: str | None = None
-    # Prefill value for the inline timestamp editor's datetime-local input.
-    capture_timestamp_input: str = ""
 
     @property
     def capture_epoch(self) -> int | None:
@@ -93,20 +120,40 @@ class _FrameView:
         return int(ts.timestamp())
 
 
-def _parse_at(at: str | None) -> datetime.datetime | None:
+def _parse_at(at: str | None, viewer_tz: str | None) -> datetime.datetime | None:
     """Parse the ``?at=`` ISO-8601 jump anchor, or ``None`` if absent/invalid.
 
     Accepts the ``datetime-local`` form the jump form submits (no offset) as well
-    as a full offset-aware ISO string. A malformed value is ignored rather than
-    erroring, so a hand-edited URL degrades to the plain newest-first first page.
+    as a full offset-aware ISO string. A naive value is wall-clock time in the
+    viewer's zone ``viewer_tz`` (UTC when unset), the zone every timestamp on the
+    page is shown in (#70 F-R5); an offset-aware value (a link shared between
+    users) keeps its own offset. The result is aware UTC. A malformed value is
+    ignored rather than erroring, so a hand-edited URL degrades to the plain
+    newest-first first page.
     """
     if not at:
         return None
     try:
-        return datetime.datetime.fromisoformat(at)
+        parsed = datetime.datetime.fromisoformat(at)
     except ValueError:
         return None
+    return deps.viewer_local_to_utc(parsed, viewer_tz)
 
+
+def _blank_to_none(value: object) -> object:
+    """Read an empty (or all-blank) query value as absent.
+
+    The project picker's "All Projects" option has ``value=""``, so choosing it
+    requests ``?project_id=``. ``int | None`` rejects the empty string with a 422;
+    it means "no project", the same as leaving the parameter out (#226).
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+#: A ``project_id`` query parameter where the empty string means "all projects".
+OptionalProjectId = Annotated[int | None, BeforeValidator(_blank_to_none)]
 
 # Recognised values for the ``?jump=`` campaign-scale navigation control. Each
 # is a thin wrapper over the existing keyset/window machinery (see
@@ -120,7 +167,7 @@ def frames_page(
     request: Request,
     db: DbDep,
     user: CurrentUser,
-    project_id: int | None = None,
+    project_id: OptionalProjectId = None,
     before: int | None = None,
     at: str | None = None,
     jump: str | None = None,
@@ -147,7 +194,7 @@ def frames_page(
     band) and ``nearest_frame_note`` (the real capture an off-frame ``?at=``
     resolved to). Both are absent (``None``) unless the jump produced them.
     """
-    anchor = _parse_at(at)
+    anchor = _parse_at(at, user.viewer_timezone)
 
     if project_id is not None and (anchor is not None or (jump in _JUMP_VALUES)):
         project = _get_project_or_404(db, project_id)
@@ -462,17 +509,21 @@ def _resolve_gap_anchor(
     """
     from ...storage import frames as frame_service
 
-    frame_times = frame_service.list_active_frame_times(db, project_id)
-    if len(frame_times) < 2:
+    # The pair walk runs in SQL (#66 C7): only the bounds and the gaps come
+    # back, not every timestamp of the project.
+    bounds = frame_service.active_frame_time_bounds(db, project_id)
+    if bounds is None or bounds.count < 2:
         return None, None
     now = datetime.datetime.now(datetime.UTC)
-    aware_times = [_aware(t) for t in frame_times]
-    span_start, span_end = _jump_span(project, aware_times, now)
-    gaps = frame_service.find_capture_gaps(aware_times, span_start, span_end)
+    span_start, span_end = _jump_span(project, [_aware(bounds.first)], now)
+    gaps = [
+        frame_service.CaptureGap(before=_aware(g.before), after=_aware(g.after))
+        for g in frame_service.list_capture_gaps(db, project_id, span_start, span_end)
+    ]
     if not gaps:
         return None, None
     # No explicit anchor: step relative to the newest captured frame.
-    ref = _aware(anchor) if anchor is not None else aware_times[-1]
+    ref = _aware(anchor) if anchor is not None else _aware(bounds.last)
     gap = frame_service.nearest_gap(gaps, ref, direction=direction)
     if gap is None:
         return None, None
@@ -591,14 +642,63 @@ def _global_frame_batch(
     return views, next_before
 
 
+def _batch_cap_href(
+    frames: list[_FrameView],
+    *,
+    batch_no: int,
+    project_id: int | None,
+    next_before: int | None,
+    show_deleted: bool,
+) -> str | None:
+    """The cap's jump link when this batch ends the scroll session, else ``None``.
+
+    ``None`` means "render the normal sentinel" (or, at the series start, the
+    ordinary end-cap).
+    """
+    if next_before is None or batch_no < _MAX_GRID_BATCHES:
+        return None
+    return _cap_jump_href(
+        frames,
+        project_id=project_id,
+        next_before=next_before,
+        show_deleted=show_deleted,
+    )
+
+
+def _cap_jump_href(
+    frames: list[_FrameView],
+    *,
+    project_id: int | None,
+    next_before: int,
+    show_deleted: bool,
+) -> str:
+    """Link for the batch-cap end-cap: continue from the oldest loaded frame.
+
+    A single-project grid has a time axis, so the link is
+    ``?at=<oldest loaded capture time, ISO-8601 with offset>`` (the offset keeps
+    it unambiguous for any viewer zone; ``_parse_at`` honours it). The
+    cross-project grid has no time axis, and a loaded frame without a capture
+    time has nothing to anchor on, so both continue from the keyset cursor
+    (``before=``) instead.
+    """
+    tail = "&show_deleted=1" if show_deleted else ""
+    scope = "" if project_id is None else f"project_id={project_id}&"
+    oldest = frames[-1].capture_timestamp_raw if frames else None
+    if project_id is not None and oldest is not None:
+        anchor = _aware(oldest).isoformat()
+        return f"/frames?{scope}at={quote(anchor, safe='')}{tail}"
+    return f"/frames?{scope}before={next_before}{tail}"
+
+
 @router.get("/frames/batch", response_class=HTMLResponse)
 def frames_batch(
     request: Request,
     db: DbDep,
     user: CurrentUser,
-    project_id: int | None = None,
+    project_id: OptionalProjectId = None,
     before: int | None = None,
     show_deleted: int = 0,
+    batch_no: Annotated[int, Query(ge=1, le=10_000)] = 1,
 ) -> Response:
     """Return one continuous-scroll batch of frame tiles + a fresh sentinel.
 
@@ -609,6 +709,11 @@ def frames_batch(
     With a ``project_id`` the batch is one project paged on ``sequence_index``;
     without one it is the cross-project "All Projects" batch paged on frame id.
     The presence of ``project_id`` is the sole mode discriminator.
+
+    ``batch_no`` is this batch's 1-based position in the scroll session (the
+    sentinel that fetched it carries it). From ``_MAX_GRID_BATCHES`` on, a batch
+    that still has older frames ends in a cap with a jump link instead of a
+    sentinel, which keeps a long scroll from growing the DOM without bound.
     """
     if project_id is None:
         frames, next_before = _global_frame_batch(
@@ -626,6 +731,14 @@ def frames_batch(
                 frames=frames,
                 next_before=next_before,
                 show_deleted=bool(show_deleted),
+                batch_no=batch_no,
+                cap_href=_batch_cap_href(
+                    frames,
+                    batch_no=batch_no,
+                    project_id=None,
+                    next_before=next_before,
+                    show_deleted=bool(show_deleted),
+                ),
             ),
         )
 
@@ -645,6 +758,14 @@ def frames_batch(
             frames=frames,
             next_before=next_before,
             show_deleted=bool(show_deleted),
+            batch_no=batch_no,
+            cap_href=_batch_cap_href(
+                frames,
+                batch_no=batch_no,
+                project_id=project_id,
+                next_before=next_before,
+                show_deleted=bool(show_deleted),
+            ),
         ),
     )
 
@@ -654,7 +775,7 @@ def frames_since(
     db: DbDep,
     user: CurrentUser,
     after: int,
-    project_id: int | None = None,
+    project_id: OptionalProjectId = None,
     show_deleted: int = 0,
 ) -> dict[str, int]:
     """Return how many frames were added after the client's newest frame id.
@@ -691,10 +812,12 @@ def _resolve_frame_real_path(db: DbSession, project_id: int, frame_id: int) -> s
     """Resolve a frame's on-disk real path, or raise 404.
 
     The frame must belong to ``project_id`` (anti-IDOR) and its stored path must
-    resolve inside the project's own frame directory -- a corrupt or hostile path
-    (traversal, absolute escape, or symlink) is treated as not found. The path is
-    derived solely from the stored ``file_path``; no client string reaches the
-    filesystem. Shared by the full-image and thumbnail routes.
+    resolve inside the project's own frame directories -- a corrupt or hostile
+    path (traversal, absolute escape, or symlink) is treated as not found. The
+    containment rule is shared with the export and render paths
+    (:func:`~timelapse_manager.storage.paths.resolve_contained_frame_path`,
+    #67 S16). The path is derived solely from the stored ``file_path``; no client
+    string reaches the filesystem. Shared by the full-image and thumbnail routes.
     """
     import os.path
 
@@ -705,19 +828,38 @@ def _resolve_frame_real_path(db: DbSession, project_id: int, frame_id: int) -> s
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
     project = _get_project_or_404(db, project_id)
-    settings = _settings()
-    resolved = paths.resolve_absolute(settings, project_id, frame.file_path)
-
-    # Containment boundary is the project's own frame directory, which is the
-    # frames root for default layout and the explicit storage_path otherwise --
-    # so custom-storage frames (legitimately outside the frames root) still pass.
-    boundary = os.path.realpath(paths.frame_dir(settings, project))
-    real_path = os.path.realpath(resolved)
-    if not (real_path == boundary or real_path.startswith(boundary + os.sep)):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    try:
+        real_path = os.fspath(
+            paths.resolve_contained_frame_path(_settings(), project, frame.file_path)
+        )
+    except paths.PathContainmentError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+        ) from None
     if not os.path.isfile(real_path):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
     return real_path
+
+
+# Frame bytes never change once written, so they are cacheable; kept private
+# because the routes are gated behind authentication.
+_FRAME_CACHE_CONTROL = "private, max-age=86400"
+# A full-size frame served in place of a thumbnail (no generation slot free, or
+# generation failed) must not be cached under the thumbnail URL: the browser
+# asks again later and then gets the real thumbnail.
+_THUMBNAIL_FALLBACK_CACHE_CONTROL = "private, no-cache"
+
+
+def _frame_file_response(real_path: str, cache_control: str) -> FileResponse:
+    """Serve a contained, already-resolved image file with ``cache_control``."""
+    import os.path
+
+    media_type = _IMAGE_MEDIA_TYPES.get(
+        os.path.splitext(real_path)[1].lower(), "application/octet-stream"
+    )
+    return FileResponse(
+        real_path, media_type=media_type, headers={"Cache-Control": cache_control}
+    )
 
 
 @router.get("/projects/{project_id}/frames/{frame_id}/image")
@@ -731,72 +873,150 @@ def frame_image(
     404, so a frame id cannot be probed across project scopes. Only local files
     are served, so there is no outbound-request (SSRF) surface.
     """
-    import os.path
-
     real_path = _resolve_frame_real_path(db, project_id, frame_id)
-    media_type = _IMAGE_MEDIA_TYPES.get(
-        os.path.splitext(real_path)[1].lower(), "application/octet-stream"
-    )
-    # Frame bytes never change once written, so they are cacheable; kept private
-    # because the route is gated behind authentication.
-    return FileResponse(
-        real_path,
-        media_type=media_type,
-        headers={"Cache-Control": "private, max-age=86400"},
+    return _frame_file_response(real_path, _FRAME_CACHE_CONTROL)
+
+
+# Frame ids whose thumbnail was refused as oversized, so the warning is logged
+# once per frame per process. Capped so a flood of bad frames cannot grow it
+# without bound; past the cap the refusals go unlogged.
+_REFUSED_THUMBNAIL_FRAMES: set[int] = set()
+_REFUSED_THUMBNAIL_FRAMES_CAP = 10_000
+_REFUSED_THUMBNAIL_LOCK = threading.Lock()
+
+
+def _log_refused_thumbnail_once(project_id: int, frame_id: int) -> None:
+    """Log a refused (oversized or unreadable) frame once per frame id."""
+    with _REFUSED_THUMBNAIL_LOCK:
+        if (
+            frame_id in _REFUSED_THUMBNAIL_FRAMES
+            or len(_REFUSED_THUMBNAIL_FRAMES) >= _REFUSED_THUMBNAIL_FRAMES_CAP
+        ):
+            return
+        _REFUSED_THUMBNAIL_FRAMES.add(frame_id)
+    logger.warning(
+        "no thumbnail for frame %s (project %s): its image header is oversized "
+        "or unreadable",
+        frame_id,
+        project_id,
     )
 
 
-# Width (px) of generated thumbnails; height is auto to preserve aspect ratio.
-_THUMBNAIL_WIDTH = 320
+def _thumbnail_is_fresh(thumb_path: Path, source_path: str) -> bool:
+    """Return whether a usable cached thumbnail at least as new as the frame exists.
+
+    ``lstat`` is used so a symlink planted in the cache is never served: only a
+    regular, non-empty file counts.
+    """
+    import os
+    import stat
+
+    try:
+        info = os.lstat(thumb_path)
+        source_mtime = os.path.getmtime(source_path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_size > 0
+        and info.st_mtime >= source_mtime
+    )
 
 
 @router.get("/projects/{project_id}/frames/{frame_id}/thumbnail")
 def frame_thumbnail(
-    db: DbDep, user: CurrentUser, project_id: int, frame_id: int
+    db: DbDep,
+    user: CurrentUser,
+    project_id: int,
+    frame_id: int,
+    size: int = paths.DEFAULT_THUMBNAIL_WIDTH,
 ) -> Response:
-    """Serve a small, cached thumbnail of a frame (any authenticated user).
+    """Serve a cached, downscaled JPEG of a frame (any authenticated user).
 
-    The source frame is resolved through the same anti-IDOR + containment guard
-    as the full image. A downscaled JPEG is generated once with the bundled
-    ffmpeg into a per-project cache under the data directory and reused on
-    subsequent requests; if generation fails the full image is served as a
-    graceful fallback. Local files only -- no SSRF surface.
+    ``size`` is the width in px: 320 (the default, the frame grid) or 640 (the
+    dashboard card and project header, #70 F-P2); anything else is a 422. The
+    source frame is resolved through the same anti-IDOR + containment guard as
+    the full image, and the cache file through the thumbnail-root containment
+    check. Local files only -- no SSRF surface.
+
+    A missing or stale thumbnail is generated with the bundled ffmpeg (#67 P3):
+
+    * at most ``render.thumbnail_concurrency`` generations run at once; a
+      request that waits longer than two seconds for a slot gets the full
+      image, marked ``no-cache`` so the browser retries the thumbnail later;
+    * the file is written to a temporary name and renamed into place, so a
+      partial thumbnail is never served or cached;
+    * a frame whose header declares an oversized image is a 404 (logged once
+      per frame); any other generation failure serves the full image, uncached.
+
+    The database session is committed, and so released, once the frame is
+    resolved and before any waiting or generation (#182).
     """
-    import os.path
     import subprocess
 
-    from ...encode.thumbnail import generate_thumbnail
-    from ...storage import paths
+    from ...encode import thumbnail
+
+    if size not in paths.THUMBNAIL_WIDTHS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="size must be one of: "
+            + ", ".join(str(width) for width in sorted(paths.THUMBNAIL_WIDTHS)),
+        )
 
     real_path = _resolve_frame_real_path(db, project_id, frame_id)
-
+    # All the database work is done: end the transaction before the generation
+    # slot wait (up to 2 s) and the ffmpeg run (up to 20 s), so the pooled
+    # connection and its read snapshot are released instead of pinning a WAL
+    # checkpoint (#182). Committing, not rolling back, keeps what the auth
+    # dependency wrote (the session's last-seen touch), as the dependency's own
+    # exit would.
+    db.commit()
     settings = _settings()
-    cache_dir = paths.thumbnail_cache_dir(settings, project_id)
-    thumb_path = cache_dir / f"{frame_id}.jpg"
+    try:
+        cache_dir = paths.contained_thumbnail_dir(settings, project_id)
+    except paths.PathContainmentError:
+        logger.warning(
+            "thumbnail cache of project %s is outside the thumbnail root; "
+            "serving the full frame",
+            project_id,
+        )
+        return _frame_file_response(real_path, _THUMBNAIL_FALLBACK_CACHE_CONTROL)
+    thumb_path = cache_dir / paths.thumbnail_file_name(frame_id, size)
 
-    # Regenerate when missing or older than the source frame. Generation is an
-    # ffmpeg subprocess isolated in the encode layer; on any failure fall back to
-    # the full-size image so the UI still shows something.
-    needs_build = (
-        not thumb_path.is_file()
-        or thumb_path.stat().st_mtime < os.path.getmtime(real_path)
-    )
-    if needs_build:
-        try:
-            generate_thumbnail(
-                get_context().ffmpeg_path,
-                real_path,
-                thumb_path,
-                width=_THUMBNAIL_WIDTH,
-            )
-        except (subprocess.SubprocessError, OSError):
-            return frame_image(db, user, project_id, frame_id)
+    if not _thumbnail_is_fresh(thumb_path, real_path):
+        with thumbnail.generation_slot(
+            settings.render.thumbnail_concurrency
+        ) as acquired:
+            if not acquired:
+                return _frame_file_response(
+                    real_path, _THUMBNAIL_FALLBACK_CACHE_CONTROL
+                )
+            # Another request may have built it while this one waited.
+            if not _thumbnail_is_fresh(thumb_path, real_path):
+                try:
+                    thumbnail.generate_thumbnail_atomic(
+                        get_context().ffmpeg_path,
+                        real_path,
+                        thumb_path,
+                        width=size,
+                    )
+                except ValueError:
+                    # ImageTooLargeError: the header declares a dimension bomb.
+                    _log_refused_thumbnail_once(project_id, frame_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND, detail="not found"
+                    ) from None
+                except (subprocess.SubprocessError, OSError):
+                    logger.debug(
+                        "thumbnail generation failed for frame %s",
+                        frame_id,
+                        exc_info=True,
+                    )
+                    return _frame_file_response(
+                        real_path, _THUMBNAIL_FALLBACK_CACHE_CONTROL
+                    )
 
-    return FileResponse(
-        str(thumb_path),
-        media_type="image/jpeg",
-        headers={"Cache-Control": "private, max-age=86400"},
-    )
+    return _frame_file_response(str(thumb_path), _FRAME_CACHE_CONTROL)
 
 
 def _frame_metadata_context(
@@ -808,7 +1028,7 @@ def _frame_metadata_context(
     envelope is run through the display normalizer here so the templates stay
     dumb. An absent or empty envelope yields ``scene_groups=[]`` and
     ``schema_version=None`` -- the template's null state, not an error. Shared by
-    the HTMX panel endpoint and the no-JS full-page fallback.
+    the drawer fragment and the no-JS full-page fallback.
     """
     from ...cameras.scene_metadata import normalize_scene_metadata, scene_schema_version
 
@@ -832,39 +1052,16 @@ def _frame_metadata_context(
     }
 
 
-@router.get(
-    "/projects/{project_id}/frames/{frame_id}/metadata",
-    response_class=HTMLResponse,
-)
-def frame_metadata(
-    request: Request, db: DbDep, user: CurrentUser, project_id: int, frame_id: int
-) -> Response:
-    """Return a frame's scene-metadata panel fragment (any authenticated user).
-
-    Viewing metadata is a read, so any logged-in role may fetch it. The frame is
-    required to belong to ``project_id`` (a mismatch is a 404). A frame with no
-    recorded scene metadata renders the partial's null state -- that is normal,
-    not an error.
-    """
-    return templates.TemplateResponse(
-        request,
-        "_partials/frame_metadata.html",
-        deps.base_context(
-            request, db, user, **_frame_metadata_context(db, project_id, frame_id)
-        ),
-    )
-
-
 @router.get("/projects/{project_id}/frames/{frame_id}", response_class=HTMLResponse)
 def frame_detail(
     request: Request, db: DbDep, user: CurrentUser, project_id: int, frame_id: int
 ) -> Response:
     """Render a frame's scene metadata as a full page (no-JS fallback).
 
-    The frame tile's Info link is HTMX-enhanced to swap the metadata panel in
-    place, but its plain ``href`` points here so the feature still works without
-    JavaScript. Same context and 404 contract as the HTMX panel endpoint, wrapped
-    in the app's base layout with a link back to the frame browser.
+    The frame tile's link is HTMX-enhanced to open the drawer, but its plain
+    ``href`` points here so the feature still works without JavaScript. Wrapped in
+    the app's base layout with a link back to the frame browser; a frame outside
+    ``project_id`` is a 404.
     """
     return templates.TemplateResponse(
         request,
@@ -903,7 +1100,6 @@ def _frame_drawer_view(frame: Frame) -> _FrameView:
             else None
         ),
         origin=frame.origin,
-        capture_timestamp_input=_dt_input(frame.capture_timestamp),
     )
 
 
@@ -974,7 +1170,7 @@ def frame_drawer(
     (no-JS) request gets the standalone full-page detail, so the feature still
     works without JavaScript. The frame must belong to ``project_id`` (a mismatch
     is a 404). The trailing ``/drawer`` literal is a distinct sibling of the
-    ``/image``, ``/thumbnail``, and ``/metadata`` suffixes; a path parameter never
+    ``/image`` and ``/thumbnail`` suffixes; a path parameter never
     matches across a ``/``, so this cannot collide with the bare detail route.
     """
     context = _frame_drawer_context(db, project_id, frame_id)
@@ -1288,11 +1484,20 @@ def frames_range_materialize(
     The explicit id-list an id-only operation (a later bulk timestamp offset)
     needs: it pins the exact frames at resolution time so a replay acts on the
     same set even if new frames have since arrived. Operator-gated, CSRF-protected,
-    and a malformed descriptor is a 400.
+    and a malformed descriptor is a 400. A range larger than ``frames.max_range_ids``
+    is a 413.
     """
     from ...storage import frame_selection
 
     descriptor = _descriptor_from_form(db, form)
+    # Refuse before resolving, so a whole-project selection never builds a
+    # multi-megabyte id list (#67 P9). The count route gives the UI the number.
+    limit = get_context().settings.frames.max_range_ids
+    if frame_selection.count(db, descriptor) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Range too large; narrow the selection",
+        )
     return JSONResponse({"frame_ids": frame_selection.materialize(db, descriptor)})
 
 
@@ -1370,6 +1575,7 @@ def _offset_error_summary(message: str) -> dict[str, Any]:
 
 @router.post("/frames/offset")
 def frames_offset(
+    request: Request,
     db: DbDep,
     user: OperatorUser,
     form: FormDep,
@@ -1401,6 +1607,25 @@ def frames_offset(
     than the synchronous ceiling is rejected, like the bulk endpoint, to avoid
     holding a write transaction too long. Undo is the inverse offset over the
     shifted id-set, never a restore.
+
+    An ``Idempotency-Key`` header makes a repeat of the same request (a double
+    click, a retry after a dropped connection) replay the first response instead
+    of shifting the frames again (see :mod:`..idempotency`).
+    """
+    return run_idempotent(
+        request,
+        user_id=user.id,
+        route="frames.offset",
+        form=form,
+        handler=lambda: _offset_frames(db, user.id, form),
+    )
+
+
+def _offset_frames(db: DbSession, user_id: int, form: dict[str, str]) -> Response:
+    """Validate and apply one offset request; the body of :func:`frames_offset`.
+
+    Commits before returning a success, so a stored idempotent replay never
+    reports a shift that a later commit failure rolled back.
     """
     raw_seconds = form.get("seconds", "")
     try:
@@ -1436,7 +1661,8 @@ def frames_offset(
 
     from ...storage import frames as frame_service
 
-    result = frame_service.offset_timestamps_many(db, frame_ids, seconds, user.id)
+    result = frame_service.offset_timestamps_many(db, frame_ids, seconds, user_id)
+    db.commit()
     return JSONResponse(_build_offset_summary(seconds, result))
 
 
@@ -1500,6 +1726,7 @@ def _export_ids_from_form(db: DbSession, form: dict[str, str]) -> list[int] | st
 
 @router.post("/frames/export")
 def frames_export(
+    request: Request,
     db: DbDep,
     user: OperatorUser,
     form: FormDep,
@@ -1527,6 +1754,25 @@ def frames_export(
     one. The single cross-project constraint is that every id must belong to one
     project (the descriptor is single-project; an explicit id-list is validated to
     a single project below) so the zip has one render root.
+
+    An ``Idempotency-Key`` header makes a repeat of the same request replay the
+    first job handle instead of enqueueing a second export (see
+    :mod:`..idempotency`).
+    """
+    return run_idempotent(
+        request,
+        user_id=user.id,
+        route="frames.export",
+        form=form,
+        handler=lambda: _enqueue_export(db, user, form),
+    )
+
+
+def _enqueue_export(db: DbSession, user: User, form: dict[str, str]) -> Response:
+    """Validate and enqueue one export request; the body of :func:`frames_export`.
+
+    Commits before returning the job handle (and before waking the worker), so a
+    stored idempotent replay always names a job that exists.
     """
     resolved = _export_ids_from_form(db, form)
     if isinstance(resolved, str):
@@ -1540,6 +1786,16 @@ def frames_export(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
+    # An explicit id list obeys the same ceiling as a materialised range (#96).
+    # A descriptor is resolved server-side and is not capped: a whole-project
+    # export is the expected large case.
+    limit = get_context().settings.frames.max_range_ids
+    if not form.get("descriptor") and len(frame_ids) > limit:
+        return JSONResponse(
+            {"error": "Selection too large; narrow the selection."},
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        )
+
     project_id = _single_project_for_ids(db, frame_ids)
     if project_id is None:
         return JSONResponse(
@@ -1547,20 +1803,14 @@ def frames_export(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
-    job = RenderJob(
-        project_id=project_id,
-        kind="export",
-        status="pending",
-        output_settings={"frame_ids": frame_ids},
+    # The service inserts the pending export and audits who asked for it (the
+    # export card's "started by"); commit before waking the worker.
+    result = render_service.enqueue_export(
+        db, Actor.of(user), project_id, frame_ids=frame_ids
     )
-    db.add(job)
-    db.flush()
-    job_id = job.id
+    job_id = result.value.id
     db.commit()
-
-    queue = get_context().render_queue
-    if queue is not None:
-        queue.notify()
+    run_effects(result.effects, get_context())
 
     return JSONResponse(
         {"job_id": job_id, "status": "pending"},
@@ -1576,11 +1826,7 @@ def _single_project_for_ids(db: DbSession, frame_ids: list[int]) -> int | None:
     exists and shares it; returns ``None`` when the ids span projects or none of
     them resolve to a real frame (an export of nothing has no project).
     """
-    rows = (
-        db.execute(select(Frame.project_id).where(Frame.id.in_(frame_ids)).distinct())
-        .scalars()
-        .all()
-    )
+    rows = distinct_project_ids(db, frame_ids)
     if len(rows) != 1:
         return None
     return rows[0]
@@ -1651,6 +1897,38 @@ def frames_export_download(
     )
 
 
+@router.get("/frames/export/{job_id}/card", response_class=HTMLResponse)
+def frames_export_card(
+    request: Request, db: DbDep, user: CurrentUser, job_id: int
+) -> Response:
+    """The export card: status, who started it, frame window, zip, failure.
+
+    Opened from the project Frames tab's Exports list in the same dialog as the
+    render card. Every role may open it; Download and Delete appear only for
+    operators and admins, matching the operator-gated export download route.
+    """
+    job = db.get(RenderJob, job_id)
+    if job is None or job.kind != "export":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="export not found"
+        )
+    return card_response(request, db, user, job, template="_partials/export_card.html")
+
+
+@router.post("/frames/export/{job_id}/delete")
+async def frames_export_delete(
+    request: Request, db: DbDep, user: OperatorUser, job_id: int, form: FormDep
+) -> Response:
+    """Delete a frame export's zip and row (cancelling it first if running).
+
+    Same rules as deleting a render: the zip is removed only inside the project's
+    render root, a missing zip is not an error, and the delete is audited.
+    """
+    return await delete_response(
+        request, db, user, job_id, kind="export", next_url=form.get("next")
+    )
+
+
 @router.post("/projects/{project_id}/frames/{frame_id}/soft-delete")
 def frame_soft_delete(
     request: Request,
@@ -1662,10 +1940,9 @@ def frame_soft_delete(
     drawer: int = 0,
 ) -> Response:
     """Soft-delete a frame and re-render its tile (or the drawer body)."""
-    from ...storage import frames as frame_service
-
-    _assert_frame_in_project(db, project_id, frame_id)
-    frame = frame_service.soft_delete(db, frame_id, user.id)
+    frame = frame_service.soft_delete_frame(
+        db, Actor.of(user), project_id, frame_id
+    ).value
     if drawer:
         return _frame_drawer_mutation_response(request, db, user, project_id, frame)
     return _frame_tile_response(
@@ -1684,10 +1961,7 @@ def frame_restore(
     drawer: int = 0,
 ) -> Response:
     """Restore a soft-deleted frame and re-render its tile (or the drawer body)."""
-    from ...storage import frames as frame_service
-
-    _assert_frame_in_project(db, project_id, frame_id)
-    frame = frame_service.restore(db, frame_id, user.id)
+    frame = frame_service.restore_frame(db, Actor.of(user), project_id, frame_id).value
     if drawer:
         return _frame_drawer_mutation_response(request, db, user, project_id, frame)
     return _frame_tile_response(
@@ -1711,10 +1985,7 @@ def frame_exclude(
     the soft-delete/restore response shape: a ``?drawer=1`` request gets the
     drawer body plus an out-of-band tile update, otherwise just the tile.
     """
-    from ...storage import frames as frame_service
-
-    _assert_frame_in_project(db, project_id, frame_id)
-    frame = frame_service.exclude(db, frame_id, user.id)
+    frame = frame_service.exclude_frame(db, Actor.of(user), project_id, frame_id).value
     if drawer:
         return _frame_drawer_mutation_response(request, db, user, project_id, frame)
     return _frame_tile_response(
@@ -1733,10 +2004,7 @@ def frame_include(
     drawer: int = 0,
 ) -> Response:
     """Return an excluded frame to renders and re-render its tile (or drawer)."""
-    from ...storage import frames as frame_service
-
-    _assert_frame_in_project(db, project_id, frame_id)
-    frame = frame_service.include(db, frame_id, user.id)
+    frame = frame_service.include_frame(db, Actor.of(user), project_id, frame_id).value
     if drawer:
         return _frame_drawer_mutation_response(request, db, user, project_id, frame)
     return _frame_tile_response(
@@ -1754,21 +2022,24 @@ def frame_edit(
     form: FormDep,
     drawer: int = 0,
 ) -> Response:
-    """Correct a frame's capture timestamp and re-render its tile (or drawer row)."""
-    from ...storage import frames as frame_service
+    """Correct a frame's capture timestamp and re-render its tile (or drawer row).
 
+    A naive ``capture_timestamp`` (the ``datetime-local`` input) is read in the
+    viewer's zone, as the jump boxes and milestone times are (#124); an
+    offset-aware value keeps its own offset. Storage normalises to naive UTC.
+    """
     raw = form.get("capture_timestamp", "")
     try:
-        capture_timestamp = datetime.datetime.fromisoformat(raw)
+        parsed = datetime.datetime.fromisoformat(raw)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="capture_timestamp must be ISO-8601",
         ) from exc
-    _assert_frame_in_project(db, project_id, frame_id)
-    frame = frame_service.edit_capture_timestamp(
-        db, frame_id, capture_timestamp, user.id
-    )
+    capture_timestamp = deps.viewer_local_to_utc(parsed, user.viewer_timezone)
+    frame = frame_service.edit_frame_timestamp(
+        db, Actor.of(user), project_id, frame_id, capture_timestamp
+    ).value
     if drawer:
         db.flush()
         return templates.TemplateResponse(
@@ -1783,13 +2054,6 @@ def frame_edit(
             ),
         )
     return _frame_tile_response(request, db, user, project_id, frame)
-
-
-def _assert_frame_in_project(db: DbSession, project_id: int, frame_id: int) -> None:
-    """Raise 404 unless ``frame_id`` belongs to ``project_id``."""
-    frame = db.get(Frame, frame_id)
-    if frame is None or frame.project_id != project_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
 
 
 def _frame_drawer_mutation_response(
@@ -1859,92 +2123,19 @@ def _frame_tile_response(
 # --- batch frame import (multipart upload) ----------------------------------
 #
 # Importing a batch of existing image files is a multipart/form-data upload. The
-# rest of the web layer only ever parses application/x-www-form-urlencoded by
-# hand (the optional multipart dependency is intentionally absent), so this is
-# the single place that decodes a multipart body, kept minimal: it pulls only the
-# named file parts and ignores everything else. The CSRF token rides in the
-# X-CSRF-Token header (injected on every HTMX request by hx-headers on <body>),
-# so the middleware verifies it without needing to read the multipart body.
+# rest of the web layer parses application/x-www-form-urlencoded by hand (the
+# optional multipart dependency is intentionally absent); the import body is read
+# as a stream by :func:`..multipart.stream_multipart`, which writes each file to a
+# spool directory as it arrives, so the batch is never held in memory. The CSRF
+# token rides in the X-CSRF-Token header (added to every HTMX request by csrf.js
+# from the csrf-token meta tag); a no-JS submit carries it as the *first*
+# ``csrf_token`` part, which the CSRF middleware checks before any file byte is
+# read (the form template pins that order).
 
 # Upper bound on the whole multipart request body, independent of the per-file
-# count cap the storage importer enforces. The body is read fully into memory to
-# parse it, so an absurd Content-Length is rejected up front rather than buffered.
+# count cap the storage importer enforces. An absurd Content-Length is rejected up
+# front; the streaming reader enforces the caps on the bytes actually received.
 _MAX_IMPORT_REQUEST_BYTES = 512 * 1024 * 1024
-
-
-def _parse_multipart_files(
-    body: bytes, content_type: str, field: str
-) -> list[tuple[str, bytes]]:
-    """Extract ``(filename, bytes)`` for every ``field`` part of a multipart body.
-
-    A deliberately small multipart/form-data reader for the one upload route the
-    web layer has -- the project does not depend on a full multipart parser. Only
-    parts whose ``Content-Disposition`` name equals ``field`` are returned; any
-    other field (e.g. a redundant ``csrf_token``) is ignored. A part with no
-    filename, or with empty bytes, is skipped so an empty file input does not
-    become a zero-byte "file". Returns an empty list when the boundary is missing
-    or no matching part is present.
-    """
-    boundary = _multipart_boundary(content_type)
-    if boundary is None:
-        return []
-    delimiter = b"--" + boundary
-    files: list[tuple[str, bytes]] = []
-    # Split on the delimiter; the first chunk is the preamble and the last is the
-    # closing "--\r\n" epilogue, both discarded by the header/blank-line check.
-    for segment in body.split(delimiter):
-        if not segment or segment in (b"--\r\n", b"--", b"\r\n"):
-            continue
-        segment = segment[2:] if segment.startswith(b"\r\n") else segment
-        header_blob, sep, content = segment.partition(b"\r\n\r\n")
-        if not sep:
-            continue
-        headers = _parse_part_headers(header_blob)
-        disposition = headers.get("content-disposition", "")
-        name = _disposition_param(disposition, "name")
-        if name != field:
-            continue
-        filename = _disposition_param(disposition, "filename")
-        if not filename:
-            continue
-        # Trim the trailing CRLF the multipart framing appends after the content.
-        if content.endswith(b"\r\n"):
-            content = content[:-2]
-        if not content:
-            continue
-        files.append((filename, content))
-    return files
-
-
-def _multipart_boundary(content_type: str) -> bytes | None:
-    """Return the boundary token from a multipart Content-Type, or ``None``."""
-    if not content_type.startswith("multipart/form-data"):
-        return None
-    for part in content_type.split(";"):
-        key, _, value = part.strip().partition("=")
-        if key.strip().lower() == "boundary":
-            return value.strip().strip('"').encode("latin-1")
-    return None
-
-
-def _parse_part_headers(header_blob: bytes) -> dict[str, str]:
-    """Parse one multipart part's header block into a lowercased-key dict."""
-    headers: dict[str, str] = {}
-    for line in header_blob.split(b"\r\n"):
-        if not line:
-            continue
-        key, _, value = line.partition(b":")
-        headers[key.decode("latin-1").strip().lower()] = value.decode("latin-1").strip()
-    return headers
-
-
-def _disposition_param(disposition: str, param: str) -> str | None:
-    """Return a ``Content-Disposition`` parameter value (e.g. ``name``), or None."""
-    for piece in disposition.split(";"):
-        key, _, value = piece.strip().partition("=")
-        if key.strip().lower() == param:
-            return value.strip().strip('"')
-    return None
 
 
 def _import_result_response(
@@ -1961,6 +2152,9 @@ def _import_result_response(
     empty selection) carries a message instead. Both return 200 so the inline
     fragment swaps into ``#frames-import-result`` -- the repo's inline-error
     convention, since HTMX does not swap a non-2xx response without extra wiring.
+
+    Synchronous and session-reading (the CSRF token comes from the session row),
+    so :func:`frames_import` awaits it through the threadpool (#49).
     """
     return templates.TemplateResponse(
         request,
@@ -1982,68 +2176,175 @@ async def frames_import(
     """Import a batch of image files as uploaded frames for the project.
 
     Body: ``multipart/form-data`` with one or more ``files`` parts (the field
-    name is ``files``, repeated per file) and the per-session CSRF token, which
-    rides in the ``X-CSRF-Token`` header (HTMX adds it automatically) -- so the
-    CSRF middleware verifies the request without reading the multipart body.
+    name is ``files``, repeated per file) and the per-session CSRF token: the
+    ``X-CSRF-Token`` header (HTMX adds it automatically) or, for a no-JS submit,
+    the leading ``csrf_token`` part. The CSRF middleware verifies it before any
+    file byte is read. The files are streamed to a spool directory as they
+    arrive (never buffered) and imported on the jobs executor; the caller's
+    access is re-checked live once the body is in.
 
     Operator/admin-gated like every other frame mutation. Each file's bytes are
     validated and its Exif capture time read by the storage importer; a file with
-    no readable time falls back to now (naive UTC) and is flagged inferred. The
-    whole project is then re-sequenced chronologically. The per-file count cap is
-    enforced by the importer (an over-size batch returns an inline error); an
-    absurd request body is rejected up front by ``Content-Length``.
+    no readable time falls back to now (naive UTC) and is flagged inferred. A time
+    without a UTC offset of its own is read in the optional ``exif_timezone`` field
+    (an IANA name; an unknown one is an inline error), else in the project's
+    schedule timezone. The whole project is then re-sequenced chronologically.
+    The size and file-count caps are enforced while the body streams in (an
+    over-size batch returns an inline error); an absurd body is rejected up
+    front by ``Content-Length``.
 
     The response is the ``#frames-import-result`` fragment -- "{n} imported" plus
     any skipped files with reasons -- returned at HTTP 200 (success or error
     alike) so HTMX swaps it into the result container.
     """
-    from ...storage import frames as frame_service
-
-    _get_project_or_404(db, project_id)
+    # The request's Session is only ever used off the event loop (#49): the
+    # project lookup, the transaction release and every result render (which
+    # reads the session row for the CSRF token) run in the threadpool, while the
+    # body read stays on the loop and the import itself runs in a worker thread.
+    await run_in_threadpool(_get_project_or_404, db, project_id)
 
     content_length = request.headers.get("content-length")
+    declared = 0
     if content_length is not None:
         try:
-            if int(content_length) > _MAX_IMPORT_REQUEST_BYTES:
-                return _import_result_response(
+            declared = int(content_length)
+        except ValueError:
+            declared = 0
+        if declared > _MAX_IMPORT_REQUEST_BYTES:
+            return await run_in_threadpool(
+                _import_result_response,
+                request,
+                db,
+                user,
+                error="The upload is too large. Import fewer files at once.",
+            )
+
+    context = get_context()
+    settings = context.settings
+    # Release this request's transaction before the (possibly slow) body read and
+    # before the importer runs. The importer writes from a worker thread on its
+    # own connection, and SQLite (even in WAL) allows only one writer at a time;
+    # this request's session would hold the writer slot until it commits. Nothing
+    # is pending, and the session re-opens a fresh transaction when the result
+    # fragment renders.
+    await run_in_threadpool(db.commit)
+    try:
+        async with upload_spool(
+            settings.paths.data_dir,
+            expected_bytes=max(declared, 0),
+            low_watermark_bytes=settings.storage.low_watermark_bytes,
+        ) as spool:
+            form = await stream_multipart(
+                request,
+                spool_dir=spool.path,
+                file_field="files",
+                text_fields=frozenset({"csrf_token", "exif_timezone"}),
+                max_file_bytes=settings.capture.max_image_bytes,
+                max_total_bytes=min(
+                    _MAX_IMPORT_REQUEST_BYTES, settings.server.max_request_body_bytes
+                ),
+                max_files=frame_service.MAX_IMPORT_BATCH,
+                low_watermark_bytes=settings.storage.low_watermark_bytes,
+            )
+            files = [(part.filename, part.path) for part in form.files if part.path]
+            if not files:
+                return await run_in_threadpool(
+                    _import_result_response,
                     request,
                     db,
                     user,
-                    error="The upload is too large. Import fewer files at once.",
+                    error="No files were selected to import.",
                 )
-        except ValueError:
-            pass
-
-    body = await request.body()
-    files = _parse_multipart_files(
-        body, request.headers.get("content-type", ""), "files"
-    )
-    if not files:
-        return _import_result_response(
-            request, db, user, error="No files were selected to import."
+            # The dependency authorised before the body; a revoke, disable or
+            # demotion can land while it streams in (#207), so re-check live
+            # now. The actor comes from the live row, inside the hop.
+            actor = await run_in_threadpool(
+                _reauthorize_actor, request, db, settings.session
+            )
+            fallback = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+            # The worker owns the spool from here and removes it, so a client
+            # that disconnects mid-import neither loses the import nor leaves
+            # files behind.
+            result = await run_in(
+                context.jobs_executor,
+                _import_from_spool,
+                context.session_factory,
+                settings,
+                actor,
+                project_id,
+                spool,
+                files,
+                fallback,
+                form.fields.get("exif_timezone"),
+            )
+    except BodyTooLargeError:
+        error = "The upload is too large. Import fewer files at once."
+    except ValidationError as exc:
+        error = str(exc)
+    except (TooManyFilesError, frame_service.ImportBatchTooLargeError):
+        error = (
+            f"import batch exceeds the maximum of {frame_service.MAX_IMPORT_BATCH} "
+            "files; import fewer files at once"
         )
+    except MultipartError:
+        error = "The upload could not be read. Reload the page and try again."
+    except InsufficientSpoolSpaceError:
+        error = "There is not enough free disk space to accept this upload."
+    else:
+        return await run_in_threadpool(
+            _import_result_response, request, db, user, result=result.value
+        )
+    return await run_in_threadpool(
+        _import_result_response, request, db, user, error=error
+    )
 
-    context = get_context()
-    fallback = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-    # Release this request's transaction before the importer runs. The importer
-    # writes from a worker thread on its own connection, and SQLite (even in WAL)
-    # allows only one writer at a time; this request's session holds the writer
-    # slot until it commits, so without this the threaded import would wait out
-    # the busy timeout and fail. Committing here is safe -- nothing else is
-    # pending -- and the session re-opens a fresh transaction when the result
-    # fragment renders.
-    db.commit()
+
+def _reauthorize_actor(
+    request: Request, db: DbSession, session_settings: SessionSettings
+) -> Actor:
+    """Re-check the caller's access after the body; return the live actor.
+
+    Synchronous, for a threadpool hop (the session read stays off the loop).
+    The role comes from the live user row, never from the dependency's earlier
+    answer, so a demoted operator cannot finish an upload begun as one.
+
+    :raises HTTPException: ``401`` / ``403`` when access was lost meanwhile.
+    """
+    user = reauthorize_after_body(
+        request,
+        db,
+        settings=session_settings,
+        allowed_roles=(deps.OPERATOR_ROLE, deps.ADMIN_ROLE),
+    )
+    if user is None:  # a cookie-authenticated route always has a session
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return Actor.of(user)
+
+
+def _import_from_spool(
+    session_factory: sessionmaker[DbSession],
+    settings: Settings,
+    actor: Actor,
+    project_id: int,
+    spool: UploadSpool,
+    files: list[tuple[str, Path]],
+    fallback: datetime.datetime,
+    exif_timezone: str | None = None,
+) -> Result[ImportResult]:
+    """Import the spooled files; always removes the spool directory.
+
+    Synchronous, for the jobs executor.
+    """
+    spool.claim_or_raise()
     try:
-        result = await asyncio.to_thread(
-            frame_service.import_frames,
-            context.session_factory,
-            context.settings,
+        return frame_service.import_frames(
+            session_factory,
+            settings,
+            actor,
             project_id,
             files,
             fallback,
-            user.id,
+            exif_timezone,
         )
-    except frame_service.ImportBatchTooLargeError as exc:
-        return _import_result_response(request, db, user, error=str(exc))
-
-    return _import_result_response(request, db, user, result=result)
+    finally:
+        spool.finish()

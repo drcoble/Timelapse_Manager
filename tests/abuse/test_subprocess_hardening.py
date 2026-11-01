@@ -8,13 +8,18 @@ reaching the ffmpeg subprocess:
   - drawtext text escaping
   - Timestamp-format escaping
   - Overlay image path confinement
+  - Concat list entries and the concat protocol whitelist (#67 S15)
+  - Chapter titles in the ffmetadata file
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+from tests.unit.encode.ffmpeg_parse_model import read_concat_files, read_ffmetadata
 
 # Re-export for cleaner references in the codec/container tests.
 from timelapse_manager.encode.allowlist import (  # noqa: F401
@@ -29,7 +34,16 @@ from timelapse_manager.encode.allowlist import (  # noqa: F401
     validate_dimensions,
     validate_fps,
 )
-from timelapse_manager.encode.encoder import EncoderError
+from timelapse_manager.encode.encoder import (
+    Chapter,
+    EncoderError,
+    FrameRef,
+    FrameSequence,
+    OutputSettings,
+    OverlayConfig,
+    RenderSpec,
+)
+from timelapse_manager.encode.ffmpeg_impl import FfmpegEncoder
 from timelapse_manager.encode.overlay import (
     escape_drawtext,
     escape_path_for_filter,
@@ -290,26 +304,25 @@ class TestEscapeTimestampFormat:
         # Each : must become \\\\\\: (3 backslashes + colon)
         assert "\\\\\\:" in result
 
-    def test_backslash_doubled(self) -> None:
-        result = escape_timestamp_format("literal\\path")
-        assert "\\\\" in result
+    @pytest.mark.parametrize(
+        "fmt",
+        [
+            "literal\\path",
+            "it's %H",
+            "',null",
+            "x',movie=/etc/passwd",
+            "[a];movie=x",
+            "%{eif:1:d}",
+        ],
+    )
+    def test_hostile_format_is_refused_not_escaped(self, fmt: str) -> None:
+        """Quotes and backslashes cannot be escaped safely inside text='...'.
 
-    def test_single_quote_escaped(self) -> None:
-        """A single quote would close the outer text='...' quoting.
-
-        escape_timestamp_format writes \\' so the filtergraph parser treats it
-        as an escaped quote rather than a quote-close.
+        The old escaper wrote \\' for a quote, which *closes* a single-quoted
+        filtergraph value; the format grammar now refuses such values (#67 S4).
         """
-        result = escape_timestamp_format("it's %H")
-        # The escape sequence must be present.
-        assert "\\'" in result
-        # An un-escaped bare apostrophe must not appear (only the escaped form).
-        import re
-
-        bare_quotes = re.findall(r"(?<!\\)'", result)
-        assert len(bare_quotes) == 0, (
-            f"Found unescaped single quote in result: {result!r}"
-        )
+        with pytest.raises(EncoderError, match="invalid timestamp overlay format"):
+            escape_timestamp_format(fmt)
 
     def test_strftime_percent_directives_pass_through(self) -> None:
         """% in format strings must NOT be double-escaped (unlike drawtext)."""
@@ -375,3 +388,204 @@ class TestResolveOverlayImage:
         """Windows path backslashes must be doubled for the filtergraph."""
         result = escape_path_for_filter("C:\\Windows\\Fonts\\arial.ttf")
         assert "\\\\" in result
+
+
+# ---------------------------------------------------------------------------
+# Concat list and concat input (#67 S15, S5 newline part)
+# ---------------------------------------------------------------------------
+
+
+def _frames(paths: list[Path]) -> list[FrameRef]:
+    base = datetime(2024, 6, 1, 12, tzinfo=UTC)
+    return [
+        FrameRef(
+            sequence_index=i,
+            capture_timestamp=base + timedelta(minutes=i),
+            absolute_path=path,
+            width=64,
+            height=48,
+        )
+        for i, path in enumerate(paths)
+    ]
+
+
+def _spec_for(tmp_path: Path, frames: list[FrameRef], **kwargs: object) -> RenderSpec:
+    render_root = tmp_path / "renders"
+    render_root.mkdir(exist_ok=True)
+    return RenderSpec(
+        project_id=1,
+        frames=FrameSequence(project_id=1, frames=frames),
+        output_settings=OutputSettings(
+            fps=24.0, width=64, height=48, codec="h264", container="mp4", crf=23
+        ),
+        overlay=OverlayConfig(),
+        chapters=kwargs.get("chapters", []),  # type: ignore[arg-type]
+        deflicker=False,
+        output_path=render_root / "out.mp4",
+        project_render_root=render_root,
+    )
+
+
+HOSTILE_FRAME_NAMES = [
+    "plain.jpg",
+    "it's.jpg",
+    "''.jpg",
+    "a'\\''b.jpg",
+    "space in name.jpg",
+    "  leading-and-trailing  .jpg",
+    "back\\slash.jpg",
+    "#hash.jpg",
+    "-leading-dash.jpg",
+    "colon:file.jpg",
+    "comma,semi;[br].jpg",
+    "é日本🎥.jpg",
+    "file 'x'.jpg",
+    "duration 1.jpg",
+    "x" * 200 + ".jpg",
+]
+
+
+@pytest.mark.abuse
+class TestConcatList:
+    @pytest.mark.parametrize(
+        "name",
+        HOSTILE_FRAME_NAMES,
+        ids=[f"name{i}" for i in range(len(HOSTILE_FRAME_NAMES))],
+    )
+    def test_hostile_path_reads_back_unchanged(self, tmp_path: Path, name: str) -> None:
+        paths = [tmp_path / name, tmp_path / "next.jpg"]
+        list_path = FfmpegEncoder()._write_concat_list(_frames(paths), tmp_path)
+
+        text = list_path.read_text(encoding="utf-8")
+        assert read_concat_files(text) == [str(p) for p in paths]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "evil\nfile 'http://example.invalid/x.jpg'",
+            "evil\rfile '/etc/passwd'",
+            "evil\r\nffconcat version 1.0",
+            "evil\x00.jpg",
+            "trailing\n",
+        ],
+    )
+    def test_line_break_or_nul_in_a_path_is_refused(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        frames = _frames([tmp_path / "ok.jpg", Path(str(tmp_path) + "/" + name)])
+
+        with pytest.raises(EncoderError, match="line break or NUL"):
+            FfmpegEncoder()._write_concat_list(frames, tmp_path)
+        # Nothing is written: the list is built in memory first.
+        assert not (tmp_path / "concat.txt").exists()
+
+    def test_build_argv_refuses_a_newline_path(self, tmp_path: Path) -> None:
+        frames = _frames([tmp_path / "a.jpg", tmp_path / "b\nfile '/etc/passwd'"])
+        spec = _spec_for(tmp_path, frames)
+        work = tmp_path / "work"
+        work.mkdir()
+
+        with pytest.raises(EncoderError, match="line break or NUL"):
+            FfmpegEncoder()._build_argv(
+                spec, spec.output_path.resolve(), spec.project_render_root, work
+            )
+
+    @pytest.mark.parametrize("api", [None, "vaapi", "nvenc"])
+    def test_concat_input_is_limited_to_the_file_protocol(
+        self, tmp_path: Path, api: str | None
+    ) -> None:
+        frames = _frames([tmp_path / "a.jpg", tmp_path / "b.jpg"])
+        spec = _spec_for(tmp_path, frames)
+        work = tmp_path / "work"
+        work.mkdir()
+        encoder = FfmpegEncoder(
+            hwaccel_enabled=api is not None,
+            hwaccel_api=api,
+            available_hw_encoders=frozenset({"h264_vaapi", "h264_nvenc"}),
+        )
+
+        argv = encoder._build_argv(
+            spec, spec.output_path.resolve(), spec.project_render_root, work
+        )
+
+        concat = argv.index("concat")
+        assert argv[concat - 3 : concat + 5] == [
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(work / "concat.txt"),
+        ]
+        assert argv.count("-protocol_whitelist") == 1
+
+
+# ---------------------------------------------------------------------------
+# Chapter titles in the ffmetadata file
+# ---------------------------------------------------------------------------
+
+HOSTILE_TITLES = [
+    "Plain title",
+    "a=b",
+    "x;y",
+    "#not a comment",
+    ";not a comment",
+    "[CHAPTER]",
+    "back\\slash",
+    "ends with backslash\\",
+    "ends with two\\\\",
+    "\\",
+    "line\nbreak",
+    "cr\rbreak",
+    "crlf\r\nbreak",
+    "nul\x00byte",
+    "tab\tx",
+    "title=injected\n[CHAPTER]\nTIMEBASE=1/1\nSTART=0\nEND=1",
+    "é日本🎥",
+    "-dash",
+    "y" * 3000,
+]
+
+
+def _expected_title(label: str) -> str:
+    text = label.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = text.replace("\t", " ")
+    text = "".join(ch for ch in text if ch >= " " and ch != "\x7f")
+    return text.rstrip("\\")
+
+
+@pytest.mark.abuse
+class TestChapterTitles:
+    def test_hostile_titles_read_back_one_chapter_each(self, tmp_path: Path) -> None:
+        chapters = [
+            Chapter(timecode_seconds=float(i), label=title)
+            for i, title in enumerate(HOSTILE_TITLES)
+        ]
+        meta = FfmpegEncoder()._write_chapters_metadata(chapters, tmp_path)
+
+        sections = read_ffmetadata(meta.read_bytes())
+
+        assert sections[0] == {}
+        read_back = sections[1:]
+        assert len(read_back) == len(HOSTILE_TITLES)
+        for section, title in zip(read_back, HOSTILE_TITLES, strict=True):
+            assert set(section) == {"TIMEBASE", "START", "END", "title"}
+            assert section["title"] == _expected_title(title)
+
+    def test_trailing_backslash_does_not_swallow_the_next_chapter(
+        self, tmp_path: Path
+    ) -> None:
+        # ffmetadec ends a line only when the previous raw byte is not "\\", so
+        # an escaped trailing backslash used to merge the next line into the
+        # title.
+        chapters = [
+            Chapter(timecode_seconds=0.0, label="first\\"),
+            Chapter(timecode_seconds=5.0, label="second"),
+        ]
+        meta = FfmpegEncoder()._write_chapters_metadata(chapters, tmp_path)
+
+        sections = read_ffmetadata(meta.read_bytes())
+
+        assert [s.get("title") for s in sections[1:]] == ["first", "second"]

@@ -45,6 +45,13 @@
   stroke-width: 1.5;
 }
 
+/* The scrubber drag area. Without this a touch drag along the ribbon is taken
+   as a scroll or zoom and the browser cancels the pointer (#200); the page
+   scrolls from anywhere outside the strip. */
+.frame-ribbon .time-ribbon {
+  touch-action: none;
+}
+
 .time-ribbon-svg--interactive {
   cursor: pointer;
 }

@@ -18,7 +18,7 @@
     a private address unless that network has been explicitly allowed here. If
     adding a camera fails with <em>"address is not within any admin-allowed
     subnet"</em>, add its network below (for example
-    <span class="mono">10.1.16.0/24</span>). Loopback, link-local, and
+    <span class="mono">192.168.1.0/24</span>). Loopback, link-local, and
     cloud-metadata addresses are always blocked and cannot be allowed.
     Changes take effect immediately — no restart needed.
   </p>
@@ -62,10 +62,10 @@
                   rows="5"
                   autocomplete="off"
                   spellcheck="false"
-                  placeholder="10.1.16.0/24&#10;192.168.1.0/24">{{ ssrf.allowed_private_subnets | join("\n") }}</textarea>
+                  placeholder="192.168.1.0/24&#10;10.0.5.0/24">{{ ssrf.allowed_private_subnets | join("\n") }}</textarea>
         <span class="form-hint">
           One network per line, in CIDR notation
-          (<span class="mono">10.1.16.0/24</span>). A single address is also
+          (<span class="mono">192.168.1.0/24</span>). A single address is also
           accepted and treated as a <span class="mono">/32</span>. Leave empty to
           allow no extra private networks.
         </span>

@@ -380,3 +380,30 @@ class TestEnvProvenance:
         assert "session.idle_timeout_seconds" in env_sourced
         # A sibling leaf the environment did not set is not reported.
         assert "session.absolute_timeout_seconds" not in env_sourced
+
+
+class TestCaptureWsKeepaliveValidation:
+    def test_ping_below_read_timeout_is_accepted(self) -> None:
+        from timelapse_manager.config.settings import CaptureSettings
+
+        cfg = CaptureSettings(
+            ws_ping_interval_seconds=30.0, ws_read_timeout_seconds=60.0
+        )
+        assert cfg.ws_ping_interval_seconds < cfg.ws_read_timeout_seconds
+
+    def test_ping_equal_to_read_timeout_is_rejected(self) -> None:
+        # Equal leaves no post-ping window, making the keepalive inert.
+        from pydantic import ValidationError
+
+        from timelapse_manager.config.settings import CaptureSettings
+
+        with pytest.raises(ValidationError, match="ws_ping_interval_seconds"):
+            CaptureSettings(ws_ping_interval_seconds=60.0, ws_read_timeout_seconds=60.0)
+
+    def test_ping_above_read_timeout_is_rejected(self) -> None:
+        from pydantic import ValidationError
+
+        from timelapse_manager.config.settings import CaptureSettings
+
+        with pytest.raises(ValidationError, match="ws_ping_interval_seconds"):
+            CaptureSettings(ws_ping_interval_seconds=90.0, ws_read_timeout_seconds=60.0)

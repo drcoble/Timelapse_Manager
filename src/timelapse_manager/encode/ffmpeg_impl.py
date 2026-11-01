@@ -13,10 +13,15 @@ invariants are enforced here rather than trusted from the caller:
 * **Path confinement.** The output path -- and any overlay image -- must resolve
   to a location inside the project's render root, checked with
   :meth:`pathlib.Path.is_relative_to`, not a string prefix.
-* **Untrusted concat list.** Frame paths come from the database and may contain
-  any character, so each is written into the concat list with ffmpeg's
-  single-quote escaping (``'`` -> ``'\\''``); a bare ``file <path>`` line is
-  never written.
+* **Untrusted concat list.** Frame paths come from the database, so each is
+  written into the concat list with ffmpeg's single-quote escaping (``'`` ->
+  ``'\\''``); a bare ``file <path>`` line is never written. A path containing a
+  line break or NUL, which would end the ``file`` line early, is refused, and
+  the concat input may open local files only (``-protocol_whitelist file``).
+* **The final filtergraph is checked.** The finished graph string is parsed the
+  way ffmpeg parses it; its filter names must equal, in order, the filters the
+  builder meant to emit, each on the allowlist, and each ``drawtext`` must carry
+  exactly the options the builder wrote.
 * **One timestamp drawtext, ever.** The capture-time overlay is a single
   ``drawtext`` reading each frame's presentation timestamp, so a months-long
   project does not explode into tens of thousands of filters.
@@ -24,6 +29,10 @@ invariants are enforced here rather than trusted from the caller:
   encode time only; the input files are read-only.
 * **Cancellation kills the child.** Cancelling the render terminates ffmpeg and
   removes any partial output before propagating.
+* **A stuck encode cannot hold the render slot.** ffmpeg reports progress on
+  stdout (``-progress pipe:1``); a watchdog kills it, removes the partial output
+  and raises :class:`EncoderTimeoutError` when no progress counter has advanced
+  for the stall timeout, or when the render outlives its wall-clock ceiling.
 """
 
 from __future__ import annotations
@@ -34,6 +43,8 @@ import logging
 import shlex
 import tempfile
 import time
+from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -69,18 +80,245 @@ _DEFAULT_FONT_CANDIDATES: tuple[str, ...] = (
     "C:\\Windows\\Fonts\\arial.ttf",
 )
 
+# Muxers whose index (``moov``) ffmpeg writes at the end unless told otherwise.
+# ``+faststart`` moves it to the front so a browser can start playback (and
+# seek) without first fetching the tail of the file. MP4 is the only such
+# container on the allowlist (``allowlist.CONTAINER_MUXERS``).
+_FASTSTART_MUXERS: frozenset[str] = frozenset({"mp4"})
+
+# Every encoder that produces H.265: the software one plus the hardware ones,
+# derived from the allowlist so a new hardware HEVC encoder is covered too.
+_HEVC_ENCODERS: frozenset[str] = frozenset({"libx265"}) | frozenset(
+    name for name, codec in allowlist.HW_ENCODER_CODECS.items() if codec == "h265"
+)
+
 _DEFAULT_FONT_COLOR = "white"
 _DEFAULT_FONT_SIZE = 24
 
+# Render watchdog (#67 R2). The defaults mirror ``RenderSettings``.
+DEFAULT_STALL_TIMEOUT_SECONDS = 300.0
+# ``0`` means "derived from the frame count": see :func:`render_time_ceiling`.
+DEFAULT_MAX_JOB_SECONDS = 0.0
+# The derived ceiling: never below an hour, and two seconds per frame above that.
+_MIN_DERIVED_CEILING_SECONDS = 3600.0
+_DERIVED_SECONDS_PER_FRAME = 2.0
+# How often the watchdog checks the limits. Shortened automatically for small
+# limits so a low stall timeout is still enforced promptly.
+_WATCHDOG_TICK_SECONDS = 5.0
+# The ``-progress`` keys whose increase counts as progress. Both are integers;
+# ``N/A`` (ffmpeg's value before the first output frame) is ignored.
+_PROGRESS_KEYS: frozenset[bytes] = frozenset({b"frame", b"out_time_us"})
+# Pipe reading: fixed-size chunks, with any single line capped so a flood of
+# output without newlines cannot grow memory without bound.
+_PIPE_READ_CHUNK = 64 * 1024
+_MAX_LINE_BYTES = 4096
+# Lines of stderr kept for the failure message (the last non-empty one is used).
+_STDERR_TAIL_LINES = 50
+# After ffmpeg exits (or is killed), how long to wait for its pipes to reach EOF.
+_READER_GRACE_SECONDS = 5.0
+
+
+class EncoderTimeoutError(EncoderError):
+    """ffmpeg was killed by the render watchdog.
+
+    The message is the reason the render failed, for example
+    ``ffmpeg stalled: no progress for 300s`` or
+    ``ffmpeg exceeded max_job_seconds (3600s)``; the render queue records it as
+    the job's failure reason.
+    """
+
+
+def render_time_ceiling(max_job_seconds: float, frame_count: int) -> float:
+    """Return the wall-clock ceiling, in seconds, for one render.
+
+    A positive ``max_job_seconds`` is used as is. ``0`` derives the ceiling from
+    the frame count: ``max(3600, 2 * frame_count)``.
+    """
+    if max_job_seconds > 0:
+        return max_job_seconds
+    return max(_MIN_DERIVED_CEILING_SECONDS, _DERIVED_SECONDS_PER_FRAME * frame_count)
+
+
+def _format_seconds(seconds: float) -> str:
+    """Format a limit for a failure reason: ``300s``, ``0.5s``."""
+    if seconds == int(seconds):
+        return f"{int(seconds)}s"
+    return f"{seconds:.2f}".rstrip("0").rstrip(".") + "s"
+
+
+class _ProgressTracker:
+    """Follow ffmpeg's ``-progress`` output and report real advances.
+
+    ffmpeg writes a block of ``key=value`` lines to the progress URL about twice
+    a second, ending each block with ``progress=continue`` (``progress=end`` for
+    the last). A block arriving is not progress: a wedged encode can repeat the
+    same values. Only a strict increase of ``frame`` or ``out_time_us`` counts.
+    """
+
+    def __init__(self) -> None:
+        """Start with no value seen for any key."""
+        self._highest: dict[bytes, int] = {}
+
+    def feed(self, line: bytes) -> bool:
+        """Consume one output line; return ``True`` if a counter advanced."""
+        key, sep, value = line.strip().partition(b"=")
+        if not sep or key not in _PROGRESS_KEYS:
+            return False
+        try:
+            number = int(value)
+        except ValueError:
+            return False
+        previous = self._highest.get(key)
+        if previous is not None and number <= previous:
+            return False
+        self._highest[key] = number
+        return True
+
+
+async def _read_lines(
+    stream: asyncio.StreamReader, on_line: Callable[[bytes], None]
+) -> None:
+    """Read ``stream`` to EOF, calling ``on_line`` for each line.
+
+    Reads fixed-size chunks instead of :meth:`asyncio.StreamReader.readline`,
+    which raises on a line longer than its 64 KiB limit. A line longer than
+    ``_MAX_LINE_BYTES`` is truncated, so memory stays bounded however the child
+    writes. A final line without a trailing newline is still delivered.
+    """
+    pending = bytearray()
+    while True:
+        chunk = await stream.read(_PIPE_READ_CHUNK)
+        if not chunk:
+            break
+        pending += chunk
+        *complete, rest = pending.split(b"\n")
+        for line in complete:
+            on_line(bytes(line[:_MAX_LINE_BYTES]))
+        pending = rest[:_MAX_LINE_BYTES]
+    if pending:
+        on_line(bytes(pending))
+
+
+def _last_nonempty_line(lines: deque[bytes]) -> str | None:
+    """Return the last non-blank line of ``lines``, decoded, or ``None``."""
+    for line in reversed(lines):
+        text = line.decode("utf-8", errors="replace").strip()
+        if text:
+            return text
+    return None
+
+
+# Characters that end a line for the concat demuxer's and ffmetadata's line
+# readers, so cannot appear inside one entry.
+_LINE_BREAK_CHARS: frozenset[str] = frozenset("\r\n\0")
+
+# The options every overlay ``drawtext`` carries, in the order they are written.
+# The final-graph check requires exactly this sequence, so a value that escaped
+# its quoting and added an option (``textfile=``, say) fails the render.
+_DRAWTEXT_OPTION_KEYS: tuple[str, ...] = (
+    "fontfile",
+    "text",
+    "x",
+    "y",
+    "fontcolor",
+    "fontsize",
+    "box",
+    "boxcolor",
+)
+
+
+def _drawtext_filter(font: str, text: str, x: str, y: str) -> str:
+    """Return one overlay ``drawtext`` filter with :data:`_DRAWTEXT_OPTION_KEYS`.
+
+    ``font`` and ``text`` must already be escaped for their single-quoted
+    position (:func:`.overlay.escape_path_for_filter`,
+    :func:`.overlay.escape_drawtext`, or the timestamp expansion).
+    """
+    return (
+        f"drawtext=fontfile='{font}':text='{text}'"
+        f":x={x}:y={y}"
+        f":fontcolor={_DEFAULT_FONT_COLOR}:fontsize={_DEFAULT_FONT_SIZE}"
+        f":box=1:boxcolor=black@0.4"
+    )
+
+
+def _verify_filtergraph(graph: str, expected: list[str], *, allow_hw: bool) -> None:
+    """Check the finished filtergraph against what the builder meant to emit.
+
+    The graph is parsed as ffmpeg parses it (:func:`.allowlist.parse_filtergraph`).
+    The parsed filter names must equal ``expected`` exactly, in order, and are
+    then checked against the allowlist; each ``drawtext`` must carry exactly
+    :data:`_DRAWTEXT_OPTION_KEYS`. Comparing the ordered list (not a set) is what
+    catches an injected *allowlisted* filter, such as a second ``drawtext``.
+
+    :raises EncoderError: ``filtergraph mismatch`` when the parsed graph differs.
+    :raises EncoderCapabilityError: when a parsed filter is not on the allowlist.
+    """
+    parsed = allowlist.parse_filtergraph(graph)
+    names = [f.name for f in parsed]
+    if names != expected:
+        raise EncoderError(
+            f"filtergraph mismatch: expected filters {expected!r}, parsed {names!r}"
+        )
+    allowlist.ensure_filters_allowed(names, allow_hw=allow_hw)
+    for parsed_filter in parsed:
+        if parsed_filter.name != "drawtext":
+            continue
+        options = allowlist.parse_filter_options(parsed_filter.args or "")
+        keys = tuple(key for key, _ in options)
+        if keys != _DRAWTEXT_OPTION_KEYS:
+            raise EncoderError(
+                f"filtergraph mismatch: drawtext options {list(keys)!r}, "
+                f"expected {list(_DRAWTEXT_OPTION_KEYS)!r}"
+            )
+
+
+def _escape_ffmetadata_value(value: str) -> str:
+    r"""Escape a value for one ``key=value`` line of an ffmetadata file.
+
+    ffmetadata's reader (libavformat ``ffmetadec.c``) ends a line at ``\r``,
+    ``\n`` or NUL unless the previous byte is a backslash, and its unescape step
+    takes the character after any backslash literally. So:
+
+    * line breaks and tabs become spaces and other control characters are
+      dropped;
+    * ``\``, ``=``, ``;`` and ``#`` are backslash-escaped;
+    * trailing backslashes are dropped. The reader remembers only the previous
+      raw byte, so an escaped backslash (``\\``) at the end of the line still
+      escapes the line break: a title ending in ``\`` swallowed the next line,
+      the following chapter's ``[CHAPTER]`` header.
+    """
+    cleaned = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    cleaned = cleaned.replace("\t", " ")
+    cleaned = "".join(ch for ch in cleaned if ch >= " " and ch != "\x7f")
+    cleaned = cleaned.rstrip("\\")
+    return (
+        cleaned.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(";", "\\;")
+        .replace("#", "\\#")
+    )
+
 
 def _escape_concat_path(path: str) -> str:
-    """Escape a path for an ffmpeg concat-demuxer ``file`` line.
+    r"""Escape a path for an ffmpeg concat-demuxer ``file`` line.
 
     The concat demuxer treats a single-quoted argument literally except for the
     quote character itself, which is escaped by closing the quote, inserting an
-    escaped quote, and reopening (``'`` -> ``'\\''``). The returned value is the
+    escaped quote, and reopening (``'`` -> ``'\''``). The returned value is the
     inner content; the caller wraps it in ``file '<...>'``.
+
+    Quoting cannot protect a line break: the demuxer splits the list into lines
+    before it tokenises, so ``\r``, ``\n`` or NUL would end the entry and start
+    a new directive (#67 S15).
+
+    :raises EncoderError: if ``path`` contains ``\r``, ``\n`` or NUL.
     """
+    if not _LINE_BREAK_CHARS.isdisjoint(path):
+        raise EncoderError(
+            "frame path contains a line break or NUL; refusing to write it to "
+            "the concat list"
+        )
     return path.replace("'", "'\\''")
 
 
@@ -135,6 +373,21 @@ _HW_QUALITY_FLAG: dict[str, str] = {
     "qsv": "-global_quality",
     "vaapi": "-qp",
 }
+
+
+def _playback_args(encoder_name: str, muxer: str) -> list[str]:
+    """Return the muxer flags that make an output play well in a browser.
+
+    * ``-movflags +faststart`` for MP4, so the index precedes the media.
+    * ``-tag:v hvc1`` for H.265 in MP4: ffmpeg defaults to ``hev1``, which
+      Safari refuses. Applies to every HEVC encoder, software or hardware.
+    """
+    if muxer not in _FASTSTART_MUXERS:
+        return []
+    args = ["-movflags", "+faststart"]
+    if encoder_name in _HEVC_ENCODERS:
+        args += ["-tag:v", "hvc1"]
+    return args
 
 
 def _hw_quality_args(output: OutputSettings, api: str) -> list[str]:
@@ -238,6 +491,9 @@ class FfmpegEncoder(Encoder):
         hwaccel_api: str | None = None,
         hwaccel_device: str | None = None,
         available_hw_encoders: frozenset[str] | None = None,
+        stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS,
+        max_job_seconds: float = DEFAULT_MAX_JOB_SECONDS,
+        watchdog_clock: Callable[[], float] | None = None,
     ) -> None:
         """Create an encoder.
 
@@ -259,13 +515,31 @@ class FfmpegEncoder(Encoder):
         :param available_hw_encoders: the set of hardware encoder names this
             ffmpeg build provides. Injected for testing; when ``None`` (and
             hardware is enabled) it is probed lazily and cached on first render.
+        :param stall_timeout_seconds: kill ffmpeg when neither its frame count
+            nor its output time has advanced for this long. Must be positive.
+        :param max_job_seconds: kill ffmpeg when one render runs longer than
+            this. ``0`` derives the ceiling from the frame count (see
+            :func:`render_time_ceiling`). Must not be negative.
+        :param watchdog_clock: the monotonic clock, in seconds, the stall timeout
+            and ceiling are measured on. Defaults to the event loop's clock. A
+            test seam: a test that starts a real child process can hold the
+            clock until the child is ready, so a slow interpreter start under
+            load is not counted as a stall.
+        :raises ValueError: if either watchdog limit is out of range.
         """
+        if stall_timeout_seconds <= 0:
+            raise ValueError("stall_timeout_seconds must be positive")
+        if max_job_seconds < 0:
+            raise ValueError("max_job_seconds must not be negative")
         self._ffmpeg_binary = ffmpeg_binary
         self._font_path = font_path
         self._hwaccel_enabled = hwaccel_enabled
         self._hwaccel_api = hwaccel_api
         self._hwaccel_device = hwaccel_device
         self._available_hw_encoders = available_hw_encoders
+        self._stall_timeout_seconds = stall_timeout_seconds
+        self._max_job_seconds = max_job_seconds
+        self._watchdog_clock = watchdog_clock
 
     def _hw_capabilities(self) -> frozenset[str]:
         """Return the available hardware encoders, probing lazily if needed.
@@ -364,7 +638,11 @@ class FfmpegEncoder(Encoder):
         second ``setpts`` renumbers every input frame to one output ordinal, so
         each ``file`` line maps to exactly one output frame -- a 1:1 frame count
         with no duplicated trailing frame. Paths are single-quote escaped because
-        they originate from the (untrusted) database.
+        they originate from the (untrusted) database, and a path with a line
+        break or NUL is refused (:func:`_escape_concat_path`).
+
+        :raises EncoderError: if a frame path contains a line break or NUL;
+            nothing is written.
         """
         lines: list[str] = []
         count = len(frames)
@@ -414,12 +692,7 @@ class FfmpegEncoder(Encoder):
             # capture epoch (plus the tz offset), so gmtime with base 0 reads the
             # true local wall-clock. One filter, independent of frame count.
             text_expr = f"%{{pts\\:gmtime\\:0\\:{fmt}}}"
-            pre.append(
-                f"drawtext=fontfile='{font}':text='{text_expr}'"
-                f":x={x_text}:y={y_text}"
-                f":fontcolor={_DEFAULT_FONT_COLOR}:fontsize={_DEFAULT_FONT_SIZE}"
-                f":box=1:boxcolor=black@0.4"
-            )
+            pre.append(_drawtext_filter(font, text_expr, x_text, y_text))
 
         if cfg.text_enabled and cfg.text_content:
             font = overlay.escape_path_for_filter(self._resolve_font())
@@ -433,12 +706,7 @@ class FfmpegEncoder(Encoder):
                 y_caption = f"({y_text})-30"
             else:
                 y_caption = f"({y_text})+30"
-            pre.append(
-                f"drawtext=fontfile='{font}':text='{content}'"
-                f":x={x_text}:y={y_caption}"
-                f":fontcolor={_DEFAULT_FONT_COLOR}:fontsize={_DEFAULT_FONT_SIZE}"
-                f":box=1:boxcolor=black@0.4"
-            )
+            pre.append(_drawtext_filter(font, content, x_text, y_caption))
 
         if cfg.image_enabled and cfg.image_path:
             resolved = overlay.resolve_overlay_image(cfg.image_path, confined_root)
@@ -471,9 +739,14 @@ class FfmpegEncoder(Encoder):
         accepts system-memory frames); VA-API and QSV convert to ``nv12`` and
         ``hwupload`` the result into GPU memory just before the encoder.
 
-        Returns ``(filter_string, used_filter_names)``; the names are validated
-        against the allowlist (with the hardware filters permitted only on a
-        hardware path) so nothing unexpected is emitted.
+        Returns ``(filter_string, used_filter_names)``. The finished string is
+        parsed back (:func:`_verify_filtergraph`): its filters must equal
+        ``used`` in order and be on the allowlist (with the hardware filters
+        permitted only on a hardware path), so nothing unexpected is emitted even
+        if an overlay value escaped its quoting.
+
+        :raises EncoderError: ``filtergraph mismatch`` if the parsed graph is not
+            the one the builder assembled.
         """
         output = spec.output_settings
         shift = base_epoch + offset_seconds
@@ -528,14 +801,13 @@ class FfmpegEncoder(Encoder):
                 # Composite in system memory, then convert + upload to the GPU.
                 overlay_chain += tail
                 used += [f.split("=", 1)[0] for f in tail]
-            allowlist.ensure_filters_allowed(used, allow_hw=choice.is_hardware)
             main = ",".join(chain)
             overlay_expr = ",".join(overlay_chain)
             graph = f"[0:v]{main}[v];[v][1:v]{overlay_expr}[out]"
-            return graph, used
-
-        allowlist.ensure_filters_allowed(used, allow_hw=choice.is_hardware)
-        return ",".join(chain), used
+        else:
+            graph = ",".join(chain)
+        _verify_filtergraph(graph, used, allow_hw=choice.is_hardware)
+        return graph, used
 
     def _write_chapters_metadata(
         self, chapters: list[Chapter], directory: Path
@@ -544,8 +816,8 @@ class FfmpegEncoder(Encoder):
 
         Timecodes are in seconds on a 1/1000 timebase. Each chapter ends where
         the next begins; the last extends a nominal second past its start so it
-        is non-empty. Titles are written verbatim on their own line, which the
-        ffmetadata format takes literally (no filtergraph escaping applies).
+        is non-empty. Each title is escaped for its ffmetadata line
+        (:func:`_escape_ffmetadata_value`); no filtergraph escaping applies.
         """
         ms = 1000
         lines = [";FFMETADATA1"]
@@ -558,14 +830,7 @@ class FfmpegEncoder(Encoder):
                 end = start + ms
             if end <= start:
                 end = start + 1
-            # Escape the ffmetadata structural characters (=, ;, #, \, newline).
-            title = (
-                chapter.label.replace("\\", "\\\\")
-                .replace("=", "\\=")
-                .replace(";", "\\;")
-                .replace("#", "\\#")
-                .replace("\n", " ")
-            )
+            title = _escape_ffmetadata_value(chapter.label)
             lines += [
                 "[CHAPTER]",
                 "TIMEBASE=1/1000",
@@ -643,15 +908,29 @@ class FfmpegEncoder(Encoder):
             spec, base_epoch, offset_seconds, pre_filters, image_filter, choice
         )
 
-        argv: list[str] = [self._ffmpeg_binary, "-hide_banner"]
+        # ``-progress pipe:1`` streams key=value progress blocks to stdout for the
+        # render watchdog; ``-nostats`` drops the human-readable stats line that
+        # would otherwise go to stderr. Both are global options.
+        argv: list[str] = [
+            self._ffmpeg_binary,
+            "-hide_banner",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ]
         # Hardware device/decode init goes before the input so ffmpeg builds the
         # device context up front. Empty on the software path -> argv unchanged.
         if choice.is_hardware:
             argv += _hw_init_args(choice, self._hwaccel_device)
+        # The concat input may open local files only (#67 S15): with ``-safe 0``
+        # an entry could otherwise name any protocol ffmpeg was built with. The
+        # demuxer passes the whitelist on to every file it opens.
         argv += [
             "-loglevel",
             "error",
             "-y",
+            "-protocol_whitelist",
+            "file",
             "-f",
             "concat",
             "-safe",
@@ -689,6 +968,7 @@ class FfmpegEncoder(Encoder):
             argv += ["-c:v", encoder_name]
             argv += _quality_args(output, encoder_name)
             argv += ["-pix_fmt", "yuv420p"]
+        argv += _playback_args(choice.encoder_name, muxer)
         argv += ["-f", muxer, str(confined_output)]
         return argv
 
@@ -715,7 +995,10 @@ class FfmpegEncoder(Encoder):
             # ffmpeg flags only -- no credentials or remote URLs -- so it is safe to
             # log verbatim; shlex.join makes it copy-pasteable for reproduction.
             logger.info("ffmpeg command: %s", shlex.join(argv))
-            return await self._run(argv, confined_output, output, browser_ok, started)
+            ceiling = render_time_ceiling(self._max_job_seconds, len(spec.frames))
+            return await self._run(
+                argv, confined_output, output, browser_ok, started, ceiling
+            )
 
     async def _run(
         self,
@@ -724,30 +1007,97 @@ class FfmpegEncoder(Encoder):
         output: OutputSettings,
         browser_ok: bool,
         started: float,
+        ceiling_seconds: float,
     ) -> RenderResult:
-        """Spawn ffmpeg, await it, and translate the outcome into a result.
+        """Spawn ffmpeg, watch it, and translate the outcome into a result.
+
+        Three tasks run while ffmpeg does: one reads the ``-progress`` blocks on
+        stdout, one drains stderr into a bounded tail (so the pipe never fills
+        and blocks the child), and one waits for exit. This coroutine is the
+        watchdog: every tick it checks the stall timeout and ``ceiling_seconds``
+        (both measured from spawn) and, when one is exceeded, kills ffmpeg,
+        removes the partial output and raises :class:`EncoderTimeoutError`.
 
         On cancellation the child is killed and the partial output removed before
         the :class:`asyncio.CancelledError` is re-raised, so no orphan process or
         half-written file survives. The argv is passed as a list with
         ``shell=False`` semantics; nothing is interpreted by a shell.
         """
+        clock = self._watchdog_clock or asyncio.get_running_loop().time
+        stall_seconds = self._stall_timeout_seconds
+        tick = min(_WATCHDOG_TICK_SECONDS, stall_seconds / 4, ceiling_seconds / 4)
         process = await asyncio.create_subprocess_exec(
             *argv,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        assert process.stdout is not None and process.stderr is not None
+        spawned_at = clock()
+        last_progress_at = spawned_at
+        tracker = _ProgressTracker()
+        stderr_tail: deque[bytes] = deque(maxlen=_STDERR_TAIL_LINES)
+
+        def on_progress_line(line: bytes) -> None:
+            nonlocal last_progress_at
+            if tracker.feed(line):
+                last_progress_at = clock()
+
+        readers = [
+            asyncio.create_task(_read_lines(process.stdout, on_progress_line)),
+            asyncio.create_task(_read_lines(process.stderr, stderr_tail.append)),
+        ]
+        exited = asyncio.create_task(process.wait())
+        timeout_reason: str | None = None
         try:
-            _, stderr = await process.communicate()
+            while True:
+                done, _ = await asyncio.wait({exited}, timeout=tick)
+                if exited in done:
+                    break
+                now = clock()
+                if now - last_progress_at > stall_seconds:
+                    reason = (
+                        "ffmpeg stalled: no progress for "
+                        f"{_format_seconds(stall_seconds)}"
+                    )
+                elif now - spawned_at > ceiling_seconds:
+                    reason = (
+                        "ffmpeg exceeded max_job_seconds "
+                        f"({_format_seconds(ceiling_seconds)})"
+                    )
+                else:
+                    continue
+                # A child that exited on this very tick finished on its own; its
+                # exit status decides the outcome, not the watchdog.
+                if process.returncode is None:
+                    timeout_reason = reason
+                    logger.warning(
+                        "killing ffmpeg pid=%s: %s (last stderr: %s)",
+                        process.pid,
+                        reason,
+                        _last_nonempty_line(stderr_tail) or "none",
+                    )
+                    await self._terminate(process)
+                break
+            # Let the readers collect the final output; the pipes reach EOF once
+            # ffmpeg is gone. Bounded, in case something else holds them open.
+            await asyncio.wait(readers, timeout=_READER_GRACE_SECONDS)
         except asyncio.CancelledError:
             await self._terminate(process)
             self._remove_partial(output_path)
             raise
+        finally:
+            unfinished = [task for task in (*readers, exited) if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            await asyncio.gather(*readers, exited, return_exceptions=True)
+
+        if timeout_reason is not None:
+            self._remove_partial(output_path)
+            raise EncoderTimeoutError(timeout_reason)
 
         if process.returncode != 0:
             self._remove_partial(output_path)
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            detail = stderr_text.splitlines()[-1] if stderr_text else "no output"
+            detail = _last_nonempty_line(stderr_tail) or "no output"
             return RenderResult(
                 success=False,
                 output_path=None,

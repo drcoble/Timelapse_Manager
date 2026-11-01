@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of
@@ -237,6 +238,48 @@ class TestNotificationSettingsPost:
         )
         assert resp.status_code == 303
 
+    @pytest.mark.parametrize("mode", ["plain", "TLS", ""])
+    def test_unknown_security_mode_is_an_inline_error_and_writes_nothing(
+        self, admin_client: TestClient, mode: str
+    ) -> None:
+        """An unknown mode is an inline error, never saved as ``none`` (#214)."""
+        from timelapse_manager.db.models import NotificationSettings
+
+        ctx = get_context()
+        csrf = csrf_of(admin_client, "/notification-settings")
+        resp = admin_client.post(
+            "/notification-settings",
+            data={
+                "csrf_token": csrf,
+                "smtp_server": "mail.example.com",
+                "smtp_port": "587",
+                "smtp_security": mode,
+                "smtp_username": "user",
+                "smtp_password": "initial-password",
+                "smtp_from_address": "from@example.com",
+                "smtp_recipients": "ops@example.com",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 422
+        assert "Unknown SMTP security mode" in resp.text
+        assert "initial-password" not in resp.text
+        with session_scope(ctx.session_factory) as db:
+            assert db.get(NotificationSettings, 1) is None
+
+    def test_missing_security_field_is_refused_not_defaulted_to_none(
+        self, admin_client: TestClient
+    ) -> None:
+        csrf = csrf_of(admin_client, "/notification-settings")
+        resp = admin_client.post(
+            "/notification-settings",
+            data={"csrf_token": csrf, "smtp_server": "mail.example.com"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 422
+
     def test_blank_password_post_keeps_stored_secret(
         self, admin_client: TestClient
     ) -> None:
@@ -265,18 +308,20 @@ class TestNotificationSettingsPost:
                 ),
             )
 
-        # Submit with a blank password field, but a CHANGED smtp_server.
-        # This proves update_settings executed (server changed) while password
-        # was preserved (keep-rule applied, not a rejection).
+        # Submit with a blank password field and the SMTP target unchanged, but a
+        # CHANGED from-address. This proves update_settings executed (the sibling
+        # changed) while the password was preserved (keep-rule applied, not a
+        # rejection). Changing the target itself clears it: see the retarget test.
         csrf = csrf_of(admin_client, "/notification-settings")
         admin_client.post(
             "/notification-settings",
             data={
                 "csrf_token": csrf,
-                "smtp_server": "changed.example.com",  # mutated sibling field
+                "smtp_server": "original.example.com",
                 "smtp_port": "587",
                 "smtp_security": "none",
-                "smtp_from_address": "from@example.com",
+                "smtp_username": "user",
+                "smtp_from_address": "changed-from@example.com",  # mutated sibling
                 "smtp_recipients": "ops@example.com",
                 "smtp_password": "",  # blank — must keep stored value
             },
@@ -291,9 +336,56 @@ class TestNotificationSettingsPost:
             row = db.get(NotificationSettings, 1)
         assert row is not None
         # The sibling field change proves update_settings actually ran.
-        assert row.smtp_server == "changed.example.com"
+        assert row.smtp_from_address == "changed-from@example.com"
         # The password keep-rule preserved the stored secret (column holds ciphertext).
         assert decrypt_secret(row.smtp_password) == "stored-real-password"
+
+    def test_retargeting_smtp_with_blank_password_clears_it(
+        self, admin_client: TestClient
+    ) -> None:
+        """A new host with no new password must not inherit the old password (S9)."""
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            update_settings(
+                db,
+                NotificationSettingsUpdate(
+                    enabled_channels=[],
+                    smtp_server="original.example.com",
+                    smtp_port=587,
+                    smtp_security="none",
+                    smtp_username="user",
+                    smtp_password="stored-real-password",
+                    smtp_from_address="from@example.com",
+                    smtp_recipients=["ops@example.com"],
+                    webhook_urls=[],
+                    routing_rules=[],
+                ),
+            )
+        csrf = csrf_of(admin_client, "/notification-settings")
+        resp = admin_client.post(
+            "/notification-settings",
+            data={
+                "csrf_token": csrf,
+                "smtp_server": "changed.example.com",
+                "smtp_port": "587",
+                "smtp_security": "none",
+                "smtp_username": "user",
+                "smtp_from_address": "from@example.com",
+                "smtp_recipients": "ops@example.com",
+                "smtp_password": "***",  # the masked value the form round-trips
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+
+        from timelapse_manager.db.models import NotificationSettings
+
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(NotificationSettings, 1)
+        assert row is not None
+        assert row.smtp_server == "changed.example.com"
+        assert row.smtp_password is None
 
     def test_password_not_in_notification_settings_page_html(
         self, admin_client: TestClient
@@ -324,6 +416,126 @@ class TestNotificationSettingsPost:
         resp = admin_client.get("/notification-settings", follow_redirects=False)
         assert "do-not-show-this-password" not in resp.text
         # The mask sentinel should be in the page (value="***").
+        assert MASK_SENTINEL in resp.text
+
+
+# ---------------------------------------------------------------------------
+# POST /notification-settings — webhook signing secret keep rule
+# ---------------------------------------------------------------------------
+
+
+def _post_settings(client: TestClient, **fields: str) -> None:
+    """POST the notification settings form with a fresh CSRF token."""
+    csrf = csrf_of(client, "/notification-settings")
+    base = {
+        "csrf_token": csrf,
+        "smtp_server": "mail.example.com",
+        "smtp_port": "587",
+        "smtp_security": "none",
+        "smtp_from_address": "from@example.com",
+        "smtp_recipients": "ops@example.com",
+    }
+    base.update(fields)
+    client.post(
+        "/notification-settings",
+        data=base,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+
+
+class TestWebhookSigningSecretPost:
+    def test_saving_secret_encrypts_and_stores_it(
+        self, admin_client: TestClient
+    ) -> None:
+        """A submitted signing secret is encrypted at rest and decrypts back."""
+        from timelapse_manager.db.models import NotificationSettings
+        from timelapse_manager.security.crypto import decrypt_secret, is_encrypted
+
+        _post_settings(admin_client, webhook_signing_secret="top-secret-hmac-key")
+
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(NotificationSettings, 1)
+        assert row is not None
+        stored = row.webhook_signing_secret
+        assert stored is not None
+        assert stored != "top-secret-hmac-key", (
+            "Signing secret stored as plaintext — encryption is not applied"
+        )
+        assert is_encrypted(stored)
+        assert decrypt_secret(stored) == "top-secret-hmac-key"
+
+    def test_sentinel_submission_keeps_stored_secret(
+        self, admin_client: TestClient
+    ) -> None:
+        """Re-submitting the mask sentinel leaves the stored secret untouched.
+
+        The sibling field (smtp_server) is changed in the same POST to prove the
+        save actually ran rather than being silently rejected.
+        """
+        from timelapse_manager.db.models import NotificationSettings
+        from timelapse_manager.monitoring.settings_service import MASK_SENTINEL
+        from timelapse_manager.security.crypto import decrypt_secret
+
+        _post_settings(admin_client, webhook_signing_secret="keep-this-secret")
+        _post_settings(
+            admin_client,
+            smtp_server="changed.example.com",
+            webhook_signing_secret=MASK_SENTINEL,
+        )
+
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(NotificationSettings, 1)
+        assert row is not None
+        # Sibling change proves the save ran; secret preserved by the keep-rule.
+        assert row.smtp_server == "changed.example.com"
+        assert decrypt_secret(row.webhook_signing_secret) == "keep-this-secret"
+
+    def test_blank_submission_keeps_stored_secret(
+        self, admin_client: TestClient
+    ) -> None:
+        """A blank signing-secret field leaves an existing stored secret intact."""
+        from timelapse_manager.db.models import NotificationSettings
+        from timelapse_manager.security.crypto import decrypt_secret
+
+        _post_settings(admin_client, webhook_signing_secret="another-secret")
+        _post_settings(admin_client, webhook_signing_secret="")
+
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(NotificationSettings, 1)
+        assert row is not None
+        assert decrypt_secret(row.webhook_signing_secret) == "another-secret"
+
+    def test_unset_secret_stays_null_on_blank_submission(
+        self, admin_client: TestClient
+    ) -> None:
+        """With nothing stored, a blank submission leaves the column NULL.
+
+        The keep-rule (mirroring the SMTP password) never clears a *set* secret;
+        "clearing" is only meaningful as the never-set case, where the column
+        stays NULL and webhooks remain unsigned.
+        """
+        from timelapse_manager.db.models import NotificationSettings
+
+        _post_settings(admin_client, webhook_signing_secret="")
+
+        ctx = get_context()
+        with session_scope(ctx.session_factory) as db:
+            row = db.get(NotificationSettings, 1)
+        assert row is not None
+        assert row.webhook_signing_secret is None
+
+    def test_secret_not_rendered_in_page_html(self, admin_client: TestClient) -> None:
+        """The rendered page masks the signing secret, never echoing plaintext."""
+        from timelapse_manager.monitoring.settings_service import MASK_SENTINEL
+
+        _post_settings(admin_client, webhook_signing_secret="do-not-echo-this-secret")
+
+        resp = admin_client.get("/notification-settings", follow_redirects=False)
+        assert "do-not-echo-this-secret" not in resp.text
         assert MASK_SENTINEL in resp.text
 
 

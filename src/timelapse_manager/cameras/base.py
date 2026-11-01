@@ -15,11 +15,56 @@ only when an ``async`` method is called.
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Hashable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Protocol
+
+
+class AdapterCache(Protocol):
+    """A store an adapter keeps resolved camera values in across captures.
+
+    Adapters are rebuilt for every capture, so a value an adapter resolves (an
+    ONVIF snapshot URI, a VAPIX stream profile's snapshot knobs) would be
+    re-read every time. The capture engine hands the adapter one of these,
+    owned by the camera's session (``capture.camera_sessions``), so the value
+    is read once per camera and expires on its own. ``get`` returns ``None``
+    for a missing or expired key.
+    """
+
+    def get(self, key: Hashable) -> object | None:
+        """Return the cached value for ``key``, or ``None``."""
+        ...
+
+    def put(self, key: Hashable, value: object) -> None:
+        """Store ``value`` under ``key``."""
+        ...
+
+    def drop(self, key: Hashable) -> None:
+        """Forget ``key`` (no error when absent)."""
+        ...
+
+    def clear(self) -> None:
+        """Forget everything."""
+        ...
+
+
+#: The longest an adapter's ``move_to`` waits for the camera to settle after a
+#: successful move. The capture engine bounds a whole move by the capture
+#: timeout plus this.
+PTZ_SETTLE_MAX_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class PtzPosition:
+    """A pan/tilt/zoom reading, in the camera's own units (``None``: not reported)."""
+
+    pan: float | None
+    tilt: float | None
+    zoom: float | None
 
 
 @dataclass
@@ -37,7 +82,14 @@ class CapturedFrame:
         when the protocol exposes no such data or the read failed; collecting it
         must never fail or delay a capture, so its absence is always benign. This
         is the carrier from the adapter to the frame writer, which persists it
-        alongside the frame row.
+        alongside the frame row. Adapters leave it ``None`` in :meth:`capture`;
+        the capture path fills it afterwards through
+        :meth:`CameraAdapter.collect_scene_metadata`, outside the capture budget.
+    :param capture_notes: short machine-readable notes on how this capture fell
+        short of the requested configuration without failing, e.g.
+        ``"stream_profile_missing"`` when the selected stream profile could not
+        be applied and the camera default was used. Not persisted; the capture
+        path turns each into one warning event.
     """
 
     image_bytes: bytes
@@ -46,6 +98,7 @@ class CapturedFrame:
     format: str
     captured_at: datetime
     scene_metadata: dict | None = None
+    capture_notes: list[str] = field(default_factory=list)
 
 
 class ValidationFailure(str, Enum):  # noqa: UP042 - stable str-mixin enum
@@ -91,6 +144,59 @@ class GeoLocation:
     latitude: float
     longitude: float
     source: str
+
+
+def valid_coordinates(latitude: float, longitude: float) -> bool:
+    """Return whether a latitude/longitude pair is a real position on Earth.
+
+    Both values must be finite, the latitude within ``[-90, 90]`` and the
+    longitude within ``[-180, 180]``. Device-reported coordinates are untrusted
+    input, so the parsers and the persist sites call this before a value can
+    reach the solar-anchor maths.
+
+    This is a predicate rather than a check in :meth:`GeoLocation.__post_init__`
+    on purpose: a raising constructor would make a bad stored manual row fail to
+    load at all, where skipping it keeps the camera usable.
+    """
+    return (
+        math.isfinite(latitude)
+        and math.isfinite(longitude)
+        and -90.0 <= latitude <= 90.0
+        and -180.0 <= longitude <= 180.0
+    )
+
+
+class GeolocationAccessDenied(Exception):  # noqa: N818 - reads as an outcome
+    """The device refused the geolocation read for this account (role too low).
+
+    Raised by :meth:`CameraAdapter.get_geolocation` when the device answered the
+    location request with an authentication/authorization failure and no other
+    source produced a location. It is an exception rather than a third return
+    shape so ``get_geolocation() -> GeoLocation | None`` keeps its contract for
+    every adapter and every existing caller: ``None`` still means "the device
+    has no location", and this means "the device would not tell this account".
+
+    Deliberately *not* a :class:`CaptureError`: the many ``except CaptureError``
+    blocks on the capture and metadata paths must not swallow it. It carries no
+    credential -- neither the username nor the password -- in its attributes or
+    its message, so it is safe to log and to surface.
+
+    :param protocol: the protocol that was refused, e.g. ``"vapix"``.
+    :param required_role: the device role that can read the location, e.g.
+        ``"Administrator"``.
+    :param status: the HTTP status the device answered with (``401``/``403``),
+        or None when it could not be determined.
+    """
+
+    def __init__(self, protocol: str, required_role: str, status: int | None) -> None:
+        self.protocol = protocol
+        self.required_role = required_role
+        self.status = status
+        status_text = f" (HTTP {status})" if status is not None else ""
+        super().__init__(
+            f"{protocol} geolocation read denied{status_text}: "
+            f"requires the {required_role} role"
+        )
 
 
 @dataclass
@@ -301,14 +407,36 @@ class CaptureError(Exception):
 
     Concrete subclasses fix :attr:`reason` so callers can branch on the failure
     category without string-matching the message. Prefer raising a subclass.
+
+    ``local`` marks a failure that happened on this server rather than at the
+    camera (a pool or slot timeout, a credential that cannot be decrypted, a
+    database error). Camera health (#69, CAM-R6) does not count a local failure
+    against the camera, so it can never raise a ``camera_offline`` alert.
     """
 
     #: Default reason; overridden by subclasses.
     reason: ValidationFailure = ValidationFailure.OTHER
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, local: bool = False) -> None:
         super().__init__(message)
         self.message = message
+        self.local = local
+
+
+class CameraMissingError(RuntimeError):
+    """The project's camera row no longer exists (deleted mid-flight).
+
+    A :class:`RuntimeError`, not a :class:`CaptureError`: callers that catch
+    only capture errors (the event listener) keep their behaviour. It is a
+    *local* failure (``local`` is always true): the camera did not fail, the
+    configuration changed under the capture, so camera health ignores it.
+    """
+
+    local = True
+
+    def __init__(self, camera_id: int) -> None:
+        super().__init__(f"camera {camera_id} no longer exists")
+        self.camera_id = camera_id
 
 
 class AuthCaptureError(CaptureError):
@@ -435,6 +563,15 @@ class CameraAdapter(ABC):
             return
         raise PTZUnsupportedError("this camera does not support pan/tilt/zoom")
 
+    async def query_position(self) -> PtzPosition | None:
+        """Read the camera's current pan/tilt/zoom, or ``None`` when unknown.
+
+        Used to tell when a move has settled. The default returns ``None``,
+        which makes :meth:`move_to` implementations fall back to a fixed settle
+        delay. Never raises for an ordinary failure; it returns ``None``.
+        """
+        return None
+
     async def list_event_topics(self) -> list[EventDescriptor]:
         """Enumerate the event topics this camera can emit.
 
@@ -471,13 +608,42 @@ class CameraAdapter(ABC):
         """
         raise EventNotSupportedError("this adapter exposes no event source")
 
+    @property
+    def capture_budget_seconds(self) -> float | None:
+        """The longest one :meth:`capture` may legitimately take, or ``None``.
+
+        ``None`` means the adapter has no budget of its own and the caller's
+        ``capture.timeout_seconds`` applies. An adapter whose grab is slower by
+        design (an ffmpeg RTSP pull) returns its own total, and the caller bounds
+        the capture by the larger of the two so the shared timeout cannot cut a
+        healthy grab short (#69 CAM-R3).
+        """
+        return None
+
     @abstractmethod
     async def capture(self) -> CapturedFrame:
         """Grab a single frame.
 
+        Only the work needed to obtain the image belongs here: the caller bounds
+        this call with the capture budget. Best-effort extras go in
+        :meth:`collect_scene_metadata`, which runs after the frame is in hand.
+
         :raises CaptureError: (a subclass) when the frame cannot be obtained.
         """
         raise NotImplementedError
+
+    async def collect_scene_metadata(
+        self, frame: CapturedFrame
+    ) -> dict[str, object] | None:
+        """Return a best-effort scene-metadata envelope for a captured frame.
+
+        Called after :meth:`capture` returns, outside the capture budget; the
+        caller bounds it with its own total timeout and treats any error or
+        timeout as "no metadata". The default returns ``None``, which is correct
+        for every protocol that exposes no scene settings. Adapters that can
+        read them (Axis VAPIX) override this.
+        """
+        return None
 
     @abstractmethod
     async def validate_connection(self) -> ValidationResult:
@@ -490,7 +656,12 @@ class CameraAdapter(ABC):
 
     @abstractmethod
     async def get_geolocation(self) -> GeoLocation | None:
-        """Return the camera's geolocation if available, else None."""
+        """Return the camera's geolocation if available, else None.
+
+        :raises GeolocationAccessDenied: when the device refused the location
+            read for the configured account and no other source produced one.
+            Adapters whose protocol has no such privilege rule never raise it.
+        """
         raise NotImplementedError
 
     async def get_device_hostname(self) -> str | None:

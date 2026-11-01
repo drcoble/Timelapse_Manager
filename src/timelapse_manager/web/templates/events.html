@@ -72,25 +72,28 @@
 
 {# Date/time jump — the accessible, no-JS jump path. A plain GET returns the full
    page windowed at `at`; with JS the response is swapped into #events-tbody only.
-   The live chip selection is injected via hx-vals (js:) so the jump carries the
-   active levels without a duplicate hidden input in this form. #}
+   events-nav.js puts the live chip selection on the request (htmx:configRequest),
+   so the jump carries the active levels. Not hx-vals="js:...": htmx evaluates
+   that with Function(), which the CSP (no 'unsafe-eval') blocks, and the jump
+   then never fires (#34). #}
 <form id="events-jump" class="filter-bar"
       hx-get="/events" hx-target="#events-tbody" hx-swap="innerHTML"
       hx-push-url="false"
-      hx-vals='js:{level: window.eventsActiveLevels ? window.eventsActiveLevels() : ""}'
       action="/events" method="get"
       style="margin-bottom:var(--sp-4);display:flex;align-items:flex-end;gap:var(--sp-3);flex-wrap:wrap;">
   {% if scope %}<input type="hidden" name="scope" value="{{ scope }}">{% endif %}
   {% if search_q %}<input type="hidden" name="q" value="{{ search_q }}">{% endif %}
   {# No-JS fallback: this hidden input carries the current levels for a plain GET;
-     with JS the hx-vals above overrides it with the live chip selection. #}
+     with JS events-nav.js overrides it with the live chip selection. #}
   <input type="hidden" name="level" value="{{ selected_levels | join(',') }}">
   <div>
-    <label class="form-label" for="events-jump-at">Jump to date &amp; time</label>
+    <label class="form-label" for="events-jump-at">Jump to date &amp; time ({{ viewer_timezone | tz_label }})</label>
     <input type="datetime-local" id="events-jump-at" name="at" class="form-control"
+           aria-describedby="events-jump-hint"
            style="max-width:240px;">
   </div>
   <button type="submit" class="btn btn-secondary btn-sm">Go</button>
+  <span class="form-hint" id="events-jump-hint" style="flex-basis:100%;margin:0;">Times are in {{ viewer_timezone or 'UTC' }}. A repeated hour at a daylight-saving change means its first occurrence.</span>
 </form>
 
 {# "N new events" pill — hidden until the poll detects events newer than the
@@ -111,7 +114,7 @@
   <table class="data-table events-table">
     <thead>
       <tr>
-        <th>Time (UTC)</th>
+        <th>Time ({{ viewer_timezone | tz_label }})</th>
         <th>Level</th>
         <th>Type</th>
         <th>Scope</th>

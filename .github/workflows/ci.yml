@@ -18,8 +18,9 @@ jobs:
     name: lint + typecheck + test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # A wedged xdist worker must fail fast and visibly rather than hang on the
-    # platform default (~6h). Normal runtime is ~5 min.
-    timeout-minutes: 15
+    # platform default (~6h). The full suite is large (several thousand tests);
+    # on a 4-vCPU hosted runner allow up to two hours (the same suite took ~60-95 min on a 4-vCPU build VM).
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install FFmpeg
         # Tests and the encoder path expect FFmpeg to be available.
@@ -36,7 +37,7 @@ jobs:
           sudo apt-get install --no-install-recommends --yes ffmpeg
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           version: "0.5.11"
           enable-cache: true
@@ -74,13 +75,14 @@ jobs:
     runs-on: ubuntu-latest
     # Run on main-branch pushes and on PRs; kept separate from the matrix so a
     # browser-install failure never blocks the unit/integration results.
-    # Normal runtime ~8-10 min incl. the Chromium install + --reruns.
-    timeout-minutes: 20
+    # The browser suite is long on a hosted runner; the cap leaves headroom for
+    # the Chromium install and --reruns.
+    timeout-minutes: 60
     needs: quality
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install FFmpeg
         # The app lifespan calls resolve_ffmpeg_binary at startup; FFmpeg must
@@ -90,7 +92,7 @@ jobs:
           sudo apt-get install --no-install-recommends --yes ffmpeg
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           version: "0.5.11"
           enable-cache: true

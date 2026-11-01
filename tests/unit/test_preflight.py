@@ -9,19 +9,25 @@ from timelapse_manager.storage.estimator import (
 
 
 def test_bytes_per_day_uses_default_frame_size() -> None:
-    # 60s interval -> 1440 frames/day at the default frame size.
-    assert est.estimate_create_time_bytes_per_day(60) == int((86400 / 60) * DEF)
+    # 1440 captures/day (a 60 s interval) at the default frame size.
+    assert est.estimate_create_time_bytes_per_day(1440) == int(1440 * DEF)
 
 
-def test_bytes_per_day_nonpositive_interval_is_zero() -> None:
+def test_bytes_per_day_one_anchor_is_one_frame() -> None:
+    # #22: an anchor-only form plans one capture a day.
+    assert est.estimate_create_time_bytes_per_day(1.0) == DEF
+
+
+def test_bytes_per_day_nothing_planned_is_zero() -> None:
+    assert est.estimate_create_time_bytes_per_day(None) == 0
     assert est.estimate_create_time_bytes_per_day(0) == 0
     assert est.estimate_create_time_bytes_per_day(-5) == 0
 
 
-def test_bytes_per_day_scales_inversely_with_interval() -> None:
-    fast = est.estimate_create_time_bytes_per_day(10)
-    slow = est.estimate_create_time_bytes_per_day(100)
-    assert fast > slow
+def test_bytes_per_day_scales_with_captures_per_day() -> None:
+    assert est.estimate_create_time_bytes_per_day(
+        8640
+    ) > est.estimate_create_time_bytes_per_day(864)
 
 
 def test_preflight_level_thresholds() -> None:

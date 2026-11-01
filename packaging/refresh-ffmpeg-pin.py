@@ -16,18 +16,24 @@ Modes
 --apply
     Full run: resolve → download → verify sha256 → upload to the Gitea
     generic package registry (or confirm the existing mirror matches) →
-    rewrite ``ffmpeg-pin.json``.  Idempotent: if the resolved version and
+    rewrite ``ffmpeg-pin.json``.  The committed pin lists only the public
+    upstream URL; the private mirror location is derived from the registry
+    settings below (see --mirror-url).  Idempotent: if the resolved version and
     sha256 already match the pin, exits 0 without touching anything.
+
+--mirror-url
+    Print the private-mirror URL of the currently pinned build, derived from
+    the pin and TLM_REGISTRY_URL / TLM_REGISTRY_OWNER.  Build jobs pass it as
+    ``TLM_FFMPEG_MIRROR_URL`` so the mirror is tried before the public URL.
 
 Environment variables
 ---------------------
-GITEA_BASE_URL   Base URL of the Gitea instance (e.g. https://git.2cbn.com).
-GITEA_OWNER      Gitea user/org namespace that owns the package registry
-                 (e.g. drew.coble).
-GITEA_TOKEN      Gitea personal-access token with package:write scope.
-                 Required for --apply.  --check does not need it.
-GITHUB_TOKEN     Optional GitHub personal-access token.  Raises the API rate
-                 limit from 60 to 5000 req/h, useful when running frequently.
+TLM_REGISTRY_URL    Base URL of the Gitea instance (e.g. https://gitea.example.com).
+TLM_REGISTRY_OWNER  Gitea user/org namespace that owns the package registry.
+GITEA_TOKEN         Gitea personal-access token with package:write scope.
+                    Required for --apply.  --check does not need it.
+GITHUB_TOKEN        Optional GitHub personal-access token.  Raises the API rate
+                    limit from 60 to 5000 req/h, useful when running frequently.
 
 Immutable, conflict-free mirror versions
 ----------------------------------------
@@ -61,16 +67,21 @@ from typing import Any
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_RELEASE_URL = (
-    "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest"
+GITHUB_RELEASES_URL = (
+    "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases"
 )
 
-# Matches assets that are:
-#   ffmpeg-n<MAJOR.MINOR>-latest-linux64-gpl-<MAJOR.MINOR>.tar.xz
-# The version number appears twice; both occurrences must be identical.
-# Excludes: -shared, -lgpl, master, win64, macOS.
+# Matches static (non-shared) GPL linux64 builds with a stable version tag.
+# BtbN naming formats:
+#   post-2025 autobuild: ffmpeg-n<VER>-<N>-g<HASH>-linux64-gpl[-<BRANCH>].tar.xz
+#   legacy:              ffmpeg-n<VER>-latest-linux64-gpl[-<BRANCH>].tar.xz
+# Excludes: -shared builds, -lgpl, master/capital-N builds, win64, macOS.
 _ASSET_RE = re.compile(
-    r"^ffmpeg-n(\d+(?:\.\d+)+)-latest-linux64-gpl-(\d+(?:\.\d+)+)\.tar\.xz$"
+    r"^ffmpeg-n(\d+(?:\.\d+)+)"              # version prefix (lowercase n + digits)
+    r"-(?:latest|\d+-g[0-9a-f]+)"            # separator: -latest  OR  -<N>-g<hash>
+    r"-linux64-gpl"                          # build target (static, not shared)
+    r"(?:-\d+(?:\.\d+)+)?"                  # optional branch suffix (e.g. -8.1)
+    r"\.tar\.xz$"                            # extension
 )
 
 LICENSE = "GPL-3.0"
@@ -242,55 +253,70 @@ def _sha256_file(path: Path) -> str:
 
 
 def _resolve_latest_stable(github_token: str | None) -> dict[str, Any]:
-    """Query the GitHub release and return the best stable asset metadata.
+    """Query BtbN/FFmpeg-Builds releases and return the best stable asset metadata.
 
     Returns a dict with keys: name, version, url, digest_sha256.
+    The returned ``url`` is a release-specific (immutable) download URL from an
+    ``autobuild-*`` tagged release rather than the mutable ``/latest/`` alias.
     Raises RuntimeError on any failure.
     """
-    _info("Querying GitHub BtbN/FFmpeg-Builds release 'latest' ...")
-    raw = _http_get(GITHUB_RELEASE_URL, headers=_github_headers(github_token))
-    release = json.loads(raw)
-    assets = release.get("assets", [])
-    if not assets:
+    _info("Querying GitHub BtbN/FFmpeg-Builds releases ...")
+    raw = _http_get(
+        f"{GITHUB_RELEASES_URL}?per_page=10",
+        headers=_github_headers(github_token),
+    )
+    releases = json.loads(raw)
+    if not releases:
         raise RuntimeError(
-            "GitHub release 'latest' returned no assets; "
+            "GitHub releases list returned no entries; "
             "API may be rate-limited or the release structure changed."
         )
 
+    # Search releases in order (most recent first) for a stable linux64-gpl asset.
+    # Skip the mutable 'latest' alias tag; prefer the matching 'autobuild-*' tagged
+    # release whose download URL is immutable (specific datestamp, not an alias).
     candidates: list[dict[str, Any]] = []
-    for asset in assets:
-        name = asset.get("name", "")
-        m = _ASSET_RE.match(name)
-        if not m:
-            continue
-        ver1, ver2 = m.group(1), m.group(2)
-        if ver1 != ver2:
-            # Both version occurrences must match; skip if they diverge.
-            _warn(f"Skipping {name}: version mismatch ({ver1} vs {ver2})")
-            continue
-        # Parse version as a tuple of ints for reliable numeric comparison.
-        ver_tuple = tuple(int(x) for x in ver1.split("."))
-        digest = asset.get("digest", "")
-        digest_sha256: str | None = None
-        if digest.startswith("sha256:"):
-            digest_sha256 = digest[len("sha256:") :]
-        candidates.append(
-            {
-                "name": name,
-                "version": f"n{ver1}",  # canonical form: "n8.1"
-                "ver_tuple": ver_tuple,
-                "url": asset["browser_download_url"],
-                "digest_sha256": digest_sha256,
-            }
-        )
+    checked_tags: list[str] = []
+    for release in releases:
+        tag = release.get("tag_name", "")
+        if tag == "latest":
+            continue  # skip the mutable alias
+        checked_tags.append(tag)
+        assets = release.get("assets", [])
+        for asset in assets:
+            name = asset.get("name", "")
+            m = _ASSET_RE.match(name)
+            if not m:
+                continue
+            ver1 = m.group(1)
+            # Parse version as a tuple of ints for reliable numeric comparison.
+            ver_tuple = tuple(int(x) for x in ver1.split("."))
+            digest = asset.get("digest", "")
+            digest_sha256: str | None = None
+            if digest.startswith("sha256:"):
+                digest_sha256 = digest[len("sha256:"):]
+            # browser_download_url from an autobuild-* release contains the specific
+            # datestamp tag, making it an immutable reference.
+            candidates.append(
+                {
+                    "name": name,
+                    "version": f"n{ver1}",  # canonical form: e.g. "n8.1.2"
+                    "ver_tuple": ver_tuple,
+                    "url": asset["browser_download_url"],
+                    "digest_sha256": digest_sha256,
+                }
+            )
+        if candidates:
+            # Found stable candidates in this release; no need to scan older ones.
+            break
 
     if not candidates:
         raise RuntimeError(
-            "No stable static linux64-gpl asset found in the 'latest' release.\n"
-            f"Available assets: {[a.get('name') for a in assets]}"
+            "No stable static linux64-gpl asset found in recent autobuild releases.\n"
+            f"Releases checked (skipping 'latest'): {checked_tags[:5]}"
         )
 
-    # Pick the asset with the numerically highest version (e.g. n8.1 > n7.1).
+    # Pick the asset with the numerically highest version (e.g. n8.1.2 > n7.1.5).
     best = max(candidates, key=lambda c: c["ver_tuple"])
     _info(
         f"Selected stable build: {best['name']} "
@@ -341,10 +367,17 @@ def _peek_topdir(tarball_path: Path) -> str:
 
 
 def _mirror_url(gitea_base: str, owner: str, version: str, filename: str) -> str:
-    # Note: owner may contain a dot (drew.coble) — Gitea accepts it here.
+    # Note: an owner name may contain a dot; Gitea accepts it here.
     return (
         f"{gitea_base}/api/packages/{owner}/generic/ffmpeg-static/{version}/{filename}"
     )
+
+
+def _pin_mirror_url(pin: dict[str, Any], gitea_base: str, owner: str) -> str:
+    """Return the private-mirror URL of the build described by *pin*."""
+    filename = str(pin["url"]).rsplit("/", 1)[-1]
+    registry_version = f"{pin['version']}-{str(pin['sha256'])[:8]}"
+    return _mirror_url(gitea_base, owner, registry_version, filename)
 
 
 def _upload_to_gitea(
@@ -473,16 +506,15 @@ def mode_apply(
     resolved_sha256_from_github = best["digest_sha256"]
 
     # Idempotency check: if both version and sha256 match the current pin,
-    # and a real mirror URL is already present, skip everything.
+    # the build was mirrored when the pin was applied; skip everything.
     if (
         pin.get("version") == resolved_version
         and pin.get("sha256") == resolved_sha256_from_github
         and resolved_sha256_from_github is not None
-        and any(gitea_base in u for u in pin.get("mirror_urls", []))
     ):
         _info(
-            f"Pin is already up to date (version={resolved_version}) "
-            "with a valid mirror URL.  Nothing to do."
+            f"Pin is already up to date (version={resolved_version}).  "
+            "Nothing to do."
         )
         sys.exit(0)
 
@@ -552,8 +584,9 @@ def mode_apply(
             "ffmpeg": f"{topdir}/bin/ffmpeg",
             "ffprobe": f"{topdir}/bin/ffprobe",
         },
+        # Only public URLs are committed; the private mirror is injected at
+        # build time (see --mirror-url).
         "mirror_urls": [
-            mirror_url,
             upstream_url,
         ],
     }
@@ -564,8 +597,9 @@ def mode_apply(
     )
     _info(
         "Note: the Gitea package registry requires auth (HTTP 401 without token).\n"
-        "      release.sh reads GITEA_TOKEN and adds the Authorization header when\n"
-        "      fetching from the mirror URL."
+        "      Builds pass the mirror URL as TLM_FFMPEG_MIRROR_URL (see --mirror-url);\n"
+        "      release.sh reads GITEA_TOKEN and adds the Authorization header only\n"
+        "      when fetching from that URL."
     )
 
 
@@ -593,6 +627,14 @@ def main() -> None:
         action="store_true",
         help=("Download, verify, upload to mirror, and rewrite ffmpeg-pin.json."),
     )
+    group.add_argument(
+        "--mirror-url",
+        action="store_true",
+        help=(
+            "Print the private-mirror URL of the pinned build "
+            "(needs TLM_REGISTRY_URL and TLM_REGISTRY_OWNER)."
+        ),
+    )
     args = parser.parse_args()
 
     github_token = os.environ.get("GITHUB_TOKEN")
@@ -601,25 +643,28 @@ def main() -> None:
         mode_check(github_token=github_token)
         return
 
-    # --apply: require Gitea env vars.
-    gitea_base = os.environ.get("GITEA_BASE_URL", "").rstrip("/")
-    gitea_owner = os.environ.get("GITEA_OWNER", "")
+    # --apply and --mirror-url: require the registry env vars.
+    gitea_base = os.environ.get("TLM_REGISTRY_URL", "").rstrip("/")
+    gitea_owner = os.environ.get("TLM_REGISTRY_OWNER", "")
     gitea_token = os.environ.get("GITEA_TOKEN", "")
 
-    missing = [
-        name
-        for name, val in [
-            ("GITEA_BASE_URL", gitea_base),
-            ("GITEA_OWNER", gitea_owner),
-            ("GITEA_TOKEN", gitea_token),
-        ]
-        if not val
+    required = [
+        ("TLM_REGISTRY_URL", gitea_base),
+        ("TLM_REGISTRY_OWNER", gitea_owner),
     ]
+    if args.apply:
+        required.append(("GITEA_TOKEN", gitea_token))
+    missing = [name for name, val in required if not val]
     if missing:
+        flag = "--apply" if args.apply else "--mirror-url"
         _fail(
-            f"--apply requires environment variables: {', '.join(missing)}\n"
-            "Set them before running --apply."
+            f"{flag} requires environment variables: {', '.join(missing)}\n"
+            f"Set them before running {flag}."
         )
+
+    if args.mirror_url:
+        print(_pin_mirror_url(_load_pin(), gitea_base, gitea_owner))
+        return
 
     mode_apply(
         github_token=github_token,

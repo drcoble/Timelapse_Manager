@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -44,7 +46,12 @@ class Project(TimestampMixin, Base):
     """
 
     __tablename__ = "project"
-    __table_args__ = (Index("ix_project_camera_id", "camera_id"),)
+    # AUTOINCREMENT (migration 031, #17): a deleted project's id is never reused,
+    # so a new project does not inherit the old one's events, alerts and audit history.
+    __table_args__ = (
+        Index("ix_project_camera_id", "camera_id"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     camera_id: Mapped[int] = mapped_column(
@@ -103,4 +110,26 @@ class Project(TimestampMixin, Base):
     lifecycle_state: Mapped[str] = mapped_column(
         _lifecycle_state_enum, nullable=False, default="active"
     )
+    # The moment ``lifecycle_state`` last became ``active`` (create, resume,
+    # reactivate, start), naive UTC. The exact-time catch-up never records a
+    # missed anchor for an instant before it (#280). ``NULL`` on rows that
+    # predate the column reads as ``created_at``. Kept current by the ``set``
+    # listener below, so every code path that changes the state is covered.
+    active_since: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, default=lambda: _utc_now_naive()
+    )
     frame_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+def _utc_now_naive() -> datetime:
+    """Return the current UTC time as a naive datetime (the stored convention)."""
+    return _dt.datetime.now(_dt.UTC).replace(tzinfo=None)
+
+
+@event.listens_for(Project.lifecycle_state, "set", active_history=True)
+def _stamp_active_since(
+    target: Project, value: object, old: object, _initiator: object
+) -> None:
+    """Record when a project (re)enters ``active``, whichever code path did it."""
+    if value == "active" and old != "active":
+        target.active_since = _utc_now_naive()

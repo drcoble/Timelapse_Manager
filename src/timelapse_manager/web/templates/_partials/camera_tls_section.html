@@ -1,0 +1,9 @@
+{#
+  Partial: camera_tls_section.html — the certificate-pin section on its own.
+
+  Swapped into the edit form's #cam-{id}-tls container (outerHTML) by the fetch,
+  pin and unpin routes in web/routers/cameras.py. Context: camera (the view),
+  cert, notice, error — see camera_tls_macros.html.
+#}
+{% from "_partials/camera_tls_macros.html" import tls_section %}
+{{ tls_section(camera, current_user.role == 'admin', cert, notice, error) }}

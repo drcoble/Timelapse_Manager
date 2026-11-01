@@ -18,15 +18,25 @@
     fetched_lon         — float | None longitude reported by the camera.
     error_protocol      — "unreachable" / "auth_failed" / "timeout" / None.
     error_hostname      — "no_hostname" / "timeout" / None.
-    error_geo           — "no_location" / "unreachable" / None.
+    error_geo           — "no_location" / "access_denied" / "unreachable" / None.
+    geo_required_role   — the device role that can read the location (e.g.
+                          "Administrator") when error_geo is "access_denied".
     auth_rejected       — True when an authenticated protocol (vapix/onvif)
                           rejected the credentials even though a connection-only
                           protocol still responded; shown as a non-blocking
                           credential warning so wrong credentials are not masked.
 
+  credentials_hint — a note that the saved default login was not used for
+                 this address (it is outside the allowed private subnets), or None.
+
   No credentials are ever rendered here. The apply affordances fill the
   surrounding form's inputs by name, matching camera_detect_results.html.
 #}
+{% if credentials_hint %}
+  <div class="alert" role="status" style="margin-top:var(--sp-3);">
+    {{ credentials_hint }}
+  </div>
+{% endif %}
 {% if error %}
   <div class="alert error" role="alert" style="margin-top:var(--sp-3);">
     {{ error }}
@@ -36,7 +46,7 @@
 
     {% if ok_count > 0 or discovered_hostname or (fetched_lat is not none and fetched_lon is not none) %}
     <div style="display:flex;justify-content:flex-end;">
-      <button type="button" class="btn btn-primary btn-sm" onclick="tlmAcceptAll(this);">
+      <button type="button" class="btn btn-primary btn-sm" data-action="query-accept-all">
         <svg class="icon" aria-hidden="true"><use href="#icon-query"></use></svg>
         Accept all &amp; fill form
       </button>
@@ -93,7 +103,7 @@
                      {{ 'checked' if checked else '' }}
                      data-snapshot-uri="{{ c.snapshot_uri or '' }}"
                      data-stream-uri="{{ c.stream_uri or '' }}"
-                     onchange="tlmApplyDetected(this);">
+                     data-action="apply-detected">
               <span>
                 <strong>{{ c.protocol | upper }}</strong>
                 <span class="status-badge"
@@ -143,7 +153,7 @@
           </span>
           <button type="button" class="btn btn-sm btn-secondary"
                   data-hostname="{{ discovered_hostname }}"
-                  onclick="tlmApplyHostname(this);">
+                  data-action="apply-hostname">
             Use discovered hostname
           </button>
         </div>
@@ -176,9 +186,21 @@
           <button type="button" class="btn btn-sm btn-secondary"
                   data-lat="{{ fetched_lat }}"
                   data-lon="{{ fetched_lon }}"
-                  onclick="tlmApplyLocation(this);">
+                  data-action="apply-location">
             Use these coordinates
           </button>
+        </div>
+      {% elif error_geo == 'access_denied' %}
+        <div class="alert warning" role="status">
+          The camera refused to share its location with this account. Axis
+          cameras only reveal latitude/longitude to an
+          <strong>{{ geo_required_role or 'Administrator' }}</strong> account
+          (VAPIX geolocation API). Capture does not need that, so keep an
+          operator account here and either enter the coordinates manually, or
+          save the camera and use <strong>Poll camera</strong> &rarr;
+          <strong>Read with admin account</strong> under Advanced &rarr;
+          Location. That lookup uses the administrator login once and does not
+          save it.
         </div>
       {% elif error_geo == 'no_location' %}
         <div class="form-hint">
@@ -192,66 +214,4 @@
     </div>
   </div>
 
-  {# Apply affordances fill the surrounding form's inputs by name, matching the
-     detect-results pattern. Each is guarded against a missing input. #}
-  <script>
-    function tlmAcceptAll(btn) {
-      var root = btn.closest('#camera-query-results') || document;
-      var radio = root.querySelector('input[name="detected_protocol"]:checked')
-               || root.querySelector('input[name="detected_protocol"]');
-      if (radio) { radio.checked = true; tlmApplyDetected(radio); }
-      var host = root.querySelector('button[data-hostname]');
-      if (host) { tlmApplyHostname(host); }
-      var loc = root.querySelector('button[data-lat]');
-      if (loc) { tlmApplyLocation(loc); }
-    }
-    function tlmRevealAdvanced(input) {
-      // When an applied field lives inside the collapsed Advanced disclosure,
-      // open it so the change is visible. No-op when there is no <details>.
-      if (!input) { return; }
-      var d = input.closest('details');
-      if (d) { d.open = true; }
-    }
-    function tlmApplyDetected(radio) {
-      var form = radio.closest('form');
-      if (!form) { return; }
-      var proto = form.querySelector('[name="protocol"]');
-      if (proto) { proto.value = radio.value; }
-      var snap = form.querySelector('[name="snapshot_uri"]');
-      if (snap) {
-        snap.value = radio.getAttribute('data-snapshot-uri') || '';
-        tlmRevealAdvanced(snap);
-      }
-      var stream = form.querySelector('[name="stream_uri"]');
-      if (stream) { stream.value = radio.getAttribute('data-stream-uri') || ''; }
-    }
-    function tlmApplyHostname(btn) {
-      var form = btn.closest('form');
-      if (!form) { return; }
-      var value = btn.getAttribute('data-hostname') || '';
-      var host = form.querySelector('[name="device_hostname"]');
-      if (host) { host.value = value; }
-      var src = form.querySelector('[name="device_hostname_source"]');
-      if (src) { src.value = 'camera'; }
-      // Seed the Name field too, but only when the operator has left it empty.
-      var name = form.querySelector('[name="name"]');
-      if (name && !name.value) { name.value = value; }
-    }
-    function tlmApplyLocation(btn) {
-      var form = btn.closest('form');
-      if (!form) { return; }
-      var lat = form.querySelector('[name="latitude"]');
-      if (lat) { lat.value = btn.getAttribute('data-lat'); }
-      var lon = form.querySelector('[name="longitude"]');
-      if (lon) { lon.value = btn.getAttribute('data-lon'); }
-      var src = form.querySelector('[name="geo_source"]');
-      if (src) { src.value = 'camera'; }
-      tlmRevealAdvanced(lat);
-    }
-    (function () {
-      var checked = document.querySelector(
-        '#camera-query-results input[name="detected_protocol"]:checked');
-      if (checked) { tlmApplyDetected(checked); }
-    })();
-  </script>
 {% endif %}

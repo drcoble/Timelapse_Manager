@@ -85,6 +85,21 @@ class TestListAlerts:
         assert body["alerts"][0]["level"] == "warning"
 
 
+class TestListLimit:
+    def test_limit_is_bounded(
+        self, migrated_client: TestClient, cam_auth_token: str
+    ) -> None:
+        """``limit`` is 1..500; anything else is a 422, not an unbounded read."""
+        headers = _auth(cam_auth_token)
+        assert (
+            migrated_client.get("/api/v1/alerts?limit=500", headers=headers).status_code
+            == 200
+        )
+        for bad in ("501", "0", "-1"):
+            resp = migrated_client.get(f"/api/v1/alerts?limit={bad}", headers=headers)
+            assert resp.status_code == 422, bad
+
+
 class TestClearOne:
     def test_clear_one_records_attribution(
         self,

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Problem reports — Timelapse Manager{% endblock %}
+{% block page_title_short %}Problem reports{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/settings" style="color:var(--color-text-muted);text-decoration:none;">Settings</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">Problem reports</span>
+{% endblock %}
+
+{% block content %}
+
+{# Admin-only (the route enforces it). The same table the Settings tab loads,
+   as a full page for the no-JS path and for direct links. #}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Problem reports</h1>
+    <div class="subtitle">Reports filed from "Report a problem" &middot; download &middot; resend &middot; delete</div>
+  </div>
+</div>
+
+{% include '_partials/report_table.html' %}
+
+{% endblock %}

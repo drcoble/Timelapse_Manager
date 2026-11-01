@@ -5,6 +5,10 @@ versions, the live database status, the network binding, and the log level.
 Database credentials embedded in the connection URL are redacted; no token or
 other secret is ever returned.
 
+``GET /api/v1/system/render-activity`` reports the render worker's live tasks
+against the queued rows, so an upgrade script can tell running work from rows
+stranded by a dead task (#67 R1).
+
 A second, separately mounted router serves a Prometheus metrics exposition. It
 is off by default and, when enabled, is gated behind administrator
 authentication -- the listener binds all interfaces and offers no unauthenticated
@@ -16,17 +20,22 @@ keep the distributed bundle lean.
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any
+from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
+from starlette.concurrency import run_in_threadpool
 
 from ..config import Settings
 from ..db.models import Event, Project, RenderJob
-from ..db.session import get_session
-from ..runtime import get_context
-from ..security.principal import require_admin_principal
+from ..db.models.render_job import active_job_filter
+from ..db.session import DbSessionDep, session_scope
+from ..monitoring import readiness
+from ..monitoring.diagnostics import executor_snapshot
+from ..runtime import AppContext, get_context
+from ..security.principal import require_metrics_reader
 from ..storage.frames import sum_project_disk_usage
 
 router = APIRouter()
@@ -56,6 +65,11 @@ _CAPTURE_FAILURE_TYPES = ("capture.gap", "capture.stalled")
 
 # The JSON details key under which an event's type identifier is stored.
 _EVENT_TYPE_KEY = "type"
+
+# Capture-runner states reported one-hot by ``tlm_runner_state``, so a stalled or
+# failing runner shows as a 0 -> 1 flip on a fixed series. A state outside this
+# set (should one be added) is still reported, as an extra series.
+_RUNNER_STATES = ("running", "idle", "error", "stopped")
 
 # Matches the ``user:password@`` credential portion of a connection URL.
 _URL_CREDENTIALS = re.compile(r"://[^/@]+@")
@@ -102,6 +116,55 @@ def system_info() -> dict[str, Any]:
         "db_status": _db_status(context.session_factory),
         "config": _summary(context.settings),
     }
+
+
+def _render_rows_without_worker(
+    session_factory: sessionmaker[Session],
+) -> dict[str, int]:
+    """Count queued render rows when no render worker runs. Synchronous.
+
+    With no worker there is no live task, so every ``encoding`` row is an
+    orphan.
+    """
+    with session_scope(session_factory) as session:
+        counts = dict(
+            session.execute(
+                select(RenderJob.status, func.count())
+                .where(active_job_filter())
+                .group_by(RenderJob.status)
+            )
+            .tuples()
+            .all()
+        )
+    encoding = int(counts.get("encoding", 0))
+    return {
+        "live_tasks": 0,
+        "pending_rows": int(counts.get("pending", 0)),
+        "encoding_rows": encoding,
+        "orphans": encoding,
+    }
+
+
+@router.get("/system/render-activity")
+async def render_activity() -> dict[str, int]:
+    """Report render work in progress, for the upgrade gate (#67 R1, O1).
+
+    ``live_tasks`` is the jobs with a running task in this process,
+    ``pending_rows`` and ``encoding_rows`` the rows in those states, and
+    ``orphans`` the ``encoding`` rows with no live task (dead work the worker
+    sweeps to ``failed`` on its next cycle). An upgrade is safe when
+    ``live_tasks + pending_rows`` is zero; counting rows alone, as the old gate
+    did, also refuses on orphans.
+
+    ``async`` because the live task ids are read under the worker's claim lock
+    on the event loop; it only awaits, and the row counts run in a worker
+    thread (#62).
+    """
+    context = get_context()
+    queue = context.render_queue
+    if queue is not None:
+        return (await queue.activity()).as_dict()
+    return await run_in_threadpool(_render_rows_without_worker, context.session_factory)
 
 
 def _require_metrics_enabled() -> None:
@@ -220,22 +283,155 @@ def _render_metrics(session: Session) -> str:
         label = _escape_label_value(name)
         lines.append(f'disk_used_bytes{{project="{label}"}} {used}')
 
+    lines.extend(_runtime_metric_lines())
+
     # A trailing newline terminates the final sample line, as the exposition
     # format expects.
     return "\n".join(lines) + "\n"
 
 
+def _runtime_metric_lines() -> list[str]:
+    """Stall-detection series read from the live process, not the database (#7).
+
+    ``tlm_runner_last_cycle_age_seconds`` is the age of each capture runner's
+    heartbeat (alert well above ``capture.max_idle_sleep_seconds``);
+    ``tlm_runner_state`` is one-hot per runner and state; the executor gauges
+    describe asyncio's default executor (what ``to_thread`` uses); and
+    ``tlm_event_loop_lag_seconds`` is the worst ``loop-lag`` tick of the last
+    minute. Runners are
+    labelled by project name (as ``disk_used_bytes`` is) plus the stable id.
+    """
+    context = get_context()
+    now = datetime.now(UTC)
+    supervisor = context.capture_supervisor
+    snapshots = supervisor.runner_snapshots() if supervisor is not None else []
+    monitor = context.loop_lag_monitor
+    executor = executor_snapshot(monitor.loop if monitor is not None else None)
+
+    lines: list[str] = []
+    lines.append(
+        "# HELP tlm_runner_last_cycle_age_seconds Seconds since each capture "
+        "runner's last loop cycle."
+    )
+    lines.append("# TYPE tlm_runner_last_cycle_age_seconds gauge")
+    for snapshot in snapshots:
+        beat = snapshot.state.last_cycle_at or snapshot.state.started_at
+        if beat is None:
+            continue
+        age = max(0.0, (now - beat).total_seconds())
+        labels = _runner_labels(snapshot.project_name, snapshot.state.project_id)
+        lines.append(f"tlm_runner_last_cycle_age_seconds{{{labels}}} {age:.3f}")
+
+    lines.append("# HELP tlm_runner_state Capture runner state (1 = current).")
+    lines.append("# TYPE tlm_runner_state gauge")
+    for snapshot in snapshots:
+        labels = _runner_labels(snapshot.project_name, snapshot.state.project_id)
+        current = snapshot.state.state
+        states = _RUNNER_STATES + ((current,) if current not in _RUNNER_STATES else ())
+        for state in states:
+            value = 1 if state == current else 0
+            lines.append(
+                f'tlm_runner_state{{{labels},state="{_escape_label_value(state)}"}} '
+                f"{value}"
+            )
+
+    lines.append(
+        "# HELP tlm_executor_queue_depth Work items queued on the default executor."
+    )
+    lines.append("# TYPE tlm_executor_queue_depth gauge")
+    lines.append(f"tlm_executor_queue_depth {int(executor.get('queue_depth') or 0)}")
+
+    lines.append("# HELP tlm_executor_threads Worker threads of the default executor.")
+    lines.append("# TYPE tlm_executor_threads gauge")
+    lines.append(f"tlm_executor_threads {int(executor.get('threads') or 0)}")
+
+    lines.append(
+        "# HELP tlm_event_loop_lag_seconds Worst lateness of the 1 s loop-lag "
+        "tick over the last minute."
+    )
+    lines.append("# TYPE tlm_event_loop_lag_seconds gauge")
+    lag = monitor.lag_seconds if monitor is not None else 0.0
+    lines.append(f"tlm_event_loop_lag_seconds {lag:.6f}")
+
+    lines.extend(_readiness_metric_lines(context, now))
+    return lines
+
+
+def _readiness_metric_lines(context: AppContext, now: datetime) -> list[str]:
+    """The ``/healthz`` readiness verdict and its render and poll inputs (#67 R5).
+
+    ``tlm_health_status`` is one-hot over ``ok``/``degraded``/``failed``, from
+    the same evaluation ``/healthz`` serves. The other three are the raw
+    figures behind three of its checks; a series whose component is not running
+    is omitted rather than reported as zero.
+    """
+    database = readiness.db_status(context.session_factory)
+    result = readiness.evaluate_readiness(
+        context,
+        database=database,
+        components=readiness.component_statuses(context),
+        now=now,
+    )
+    lines: list[str] = []
+    lines.append(
+        "# HELP tlm_health_status Readiness status reported by /healthz (1 = current)."
+    )
+    lines.append("# TYPE tlm_health_status gauge")
+    for state in readiness.STATUSES:
+        value = 1 if state == result.status else 0
+        lines.append(f'tlm_health_status{{status="{state}"}} {value}')
+
+    queue = context.render_queue
+    queue_running = readiness.component_status(queue) == "ok"
+    lines.append(
+        "# HELP tlm_render_orphans Encoding render jobs with no live task that "
+        "the last sweep could not fail."
+    )
+    lines.append("# TYPE tlm_render_orphans gauge")
+    if queue is not None and queue_running:
+        lines.append(f"tlm_render_orphans {queue.unreclaimed_orphans}")
+
+    lines.append(
+        "# HELP tlm_render_oldest_encoding_age_seconds Age of the oldest "
+        "encoding render job at the last sweep (0 when none)."
+    )
+    lines.append("# TYPE tlm_render_oldest_encoding_age_seconds gauge")
+    if queue is not None and queue_running:
+        age = readiness.oldest_encoding_age_seconds(
+            queue.oldest_encoding_started_at, now
+        )
+        lines.append(f"tlm_render_oldest_encoding_age_seconds {age or 0.0:.3f}")
+
+    dispatcher = context.notification_dispatcher
+    lines.append(
+        "# HELP tlm_dispatcher_last_poll_age_seconds Seconds since the "
+        "notification dispatcher's last successful poll."
+    )
+    lines.append("# TYPE tlm_dispatcher_last_poll_age_seconds gauge")
+    if dispatcher is not None and readiness.component_status(dispatcher) == "ok":
+        poll_age = dispatcher.last_poll_age_seconds()
+        if poll_age is not None:
+            lines.append(f"tlm_dispatcher_last_poll_age_seconds {poll_age:.3f}")
+    return lines
+
+
+def _runner_labels(project_name: str, project_id: int) -> str:
+    """The ``project``/``project_id`` label pair for a runner series."""
+    return f'project="{_escape_label_value(project_name)}",project_id="{project_id}"'
+
+
 @metrics_router.get(
     "/metrics",
-    dependencies=[Depends(_require_metrics_enabled), Depends(require_admin_principal)],
+    dependencies=[Depends(_require_metrics_enabled), Depends(require_metrics_reader)],
 )
-def metrics(db: Annotated[Session, Depends(get_session)]) -> Response:
+def metrics(db: DbSessionDep) -> Response:
     """Serve the Prometheus exposition, computed on scrape from the database.
 
     Two dependencies gate this route, in order: the first answers 404 while the
     endpoint is disabled (so it is invisible by default), and only if enabled
-    does the second require an administrator. The handler body runs solely for an
-    enabled endpoint reached by an authenticated administrator.
+    does the second require an administrator session, the local admin token, or
+    the read-only metrics token (see :func:`require_metrics_reader`). The handler
+    body runs solely for an enabled endpoint reached by one of those.
     """
     body = _render_metrics(db)
     return Response(content=body, media_type=_METRICS_CONTENT_TYPE)

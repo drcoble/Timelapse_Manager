@@ -35,7 +35,9 @@ def _seed_camera_and_project() -> tuple[int, int]:
             capture_interval_seconds=60,
             lifecycle_state="active",
             operational_status="idle",
-            storage_path="/tmp/op-project",
+            # Default layout: an operator may not copy a custom path outside
+            # storage.allowed_roots when cloning (#67 S5).
+            storage_path=None,
         )
         db.add(proj)
         db.flush()

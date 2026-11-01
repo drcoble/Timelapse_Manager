@@ -7,9 +7,14 @@
              snapshot_uri, stream_uri, geolocation} for the edit form.
     camera_username — str, the stored credential username for edit prefill
                       (empty in create mode). The password is NEVER prefilled.
+    The camera view also carries ``tls_pinned_fingerprint`` (SHA-256, colon form,
+    or none) for the certificate-pin section (_partials/camera_tls_macros.html).
+    camera_allow_basic_over_http — bool, the stored Basic-over-HTTP opt-in for
+                      edit prefill (absent in create mode: unticked).
     default_username — str, the active global default-credentials username, shown
                        as info when "use default credentials" is ticked. Empty
-                       when no default is configured/enabled. Never a password.
+                       when no default is configured/enabled, in which case the
+                       checkbox is not rendered. Never a password.
     csrf_token — str, required on every mutating form.
     flash_messages — optional list of {type, message} shown as inline errors.
 
@@ -25,11 +30,18 @@
     resolves; the form ``hx-post``s to ``POST /cameras/{id}/edit`` and swaps the
     refreshed display row back in.
 #}
+{% from "_partials/camera_tls_macros.html" import tls_section %}
 {% set editing = camera is not none %}
 
 {% macro fields(editing, camera, camera_username, default_username) %}
-  {# Ticked by default on add; on edit it reflects the stored flag. #}
-  {% set inherit = camera.credentials_inherit_default if editing else true %}
+  {# A usable default exists only when its username is set and it is enabled
+     (the route passes default_username empty otherwise). #}
+  {% set defaults_exist = (default_username or '') != '' %}
+  {# Ticked by default on add; on edit it reflects the stored flag. Never
+     ticked when no default exists, whatever the stored flag says. #}
+  {% set inherit = defaults_exist and (camera.credentials_inherit_default if editing else true) %}
+  {# Edit of a camera set to inherit after the defaults were removed. #}
+  {% set stale_inherit = editing and camera.credentials_inherit_default and not defaults_exist %}
   {# A unique suffix so the create and edit fragments never collide on element
      ids when both could exist in the DOM. #}
   {% set uid = ('cam-' ~ camera.id) if editing else 'cam-new' %}
@@ -39,46 +51,111 @@
     </div>
   {% endfor %}
   <div class="form-stack">
-    {# Address-first: the golden path starts with the address and a single Query
-       that proposes protocol / hostname / location, then name and protocol. #}
-    <div class="form-row">
+    {# Fill order (#318): address, credentials, Basic opt-in, Query camera, then
+       what Query proposes (name, hostname, protocol), the certificate-pin note
+       and finally the collapsed Advanced section. Query comes after the
+       credentials so they can be entered before probing. #}
+    <div class="form-group">
+      <label class="form-label" for="{{ uid }}-address">Address</label>
+      <input type="text" id="{{ uid }}-address" name="address"
+             class="form-control"
+             value="{{ camera.address or '' if editing else '' }}"
+             placeholder="host, IP, or URL" autocomplete="off"
+             data-action="address-scheme" data-uid="{{ uid }}">
+    </div>
+
+    {# Credentials. The "use default credentials" checkbox exists only while a
+       usable default is configured (no checkbox means nothing to inherit; the
+       server also ignores the flag then). Username/password are NOT hidden or
+       disabled by the markup, so without JS both stay visible; the creds-inherit
+       action hides and disables them while the box is ticked, and syncs on load. #}
+    {% if defaults_exist %}
       <div class="form-group">
-        <label class="form-label" for="{{ uid }}-address">Address</label>
-        <input type="text" id="{{ uid }}-address" name="address"
+        <label class="form-check" style="display:flex;gap:var(--sp-2);
+               align-items:center;">
+          <input type="checkbox" name="credentials_inherit_default"
+                 id="{{ uid }}-inherit"
+                 {{ 'checked' if inherit else '' }}
+                 data-action="creds-inherit" data-uid="{{ uid }}">
+          <span>Use default credentials</span>
+        </label>
+        {# Shown only while inheriting: which default login will be used. #}
+        <span id="{{ uid }}-default-info" class="form-hint"
+              {{ '' if inherit else 'hidden' }}>
+          Uses the default credentials from Settings (username:
+          <span class="mono">{{ default_username }}</span>).
+        </span>
+      </div>
+    {% elif stale_inherit %}
+      <div class="alert error" role="status" style="margin-bottom:var(--sp-3);">
+        This camera was set to use the default credentials, but none are
+        configured any more. Enter credentials for this camera, or set the
+        defaults again in Settings.
+      </div>
+    {% endif %}
+
+    <div class="form-row" id="{{ uid }}-creds">
+      <div class="form-group">
+        <label class="form-label" for="{{ uid }}-username">Username</label>
+        <input type="text" id="{{ uid }}-username" name="username"
                class="form-control"
-               value="{{ camera.address or '' if editing else '' }}"
-               placeholder="host, IP, or URL" autocomplete="off">
+               value="{{ camera_username if editing else '' }}"
+               autocomplete="off">
       </div>
       <div class="form-group">
-        <label class="form-label" for="{{ uid }}-hostname">Hostname</label>
-        {# The camera's network hostname. Filled by Query camera, or set by hand.
-           A hidden source field records whether the value came from the camera
-           ("camera") or was typed ("manual"); typing here resets it to manual. #}
-        <input type="text" id="{{ uid }}-hostname" name="device_hostname"
-               class="form-control"
-               value="{{ camera.device_hostname or '' if editing else '' }}"
-               placeholder="optional; set by Query"
-               autocomplete="off"
-               oninput="var s=this.form.querySelector(
-                        '[name=&quot;device_hostname_source&quot;]');
-                        if (s) { s.value = 'manual'; }">
-        <input type="hidden" name="device_hostname_source"
-               value="{{ camera.device_hostname_source or 'manual'
-                         if editing else 'manual' }}">
+        <label class="form-label" for="{{ uid }}-password">Password</label>
+        {# Never prefilled. In edit mode a blank value preserves the stored
+           credentials; only a new value replaces them. #}
+        <input type="password" id="{{ uid }}-password" name="password"
+               class="form-control" autocomplete="new-password"
+               aria-describedby="{{ uid }}-pw-hint">
+        {% if editing %}
+          <span class="form-hint" id="{{ uid }}-pw-hint">
+            Leave blank to keep the current password.
+          </span>
+        {% endif %}
       </div>
     </div>
 
+    {# Basic over plain HTTP (#69 CAM-S1): refused unless ticked. It only matters
+       for an http:// or scheme-less address, so it is hidden while the address
+       is https:// (rendered hidden for a stored https:// address, toggled by
+       the address-scheme action as the address is typed). Hidden or not, the
+       checkbox keeps its name and value, so it still submits as ticked. #}
+    <div class="form-group" id="{{ uid }}-allow-basic-group"
+         {{ 'hidden' if editing and (camera.address or '').strip().lower().startswith('https://') else '' }}>
+      <label class="form-check" style="display:flex;gap:var(--sp-2);
+             align-items:center;">
+        <input type="checkbox" name="allow_basic_over_http"
+               id="{{ uid }}-allow-basic-http"
+               aria-describedby="{{ uid }}-allow-basic-http-hint"
+               {{ 'checked' if editing and camera_allow_basic_over_http else '' }}>
+        <span>Allow Basic authentication over plain HTTP</span>
+      </label>
+      <span class="form-hint" id="{{ uid }}-allow-basic-http-hint">
+        Only for a camera at an http:// address that offers nothing but Basic
+        authentication. Basic sends the password readable on the network, so
+        it is refused unless this is ticked. Prefer an https:// address.
+      </span>
+    </div>
+
     {# Query camera: a single probe of the address that proposes the protocol(s)
-       it speaks, the network hostname it reports, and the location it reports —
+       it speaks, the network hostname it reports, and the location it reports,
        all in one consolidated panel. hx-include sends the surrounding form's
-       fields (address + any credentials; the credential inputs are disabled while
-       inheriting, so they drop out and the server falls back to the global
-       default). The result fragment fills protocol / snapshot_uri / stream_uri /
-       hostname / latitude / longitude (some of them inside Advanced) for review
-       before saving. #}
+       fields (address, credentials, the Basic opt-in, probe_camera_id; the
+       credential inputs are disabled while inheriting, so they drop out and the
+       server falls back to the global default). The result fragment fills
+       name / protocol / snapshot_uri / stream_uri / hostname / latitude /
+       longitude (some of them inside Advanced) by field name for review before
+       saving. #}
+    {% if editing %}
+      {# Lets Query use this camera's certificate pin (#233). #}
+      <input type="hidden" name="probe_camera_id" value="{{ camera.id }}">
+    {% endif %}
     <div class="form-group">
       <button type="button" class="btn btn-primary"
               hx-post="/cameras/query"
+              hx-request='{"timeout":300000}'
               hx-include="closest form"
               hx-target="#camera-query-results"
               hx-swap="innerHTML"
@@ -104,81 +181,50 @@
                required autocomplete="off">
       </div>
       <div class="form-group">
-        <label class="form-label" for="camera_protocol">Protocol</label>
-        {% set current_protocol = camera.protocol if editing else '' %}
-        <select id="camera_protocol" name="protocol" class="form-control">
-          <option value="" {{ 'selected' if not current_protocol else '' }}>
-            (none)
-          </option>
-          {% for proto in ('vapix', 'rtsp', 'onvif', 'http') %}
-            <option value="{{ proto }}"
-                    {{ 'selected' if current_protocol == proto else '' }}>
-              {{ proto | upper }}
-            </option>
-          {% endfor %}
-        </select>
-      </div>
-    </div>
-
-    {# Credentials: either inherit the global default, or set per-camera ones. #}
-    <div class="form-group">
-      <label class="form-check" style="display:flex;gap:var(--sp-2);
-             align-items:center;">
-        <input type="checkbox" name="credentials_inherit_default"
-               id="{{ uid }}-inherit"
-               {{ 'checked' if inherit else '' }}
-               onchange="var c=document.getElementById('{{ uid }}-creds');
-                         c.hidden=this.checked;
-                         document.getElementById('{{ uid }}-username').disabled=
-                         this.checked;
-                         document.getElementById('{{ uid }}-password').disabled=
-                         this.checked;
-                         document.getElementById('{{ uid }}-default-info').hidden=
-                         !this.checked;">
-        <span>Use default credentials</span>
-      </label>
-      <span class="form-hint">
-        When ticked, this camera uses the global default credentials configured
-        in Settings.
-      </span>
-    </div>
-
-    {# Shown only while inheriting: which default login will be used. #}
-    <div id="{{ uid }}-default-info" class="form-hint"
-         {{ '' if inherit else 'hidden' }}>
-      {% if default_username %}
-        Using default credentials (username:
-        <span class="mono">{{ default_username }}</span>).
-      {% else %}
-        No default credentials are configured. Set them in Settings, or untick
-        to enter credentials for this camera.
-      {% endif %}
-    </div>
-
-    {# Per-camera credentials: hidden while inheriting the default. #}
-    <div class="form-row" id="{{ uid }}-creds" {{ 'hidden' if inherit else '' }}>
-      <div class="form-group">
-        <label class="form-label" for="{{ uid }}-username">Username</label>
-        <input type="text" id="{{ uid }}-username" name="username"
+        <label class="form-label" for="{{ uid }}-hostname">Hostname</label>
+        {# The camera's network hostname. Filled by Query camera, or set by hand.
+           A hidden source field records whether the value came from the camera
+           ("camera") or was typed ("manual"); typing here resets it to manual. #}
+        <input type="text" id="{{ uid }}-hostname" name="device_hostname"
                class="form-control"
-               value="{{ camera_username if editing else '' }}"
-               autocomplete="off" {{ 'disabled' if inherit else '' }}>
-      </div>
-      <div class="form-group">
-        <label class="form-label" for="{{ uid }}-password">Password</label>
-        {# Never prefilled. In edit mode a blank value preserves the stored
-           credentials; only a new value replaces them. #}
-        <input type="password" id="{{ uid }}-password" name="password"
-               class="form-control" autocomplete="new-password"
-               aria-describedby="{{ uid }}-pw-hint"
-               {{ 'disabled' if inherit else '' }}>
-        {% if editing %}
-          <span class="form-hint" id="{{ uid }}-pw-hint">
-            Leave blank to keep the current password.
-          </span>
-        {% endif %}
+               value="{{ camera.device_hostname or '' if editing else '' }}"
+               placeholder="optional; set by Query"
+               autocomplete="off"
+               data-action="hostname-manual">
+        <input type="hidden" name="device_hostname_source"
+               value="{{ camera.device_hostname_source or 'manual'
+                         if editing else 'manual' }}">
       </div>
     </div>
+
+    <div class="form-group">
+      <label class="form-label" for="camera_protocol">Protocol</label>
+      {% set current_protocol = camera.protocol if editing else '' %}
+      <select id="camera_protocol" name="protocol" class="form-control">
+        <option value="" {{ 'selected' if not current_protocol else '' }}>
+          (none)
+        </option>
+        {% for proto in ('vapix', 'rtsp', 'onvif', 'http') %}
+          <option value="{{ proto }}"
+                  {{ 'selected' if current_protocol == proto else '' }}>
+            {{ proto | upper }}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    {# Certificate pin (#69 CAM-S1): per saved camera, administrator-driven,
+       never automatic. A new camera has nothing to pin until it is saved. #}
+    {% if editing %}
+      {{ tls_section(camera, current_user.role == 'admin') }}
+    {% else %}
+      <div class="form-group">
+        <span class="form-hint">
+          To pin a self-signed camera certificate, save the camera first and
+          use Edit.
+        </span>
+      </div>
+    {% endif %}
 
     {# ------------------------------------------------------------------ #}
     {# ADVANCED disclosure — less-common fields, collapsed by default:    #}
@@ -192,8 +238,8 @@
       </summary>
       <div class="form-stack" style="margin-top:var(--sp-3);">
 
-    {# Snapshot / stream URIs: filled by Detect, or set by hand. A successful
-       ONVIF/VAPIX detection populates these for review before saving. #}
+    {# Snapshot / stream URIs: filled by Query, by the API's detect-protocol
+       call, or set by hand. #}
     <div class="form-row">
       <div class="form-group">
         <label class="form-label" for="{{ uid }}-snapshot-uri">
@@ -202,14 +248,14 @@
         <input type="text" id="{{ uid }}-snapshot-uri" name="snapshot_uri"
                class="form-control"
                value="{{ camera.snapshot_uri or '' if editing else '' }}"
-               placeholder="optional; set by Detect" autocomplete="off">
+               placeholder="optional; from Query, the API or entered by hand" autocomplete="off">
       </div>
       <div class="form-group">
         <label class="form-label" for="{{ uid }}-stream-uri">Stream URI</label>
         <input type="text" id="{{ uid }}-stream-uri" name="stream_uri"
                class="form-control"
                value="{{ camera.stream_uri or '' if editing else '' }}"
-               placeholder="optional; set by Detect" autocomplete="off">
+               placeholder="optional; from Query, the API or entered by hand" autocomplete="off">
       </div>
     </div>
 
@@ -253,8 +299,13 @@
       {% if editing %}
         <div style="display:flex;align-items:center;gap:var(--sp-3);
                     flex-wrap:wrap;margin-top:var(--sp-1);">
+          {# One poll at a time: the button is disabled while the camera is
+             asked, and a second click while one is running is dropped. #}
           <button type="button" class="btn btn-ghost"
                   hx-get="/cameras/{{ camera.id }}/geolocation"
+                  hx-request='{"timeout":45000}'
+                  hx-disabled-elt="this"
+                  hx-sync="this:drop"
                   hx-target="#{{ uid }}-geo-poll-result"
                   hx-swap="innerHTML"
                   aria-controls="{{ uid }}-geo-poll-result">
@@ -275,14 +326,14 @@
 
     <div style="display:flex;gap:var(--sp-3);">
       <button type="submit" class="btn btn-primary">
-        {{ 'Save Changes' if editing else 'Create Camera' }}
+        {{ 'Save changes' if editing else 'Add camera' }}
       </button>
       {% if editing %}
         {# Cancel reloads the cameras page, restoring the unchanged row. #}
         <a href="/cameras" class="btn btn-ghost">Cancel</a>
       {% else %}
         <button type="button" class="btn btn-ghost"
-                onclick="document.getElementById('camera-form-card').remove();">
+                data-action="remove-by-id" data-target="camera-form-card">
           Cancel
         </button>
       {% endif %}

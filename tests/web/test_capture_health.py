@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from timelapse_manager.db.models import Camera, Project
+from timelapse_manager.db.models import Camera, Frame, Project
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
 from timelapse_manager.web.routers._viewmodels import _capture_is_overdue
@@ -53,6 +53,22 @@ def _seed_project(*, frame_count: int = 50, interval: int = 60) -> int:
         db.add(proj)
         db.flush()
         return proj.id
+
+
+def _seed_captured_frame(project_id: int, *, seconds_ago: int) -> None:
+    """Record a frame the app captured ``seconds_ago`` (Last Capture reads the DB)."""
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        db.add(
+            Frame(
+                project_id=project_id,
+                sequence_index=1,
+                capture_timestamp=_ago(seconds_ago),
+                file_path="f1.jpg",
+                origin="captured",
+                lifecycle_state="active",
+            )
+        )
 
 
 # --- pure logic -------------------------------------------------------------
@@ -109,11 +125,50 @@ def test_overdue_running_shows_banner_and_card_badge(
     operator_client: TestClient,
 ) -> None:
     pid = _seed_project(interval=60)
-    previous = _with_state(_FakeState(state="running", last_capture_at=_ago(600)))
+    # Since #5 the last capture is read from the frame table, not runner memory.
+    _seed_captured_frame(pid, seconds_ago=600)
+    previous = _with_state(_FakeState(state="running"))
     try:
         detail = operator_client.get(f"/projects/{pid}").text
         assert "Capture overdue" in detail
         dashboard = operator_client.get("/").text
         assert "Overdue" in dashboard
+    finally:
+        get_context().capture_supervisor = previous
+
+
+def _info_value(html: str, label: str) -> str:
+    """Return the text of the ``info-value`` cell following ``label``."""
+    import re
+
+    match = re.search(
+        rf'<dt class="info-label">{label}</dt>\s*<dd class="info-value">(.*?)</dd>',
+        html,
+        re.S,
+    )
+    assert match is not None, f"{label} cell not found"
+    return re.sub(r"<[^>]+>", "", match.group(1)).strip()
+
+
+def test_anchor_only_project_shows_last_and_next_capture(
+    operator_client: TestClient,
+) -> None:
+    """#5: an anchor-only project read '—' for both, even while capturing."""
+    pid = _seed_project(interval=60)
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        proj = db.get(Project, pid)
+        assert proj is not None
+        proj.capture_interval_seconds = None
+        proj.schedule = {"enabled": True, "timezone": "America/New_York"}
+        proj.exact_time_anchors = [
+            {"id": "noon", "kind": "clock", "time": "12:00", "enabled": True}
+        ]
+    _seed_captured_frame(pid, seconds_ago=3600)
+    previous = _with_state(_FakeState(state="running"))  # no in-memory capture
+    try:
+        detail = operator_client.get(f"/projects/{pid}").text
+        assert _info_value(detail, "Last Capture") not in ("", "—", "&mdash;")
+        assert _info_value(detail, "Next Capture") not in ("", "—", "&mdash;")
     finally:
         get_context().capture_supervisor = previous

@@ -15,17 +15,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
 
 import httpx
 
-from ..security.ssrf import SsrfError, assert_allowed_url
+from ..security.credential_binding import split_userinfo, target_host
+from ..security.ssrf import SsrfError, pinned_addresses_async
 from . import _onvif_soap as soap
 from . import events as eventutil
+from ._bounded import SOAP_RESPONSE_MAX_BYTES, read_capped_response
 from .base import (
+    AdapterCache,
+    AuthCaptureError,
     CameraAdapter,
     CameraCapabilities,
     CameraEvent,
@@ -39,9 +46,13 @@ from .base import (
     TimeoutCaptureError,
     UnreachableCaptureError,
     ValidationResult,
+    valid_coordinates,
 )
+from .clients import pool_exhausted_error, request_timeout
+from .host_resolution import check_camera_url_async
+from .http_auth import CameraAuthState
 from .http_jpeg import frame_from_bytes, http_get_image
-from .rtsp import RtspAdapter
+from .rtsp import RtspAdapter, rtsp_capture_budget_seconds
 from .rtsp import _guard_stream_url as _guard_stream_uri
 
 logger = logging.getLogger(__name__)
@@ -53,6 +64,40 @@ DEVICE_SERVICE_PATH = "/onvif/device_service"
 EVENTS_SERVICE_PATH = "/onvif/services"
 
 _GET_PROFILES_BODY = "<trt:GetProfiles/>"
+
+# SOAP fault subcodes a device returns when the WS-Security token is refused:
+# ONVIF's ``ter:NotAuthorized`` and WS-Security's ``wsse:FailedAuthentication``.
+_AUTH_FAULT_MARKERS = ("NotAuthorized", "FailedAuthentication")
+# Statuses a SOAP fault arrives with: 400 for a sender fault per the SOAP 1.2
+# HTTP binding, 500 on firmware that answers every fault with it.
+_FAULT_STATUSES = frozenset({400, 500})
+
+
+def soap_auth_failure(status_code: int, text: str) -> bool:
+    """Whether a failed SOAP response means the camera refused the login.
+
+    ``401``/``403`` always do; a ``400``/``500`` SOAP fault does when its body
+    names an authentication subcode (#69 CAM-R9). The caller then raises
+    :class:`AuthCaptureError`, which never falls back to RTSP.
+    """
+    if status_code in (401, 403):
+        return True
+    return status_code in _FAULT_STATUSES and any(
+        marker in text for marker in _AUTH_FAULT_MARKERS
+    )
+
+
+def _raise_for_soap_status(status_code: int, text: str, url: str, what: str) -> None:
+    """Map a failed SOAP response to the matching capture error, else return."""
+    if status_code < 400:
+        return
+    if soap_auth_failure(status_code, text):
+        raise AuthCaptureError(
+            f"authentication rejected ({status_code}) by {what} to {url}"
+        )
+    raise OtherCaptureError(f"{what} to {url} returned {status_code}")
+
+
 _GET_SERVICES_BODY = (
     "<tds:GetServices><tds:IncludeCapability>false"
     "</tds:IncludeCapability></tds:GetServices>"
@@ -70,6 +115,21 @@ _RENEW_MARGIN_SECONDS = 60
 # A short, bounded budget for the best-effort Unsubscribe on teardown so a slow
 # camera cannot stall shutdown.
 _UNSUBSCRIBE_TIMEOUT = 5.0
+# The shortest a PullMessages cycle may take. A camera that answers an empty pull
+# at once (some firmware ignores the long-poll timeout) would otherwise be polled
+# in a tight loop, hammering it and the event loop (#69 CAM-R9).
+_MIN_PULL_CYCLE_SECONDS = 1.0
+# The camera's clock offset is kept in the session's cache under this key, as
+# ``(offset_seconds, measured_at_monotonic)``. An authentication failure re-measures
+# it only when the stored value is older than the refresh interval, so a camera
+# that rejects the login for any other reason is not asked for its clock each time.
+_CLOCK_OFFSET_KEY = ("clock_offset", None)
+_CLOCK_OFFSET_REFRESH_SECONDS = 300.0
+# Offsets within this many seconds are measurement noise (the camera reports whole
+# seconds, truncated) and are treated as none.
+_CLOCK_OFFSET_NOISE_SECONDS = 1
+# Offsets beyond this are ignored.
+_CLOCK_OFFSET_MAX_SECONDS = 86400
 
 
 def _device_url(address: str) -> str:
@@ -83,16 +143,22 @@ def _device_url(address: str) -> str:
 
 
 def get_snapshot_uri_body(profile_token: str) -> str:
-    """SOAP body requesting the snapshot URI for a media profile."""
+    """SOAP body requesting the snapshot URI for a media profile.
+
+    The token comes from the device (or the operator), so it is XML-escaped.
+    """
     return (
         "<trt:GetSnapshotUri>"
-        f"<trt:ProfileToken>{profile_token}</trt:ProfileToken>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
         "</trt:GetSnapshotUri>"
     )
 
 
 def get_stream_uri_body(profile_token: str) -> str:
-    """SOAP body requesting the RTSP stream URI for a media profile."""
+    """SOAP body requesting the RTSP stream URI for a media profile.
+
+    The token comes from the device (or the operator), so it is XML-escaped.
+    """
     return (
         "<trt:GetStreamUri>"
         "<trt:StreamSetup>"
@@ -101,7 +167,7 @@ def get_stream_uri_body(profile_token: str) -> str:
         "<tt:Transport xmlns:tt='http://www.onvif.org/ver10/schema'>"
         "<tt:Protocol>RTSP</tt:Protocol></tt:Transport>"
         "</trt:StreamSetup>"
-        f"<trt:ProfileToken>{profile_token}</trt:ProfileToken>"
+        f"<trt:ProfileToken>{escape(profile_token)}</trt:ProfileToken>"
         "</trt:GetStreamUri>"
     )
 
@@ -287,6 +353,26 @@ def parse_uri(xml_text: str) -> str | None:
     return soap.find_text(root, ".//tt:Uri")
 
 
+def _resolve_watchdog_seconds() -> float:
+    """Return the configured idle watchdog for a PullPoint pull cycle, in seconds.
+
+    Falls back to the model default when no runtime context is installed, so the
+    watchdog is always armed rather than silently disabled. In a running service
+    the context is always present; the fallback only matters for the event source
+    exercised outside a fully configured application context.
+    """
+    from ..runtime import get_context
+
+    try:
+        return get_context().settings.capture.onvif_watchdog_seconds
+    except (RuntimeError, AttributeError):
+        from ..config.settings import CaptureSettings
+
+        default = CaptureSettings.model_fields["onvif_watchdog_seconds"].default
+        assert isinstance(default, float)
+        return default
+
+
 class OnvifAdapter(CameraAdapter):
     """Capture from an ONVIF camera by resolving its media-service URIs."""
 
@@ -300,13 +386,35 @@ class OnvifAdapter(CameraAdapter):
         timeout: float = 10.0,
         ffmpeg_binary: str = "ffmpeg",
         stream_id: str | None = None,
+        uri_cache: AdapterCache | None = None,
+        auth_state: CameraAuthState | None = None,
+        allow_rtsp_fallback: bool = True,
+        contain_default: bool = False,
     ) -> None:
         self._client = client
-        self._address = address
+        # True when ``credentials`` are the bound global default: the RTSP
+        # fallback then dials only a validated address inside the allowed
+        # private subnets (#268).
+        self._contain_default = contain_default
+        # False for a certificate-pinned camera: the RTSP grab is not covered by
+        # the pin and would carry the camera's credentials outside it (#228).
+        self._allow_rtsp_fallback = allow_rtsp_fallback
+        # Never keep a ``user:pass@`` from a legacy address: httpx would turn it
+        # into a preemptive Basic header on every request (#69 CAM-S2).
+        self._address = split_userinfo(address)[0]
         self._credentials = credentials
+        # The camera session's HTTP auth negotiation state for the snapshot GET
+        # (#69 CAM-S1, CAM-P1); SOAP calls authenticate with WS-Security in the
+        # envelope instead. A fresh one with the probe policy when none is given.
+        self._auth_state = auth_state if auth_state is not None else CameraAuthState()
         # Pre-configured URIs (operator-provided) short-circuit SOAP resolution.
         self._snapshot_uri = snapshot_uri
         self._stream_uri = stream_uri
+        # Values resolved over SOAP (profile token, media URIs) are kept in the
+        # camera session's cache across captures when one is given (#69
+        # CAM-P1), so a capture costs one snapshot GET instead of three
+        # requests. Operator-provided URIs never go through it.
+        self._uri_cache = uri_cache
         # The selected media-profile token, or None to use the device's first
         # profile. A non-None stream_id seeds the profile token so the snapshot/
         # stream URI resolvers target that profile. (When ``snapshot_uri`` /
@@ -318,64 +426,323 @@ class OnvifAdapter(CameraAdapter):
         # endpoint; passed through so the fallback grab uses the same ffmpeg as
         # the rest of the application (bundled when frozen).
         self._ffmpeg_binary = ffmpeg_binary
+        # The camera's clock offset when there is no session cache to keep it in
+        # (an ad-hoc probe), as ``(offset_seconds, measured_at_monotonic)``.
+        self._local_clock_offset: tuple[float, float] | None = None
+        # Called (on the event loop) once an event subscription is established,
+        # so the supervisor can tell "subscribed and quiet" from "never subscribed"
+        # (#69 CAM-R7). Set by the event-listener factory; never required.
+        self.on_subscribed: Callable[[], Awaitable[None]] | None = None
 
-    async def _soap_call(self, url: str, body: str) -> str:
+    async def _guard_soap_url(self, url: str) -> None:
+        """Validate a device/media SOAP target against the camera deny-list.
+
+        The single chokepoint :meth:`_soap_call` funnels every device- and
+        media-service request through (GetProfiles, GetSnapshotUri, GetStreamUri,
+        GetServices, GetGeoLocation, GetHostname). The target URL is derived from
+        the operator-supplied camera address, so a misconfigured -- or hostile --
+        address could otherwise point an internal POST at loopback, link-local, or
+        the cloud-metadata endpoint. Routing it through the SSRF guard here closes
+        that hole at the one point every such call passes through, fail-closed.
+
+        Uses the camera/scan policy (admin private opt-in honoured; loopback/
+        link-local/metadata never relaxed) -- the same policy the snapshot, stream,
+        and event paths use -- so a legitimately-configured private camera still
+        works. A denied target surfaces as :class:`UnreachableCaptureError` so it
+        flows through the adapter's existing capture-failure handling.
+
+        The lookup runs off the event loop and an allowed answer is cached, so
+        the client's pinned connection dials the address validated here (see
+        :mod:`.clients`).
+        """
+        try:
+            await check_camera_url_async(url)
+        except SsrfError as exc:
+            raise UnreachableCaptureError(f"device URL blocked: {exc}") from exc
+
+    async def _require_own_host(self, uri: str, kind: str) -> None:
+        """Refuse a device-supplied URI that does not name this camera's host.
+
+        A device answers ``GetSnapshotUri``, ``GetStreamUri``, ``GetServices``
+        and ``CreatePullPointSubscription`` with URIs of its own choosing, and
+        the camera's credentials go to whatever host they name (a Digest
+        answer, WS-Security in a SOAP envelope, ffmpeg's URL). A rogue or
+        compromised device could otherwise name a machine that challenges and
+        collects them (#69 CAM-S5, #193). So a URI must name the configured
+        host: the same name or IP, or an IP literal that the configured name
+        resolves to (a camera added by name that reports its IP). Only hosts are
+        compared -- the stream is ``rtsp://`` on another port by design.
+
+        The URI is not fetched here, and nothing is sent to a different host.
+        An operator-stored ``snapshot_uri`` / ``stream_uri`` is not a device
+        answer and is never checked: saving one on the camera form is the
+        explicit acceptance of its host, and re-typing the password after a
+        host change is what lets stored credentials follow it
+        (:func:`~timelapse_manager.security.credential_binding.introduces_new_host`).
+        The host check rejects userinfo, whitespace, backslashes and control
+        characters first, so the parser consuming the URI cannot read a
+        different host than this check did.
+
+        :param kind: ``"snapshot"``, ``"stream"``, ``"events"`` or
+            ``"subscription"``, named in the error.
+        :raises UnreachableCaptureError: the URI is malformed or names another
+            host. Not an :class:`OtherCaptureError`, so a refused snapshot URI
+            never falls back to RTSP.
+        """
+        uri_host = target_host(uri, allow_userinfo=False)
+        if uri_host is None:
+            raise UnreachableCaptureError(f"camera returned a malformed {kind} URI")
+        own_host = target_host(self._address)
+        if own_host is not None and uri_host == own_host:
+            return
+        if own_host is not None and await self._hosts_share_address(own_host, uri_host):
+            return
+        raise UnreachableCaptureError(
+            f"camera returned a {kind} URI for another host ({uri_host}); "
+            "enter that URI on the camera form to accept it"
+        )
+
+    @staticmethod
+    async def _hosts_share_address(own_host: str, uri_host: str) -> bool:
+        """Whether ``uri_host`` is an IP literal that the camera's own host has.
+
+        Only a *literal* is an alias: a camera added by name that reports its
+        own IP. A different **name** is refused even when it resolves to the
+        camera's address right now, because the capture client resolves the
+        name again when it connects (it is not pinned), so a device could answer
+        the check with the camera's IP and the connection with its own.
+        """
+        try:
+            literal = ipaddress.ip_address(uri_host)
+        except ValueError:
+            return False
+        from ..runtime import get_context
+
+        ssrf = get_context().settings.ssrf
+        try:
+            own_ips = await pinned_addresses_async(
+                own_host,
+                allow_private=True,
+                allowed_private_subnets=ssrf.allowed_private_subnets,
+            )
+        except SsrfError:
+            return False
+        return str(literal) in own_ips
+
+    async def _soap_call(
+        self, url: str, body: str, *, authenticate: bool = True
+    ) -> str:
         """POST a SOAP envelope and return the response text.
 
-        :raises CaptureError: mapped from transport/timeout/status failures.
+        The target is validated through the SSRF guard before the POST: the URL
+        is built from the operator-supplied camera address, so guarding here -- the
+        shared device/media chokepoint -- keeps an internal POST from being aimed
+        at a denied host.
+
+        The response body is streamed and capped at
+        :data:`._bounded.SOAP_RESPONSE_MAX_BYTES` (#69 CAM-S3).
+
+        The WS-Security token carries the camera's own time (see
+        :meth:`_clock_offset`). ``authenticate=False`` sends no token at all
+        (GetSystemDateAndTime, which is how that offset is measured).
+
+        :raises AuthCaptureError: the device refused the login (a 401/403, or
+            an authentication SOAP fault; #69 CAM-R9).
+        :raises CaptureError: mapped from a denied target (SSRF), from
+            transport/timeout/status failures, or from an oversized body.
         """
-        payload = soap.envelope(body, self._credentials)
+        await self._guard_soap_url(url)
+        credentials = self._credentials if authenticate else None
+        offset = await self._clock_offset() if credentials is not None else None
+        payload = soap.envelope(body, credentials, clock_offset=offset or timedelta(0))
         headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
         try:
-            response = await self._client.post(
-                url, content=payload, headers=headers, timeout=self._timeout
+            response = await read_capped_response(
+                self._client,
+                "POST",
+                url,
+                max_bytes=SOAP_RESPONSE_MAX_BYTES,
+                content=payload,
+                headers=headers,
+                timeout=request_timeout(self._client, self._timeout),
+                read_error_body=True,
             )
+        except httpx.PoolTimeout as exc:
+            # Before TimeoutException (its base): no free local connection is
+            # not a camera failure (#69 CAM-P2).
+            raise pool_exhausted_error(url) from exc
         except httpx.TimeoutException as exc:
             raise TimeoutCaptureError(f"onvif call timed out: {url}") from exc
         except httpx.TransportError as exc:
             raise UnreachableCaptureError(
                 f"cannot reach onvif device {url}: {exc}"
             ) from exc
-        if response.status_code >= 400:
-            raise OtherCaptureError(
-                f"onvif call to {url} returned {response.status_code}"
-            )
+        self._check_soap_status(
+            response.status_code, response.text, url, "onvif call", authenticate
+        )
         return response.text
+
+    def _check_soap_status(
+        self, status_code: int, text: str, url: str, what: str, authenticated: bool
+    ) -> None:
+        """Raise for a failed SOAP reply; note a login failure for the clock check.
+
+        A refused login may mean the camera's clock drifted since it was
+        measured, so an authentication failure marks the cached offset for
+        re-measurement (see :meth:`_note_auth_failure`).
+        """
+        try:
+            _raise_for_soap_status(status_code, text, url, what)
+        except AuthCaptureError:
+            if authenticated:
+                self._note_auth_failure()
+            raise
+
+    # -- Camera clock -------------------------------------------------------
+
+    async def _clock_offset(self) -> timedelta:
+        """Return how far the camera's clock is ahead of ours, measured once.
+
+        The offset is read with one unauthenticated GetSystemDateAndTime and kept
+        in the camera session's cache, so a listener and its captures share it. A
+        device that will not say (an error, or a login required) gets no offset,
+        which is the previous behaviour (#69 CAM-R9).
+        """
+        stored = self._stored_clock_offset()
+        if stored is None:
+            stored = await self._measure_clock_offset()
+        return timedelta(seconds=stored[0])
+
+    def _stored_clock_offset(self) -> tuple[float, float] | None:
+        """Return the cached ``(seconds, measured_at)`` offset, or ``None``."""
+        if self._local_clock_offset is not None:
+            return self._local_clock_offset
+        if self._uri_cache is None:
+            return None
+        value = self._uri_cache.get(_CLOCK_OFFSET_KEY)
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and all(isinstance(part, float) for part in value)
+        ):
+            return (value[0], value[1])
+        return None
+
+    def _store_clock_offset(self, seconds: float) -> tuple[float, float]:
+        """Remember a measured offset where the next call (and capture) finds it."""
+        entry = (seconds, time.monotonic())
+        if self._uri_cache is not None:
+            self._uri_cache.put(_CLOCK_OFFSET_KEY, entry)
+        else:
+            self._local_clock_offset = entry
+        return entry
+
+    async def _measure_clock_offset(self) -> tuple[float, float]:
+        """Ask the camera for its UTC time and store the offset from ours."""
+        url = _device_url(self._address)
+        started = datetime.now(UTC)
+        try:
+            text = await self._soap_call(
+                url, soap.get_system_date_and_time_body(), authenticate=False
+            )
+        except CaptureError as exc:
+            logger.debug("onvif clock offset unavailable: %s", exc)
+            return self._store_clock_offset(0.0)
+        finished = datetime.now(UTC)
+        camera_time = soap.parse_utc_datetime(text)
+        if camera_time is None:
+            return self._store_clock_offset(0.0)
+        midpoint = started + (finished - started) / 2
+        seconds = round((camera_time - midpoint).total_seconds())
+        if abs(seconds) <= _CLOCK_OFFSET_NOISE_SECONDS:
+            seconds = 0
+        elif abs(seconds) > _CLOCK_OFFSET_MAX_SECONDS:
+            # A clock a day or more out is a broken or hostile answer, not skew
+            # to correct for (and a huge shift could overflow a timestamp).
+            logger.debug("ignoring implausible onvif clock offset of %ds", seconds)
+            seconds = 0
+        return self._store_clock_offset(float(seconds))
+
+    def _note_auth_failure(self) -> None:
+        """Drop an old clock offset after a refused login, so it is re-measured."""
+        stored = self._stored_clock_offset()
+        if stored is None:
+            return
+        if time.monotonic() - stored[1] < _CLOCK_OFFSET_REFRESH_SECONDS:
+            return
+        self._local_clock_offset = None
+        if self._uri_cache is not None:
+            self._uri_cache.drop(_CLOCK_OFFSET_KEY)
+
+    def _cached(self, key: tuple[str, str | None]) -> str | None:
+        """Return a value from the shared URI cache, if any."""
+        if self._uri_cache is None:
+            return None
+        value = self._uri_cache.get(key)
+        return value if isinstance(value, str) else None
+
+    def _remember(self, key: tuple[str, str | None], value: str) -> None:
+        """Store a resolved value in the shared URI cache, if any."""
+        if self._uri_cache is not None:
+            self._uri_cache.put(key, value)
+
+    def forget_resolved_uris(self) -> None:
+        """Drop the shared URI cache, so the next capture resolves afresh."""
+        if self._uri_cache is not None:
+            self._uri_cache.clear()
 
     async def _resolve_profile_token(self) -> str:
         if self._profile_token is not None:
             return self._profile_token
+        cached = self._cached(("profile", None))
+        if cached is not None:
+            self._profile_token = cached
+            return cached
         url = _device_url(self._address)
         text = await self._soap_call(url, _GET_PROFILES_BODY)
         token = parse_first_profile_token(text)
         if token is None:
             raise OtherCaptureError("onvif device returned no media profiles")
         self._profile_token = token
+        self._remember(("profile", None), token)
         return token
 
     async def _resolve_snapshot_uri(self) -> str:
         if self._snapshot_uri is not None:
             return self._snapshot_uri
         token = await self._resolve_profile_token()
+        cached = self._cached(("snapshot", token))
+        if cached is not None:
+            self._snapshot_uri = cached
+            return cached
         text = await self._soap_call(
             _device_url(self._address), get_snapshot_uri_body(token)
         )
         uri = parse_uri(text)
         if uri is None:
             raise OtherCaptureError("onvif device returned no snapshot URI")
+        await self._require_own_host(uri, "snapshot")
         self._snapshot_uri = uri
+        self._remember(("snapshot", token), uri)
         return uri
 
     async def _resolve_stream_uri(self) -> str:
         if self._stream_uri is not None:
             return self._stream_uri
         token = await self._resolve_profile_token()
+        cached = self._cached(("stream", token))
+        if cached is not None:
+            # Validated before it was cached; RtspAdapter re-checks the host on
+            # every grab, which closes the DNS-rebinding window on reuse.
+            self._stream_uri = cached
+            return cached
         text = await self._soap_call(
             _device_url(self._address), get_stream_uri_body(token)
         )
         uri = parse_uri(text)
         if uri is None:
             raise OtherCaptureError("onvif device returned no stream URI")
+        await self._require_own_host(uri, "stream")
         # The stream URI comes from the device's SOAP response and is therefore
         # attacker-influenceable: a rogue/compromised camera can point it at
         # loopback, the cloud-metadata endpoint, or an internal host. Validate its
@@ -384,6 +751,7 @@ class OnvifAdapter(CameraAdapter):
         # RtspAdapter.capture closes the separate DNS-rebinding window on reuse.)
         await _guard_stream_uri(uri)
         self._stream_uri = uri
+        self._remember(("stream", token), uri)
         return uri
 
     async def resolve_uris(self) -> tuple[str | None, str | None]:
@@ -422,19 +790,48 @@ class OnvifAdapter(CameraAdapter):
             )
         return snapshot_uri, stream_uri
 
+    @property
+    def capture_budget_seconds(self) -> float:
+        """The RTSP fallback's budget, so the shared capture timeout cannot cut it."""
+        return rtsp_capture_budget_seconds()
+
     async def capture(self) -> CapturedFrame:
         # Prefer the snapshot URI (cheaper, no transcoding); fall back to a
         # single-frame RTSP grab if the device exposes no snapshot endpoint.
         try:
+            return await self._capture_once()
+        except CaptureError:
+            # A failure through a cached URI (a 401/404 after the camera was
+            # reconfigured, say) must not pin a stale value for an hour: the
+            # next capture resolves everything afresh.
+            self.forget_resolved_uris()
+            raise
+
+    async def _capture_once(self) -> CapturedFrame:
+        # Only a device that answered but has no snapshot endpoint
+        # (OtherCaptureError) falls back to RTSP. A refused login
+        # (AuthCaptureError) propagates: the same credentials would fail over
+        # RTSP too, and an auth failure must reach camera health as one
+        # (#69 CAM-R9).
+        try:
             snapshot_uri = await self._resolve_snapshot_uri()
         except OtherCaptureError:
+            if not self._allow_rtsp_fallback:
+                raise
             stream_uri = await self._resolve_stream_uri()
             rtsp = RtspAdapter(
-                stream_uri, self._credentials, ffmpeg_binary=self._ffmpeg_binary
+                stream_uri,
+                self._credentials,
+                ffmpeg_binary=self._ffmpeg_binary,
+                contain_default=self._contain_default,
             )
             return await rtsp.capture()
         image_bytes = await http_get_image(
-            self._client, snapshot_uri, self._credentials, self._timeout
+            self._client,
+            snapshot_uri,
+            self._credentials,
+            self._timeout,
+            auth_state=self._auth_state,
         )
         return frame_from_bytes(image_bytes)
 
@@ -467,11 +864,16 @@ class OnvifAdapter(CameraAdapter):
         if lat is None or lon is None:
             return None
         try:
-            return GeoLocation(
-                latitude=float(lat), longitude=float(lon), source="camera"
-            )
+            latitude = float(lat)
+            longitude = float(lon)
         except ValueError:
             return None
+        # The device is untrusted: ``float()`` accepts ``nan``/``inf``, and a
+        # device can report any magnitude. Treat an impossible value as "no
+        # location" rather than letting it reach the solar-anchor maths.
+        if not valid_coordinates(latitude, longitude):
+            return None
+        return GeoLocation(latitude=latitude, longitude=longitude, source="camera")
 
     async def get_device_hostname(self) -> str | None:
         # ONVIF exposes the device hostname via the device GetHostname operation,
@@ -543,54 +945,65 @@ class OnvifAdapter(CameraAdapter):
         camera-returned and re-used over hours, so its host is re-validated on
         each request to close the DNS-rebinding window. The WS-Addressing headers
         (and, when present, the echoed subscription reference parameter) are added
-        here so each call carries the action/target the firmware requires.
+        here so each call carries the action/target the firmware requires. The
+        response body is streamed and capped at
+        :data:`._bounded.SOAP_RESPONSE_MAX_BYTES` (#69 CAM-S3).
 
+        :raises AuthCaptureError: the device refused the login (a 401/403, or
+            an authentication SOAP fault; #69 CAM-R9).
         :raises CaptureError: mapped from a denied target (SSRF), transport,
-            timeout, or non-2xx status -- the family the listener treats as
-            recoverable (backoff + re-subscribe).
+            timeout, non-2xx status or an oversized body -- the family the
+            listener treats as recoverable (backoff + re-subscribe).
         """
-        self._guard_event_url(url)
+        await self._guard_event_url(url)
         headers_xml = soap.addressing_headers(
             action, url, reference_parameters=reference_parameters
         )
-        payload = soap.envelope(body, self._credentials, headers_xml)
+        offset = await self._clock_offset() if self._credentials is not None else None
+        payload = soap.envelope(
+            body,
+            self._credentials,
+            headers_xml,
+            clock_offset=offset or timedelta(0),
+        )
         headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
         try:
-            response = await self._client.post(
+            response = await read_capped_response(
+                self._client,
+                "POST",
                 url,
+                max_bytes=SOAP_RESPONSE_MAX_BYTES,
                 content=payload,
                 headers=headers,
-                timeout=timeout if timeout is not None else self._timeout,
+                timeout=request_timeout(
+                    self._client, timeout if timeout is not None else self._timeout
+                ),
+                read_error_body=True,
             )
+        except httpx.PoolTimeout as exc:
+            raise pool_exhausted_error(url) from exc
         except httpx.TimeoutException as exc:
             raise TimeoutCaptureError(f"onvif event call timed out: {url}") from exc
         except httpx.TransportError as exc:
             raise UnreachableCaptureError(
                 f"cannot reach onvif device {url}: {exc}"
             ) from exc
-        if response.status_code >= 400:
-            raise OtherCaptureError(
-                f"onvif event call to {url} returned {response.status_code}"
-            )
+        self._check_soap_status(
+            response.status_code, response.text, url, "onvif event call", True
+        )
         return response.text
 
-    def _guard_event_url(self, url: str) -> None:
+    async def _guard_event_url(self, url: str) -> None:
         """Validate an event SOAP target against the camera deny-list.
 
         Uses the camera/scan policy (admin private opt-in honoured; loopback/
         link-local/metadata never relaxed). A denied target surfaces as
         :class:`UnreachableCaptureError` so it flows through the listener's
-        recoverable-failure handling.
+        recoverable-failure handling. Runs on every pull, so the lookup is off
+        the event loop and cached for a short time.
         """
-        from ..runtime import get_context
-
-        ssrf = get_context().settings.ssrf
         try:
-            assert_allowed_url(
-                url,
-                allow_private=True,
-                allowed_private_subnets=ssrf.allowed_private_subnets,
-            )
+            await check_camera_url_async(url)
         except SsrfError as exc:
             raise UnreachableCaptureError(f"event URL blocked: {exc}") from exc
 
@@ -608,7 +1021,17 @@ class OnvifAdapter(CameraAdapter):
         except CaptureError:
             return self._events_fallback_url()
         url = _parse_events_xaddr(text)
-        return url or self._events_fallback_url()
+        if url is None:
+            return self._events_fallback_url()
+        try:
+            await self._require_own_host(url, "events")
+        except UnreachableCaptureError as exc:
+            # The events XAddr is device-supplied and receives the login in the
+            # SOAP envelope: a host other than the camera's is ignored in favour
+            # of the conventional URL on the configured address (#69 CAM-S5).
+            logger.warning("ignoring the device's events address: %s", exc)
+            return self._events_fallback_url()
+        return url
 
     async def list_event_topics(self) -> list[EventDescriptor]:
         # Resolve the events endpoint, query its topic catalogue, and turn each
@@ -660,33 +1083,63 @@ class OnvifAdapter(CameraAdapter):
         if reference is None:
             raise OtherCaptureError("onvif device returned no subscription reference")
         sub_url, ref_params = reference
+        await self._require_own_host(sub_url, "subscription")
+        if self.on_subscribed is not None:
+            await self.on_subscribed()
         loop = asyncio.get_running_loop()
         next_renew = loop.time() + (
             _SUBSCRIPTION_TERMINATION_SECONDS - _RENEW_MARGIN_SECONDS
         )
+        watchdog_seconds = _resolve_watchdog_seconds()
         try:
             while True:
-                if loop.time() >= next_renew:
-                    await self._guarded_event_soap_call(
-                        sub_url,
-                        soap.renew_body(_SUBSCRIPTION_TERMINATION),
-                        action=soap.ACTION_RENEW,
-                        reference_parameters=ref_params,
-                    )
-                    next_renew = loop.time() + (
-                        _SUBSCRIPTION_TERMINATION_SECONDS - _RENEW_MARGIN_SECONDS
-                    )
-                pull_text = await self._guarded_event_soap_call(
-                    sub_url,
-                    soap.pull_messages_body(_PULL_TIMEOUT),
-                    action=soap.ACTION_PULL_MESSAGES,
-                    reference_parameters=ref_params,
-                    timeout=_PULL_HTTP_TIMEOUT,
-                )
-                for notification in soap.parse_pull_messages(pull_text):
+                cycle_started = loop.time()
+                # Bound the renew+pull cycle with an idle watchdog. httpx's own
+                # read timeout (_PULL_HTTP_TIMEOUT) covers a silent socket, but a
+                # half-open camera or a slow-loris trickle that keeps resetting the
+                # per-read timer can stall a cycle indefinitely -- hanging the
+                # listener task so it never reaches the re-subscribe path. On
+                # expiry we raise out of the generator; the supervisor's listener
+                # catches it like any other source failure and re-subscribes after
+                # backoff (the existing recovery path, not a new one). The yields
+                # stay outside the timeout so a slow consumer is never mistaken for
+                # a wedged camera.
+                try:
+                    async with asyncio.timeout(watchdog_seconds):
+                        if loop.time() >= next_renew:
+                            await self._guarded_event_soap_call(
+                                sub_url,
+                                soap.renew_body(_SUBSCRIPTION_TERMINATION),
+                                action=soap.ACTION_RENEW,
+                                reference_parameters=ref_params,
+                            )
+                            next_renew = loop.time() + (
+                                _SUBSCRIPTION_TERMINATION_SECONDS
+                                - _RENEW_MARGIN_SECONDS
+                            )
+                        pull_text = await self._guarded_event_soap_call(
+                            sub_url,
+                            soap.pull_messages_body(_PULL_TIMEOUT),
+                            action=soap.ACTION_PULL_MESSAGES,
+                            reference_parameters=ref_params,
+                            timeout=_PULL_HTTP_TIMEOUT,
+                        )
+                        notifications = soap.parse_pull_messages(pull_text)
+                except TimeoutError as exc:
+                    raise TimeoutCaptureError(
+                        f"onvif pull cycle did not complete within "
+                        f"{watchdog_seconds:.0f}s; treating subscription as dead"
+                    ) from exc
+                for notification in notifications:
                     event = _event_from_notification(notification)
                     if event is not None:
                         yield event
+                # A camera that answers an empty pull at once is not polled in a
+                # tight loop: the cycle takes at least the minimum, whatever the
+                # consumer spent on the events above (#69 CAM-R9).
+                remainder = _MIN_PULL_CYCLE_SECONDS - (loop.time() - cycle_started)
+                if remainder > 0:
+                    await asyncio.sleep(remainder)
         finally:
             await self._unsubscribe(sub_url, ref_params)
 
@@ -700,20 +1153,10 @@ class OnvifAdapter(CameraAdapter):
         is bounded by its own timeout so it cannot stall teardown. Ordinary
         failures (an unreachable camera, a timeout) are swallowed -- the
         subscription expires on its own termination time -- but ``CancelledError``
-        is re-raised so the teardown that triggered this finally still propagates.
+        is re-raised so the teardown that triggered this finally still propagates,
+        after waiting (also bounded) for the Unsubscribe to finish.
         """
-        task = asyncio.ensure_future(
-            asyncio.wait_for(
-                self._guarded_event_soap_call(
-                    sub_url,
-                    soap.unsubscribe_body(),
-                    action=soap.ACTION_UNSUBSCRIBE,
-                    reference_parameters=ref_params,
-                    timeout=_UNSUBSCRIBE_TIMEOUT,
-                ),
-                timeout=_UNSUBSCRIBE_TIMEOUT,
-            )
-        )
+        task = asyncio.ensure_future(self._bounded_unsubscribe(sub_url, ref_params))
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -721,10 +1164,22 @@ class OnvifAdapter(CameraAdapter):
             # completion in the background (best-effort) and re-raise so the
             # cancellation that reached this finally still propagates.
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(task, timeout=_UNSUBSCRIBE_TIMEOUT)
+                async with asyncio.timeout(_UNSUBSCRIBE_TIMEOUT):
+                    await task
             raise
         except (CaptureError, TimeoutError) as exc:
             logger.debug("onvif unsubscribe failed (subscription will expire): %s", exc)
+
+    async def _bounded_unsubscribe(self, sub_url: str, ref_params: str) -> None:
+        """Send the Unsubscribe under the teardown budget (``asyncio.timeout``)."""
+        async with asyncio.timeout(_UNSUBSCRIBE_TIMEOUT):
+            await self._guarded_event_soap_call(
+                sub_url,
+                soap.unsubscribe_body(),
+                action=soap.ACTION_UNSUBSCRIBE,
+                reference_parameters=ref_params,
+                timeout=_UNSUBSCRIBE_TIMEOUT,
+            )
 
     async def close(self) -> None:
         # The HTTP client is owned by the caller; nothing to release here.

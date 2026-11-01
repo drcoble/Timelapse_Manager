@@ -58,6 +58,27 @@
 </div>
 {% endif %}
 
+{# Outcome of the no-JS camera delete (POST /cameras/{id}/delete redirects here
+   with ?deleted=1 or ?delete_error=…). The route validates the query string;
+   only known codes and an integer count reach the template. #}
+{% if delete_notice %}
+  {% if delete_notice.kind == 'deleted' %}
+  <div class="alert success" role="status" style="margin-bottom:var(--sp-4);">
+    Camera deleted.
+  </div>
+  {% elif delete_notice.kind == 'in_use' %}
+  <div class="alert error" role="alert" style="margin-bottom:var(--sp-4);">
+    The camera was not deleted: it is used by
+    {% if delete_notice.count %}{{ delete_notice.count }} project(s){% else %}a project{% endif %}.
+    Move or delete those projects first.
+  </div>
+  {% elif delete_notice.kind == 'not_found' %}
+  <div class="alert info" role="status" style="margin-bottom:var(--sp-4);">
+    That camera no longer exists.
+  </div>
+  {% endif %}
+{% endif %}
+
 {# Inline form container — populated by HTMX when "Add Camera" is clicked #}
 <div id="camera-form-container" style="margin-bottom:var(--sp-6);"></div>
 
@@ -78,7 +99,7 @@
           <th scope="col"><span class="visually-hidden">Actions</span></th>
         </tr>
       </thead>
-      <tbody id="cameras-tbody">
+      <tbody id="cameras-tbody"{% if can_operate %} data-row-click=".camera-open-link"{% endif %}>
         {% for camera in cameras %}
           {% include '_partials/camera_row.html' %}
         {% endfor %}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from timelapse_manager.db.models import Camera
@@ -88,7 +89,56 @@ class TestDiscoverModal:
         # Exactly one results container (it moved into the modal — no duplicate).
         assert html.count('id="scan-results"') == 1
 
+    def test_range_is_prefilled_from_the_first_subnet_that_fits_the_cap(
+        self, admin_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ssrf = get_context().settings.ssrf
+        monkeypatch.setattr(
+            ssrf,
+            "allowed_private_subnets",
+            ["10.0.0.0/8", "fd00::/8", "10.0.16.0/24", "10.0.17.0/24"],
+        )
+        monkeypatch.setattr(ssrf, "max_scan_hosts", 256)
+        html = admin_client.get("/cameras").text
+        # The /8 and the IPv6 prefix exceed the cap; the first /24 is offered.
+        assert 'value="10.0.16.0/24"' in html
+        assert "Prefilled from your allowed private subnets" in html
+
+    def test_nothing_is_prefilled_when_no_subnet_fits(
+        self, admin_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ssrf = get_context().settings.ssrf
+        monkeypatch.setattr(ssrf, "allowed_private_subnets", ["10.0.0.0/8"])
+        monkeypatch.setattr(ssrf, "max_scan_hosts", 256)
+        html = admin_client.get("/cameras").text
+        assert 'name="scan_range"' in html
+        assert 'value=""' in html
+        assert "multicast does not cross routed VLANs" in html
+
     def test_viewer_sees_no_discover_modal(self, viewer_client: TestClient) -> None:
         html = viewer_client.get("/cameras").text
         assert 'data-modal-open="#discover-modal"' not in html
         assert 'class="discover-modal"' not in html
+
+
+class TestClickableRows:
+    """A camera row opens the edit form on a click; viewers get plain rows (#302)."""
+
+    def test_operator_row_is_clickable_with_a_focusable_name(
+        self, admin_client: TestClient
+    ) -> None:
+        cid = _seed_camera(name="clickcam", geo_source=None)
+        html = admin_client.get("/cameras").text
+        assert 'class="camera-row-clickable"' in html
+        assert "js/row-click.js" in html
+        # The name is a real button carrying the same request as Row actions -> Edit.
+        assert 'class="camera-open-link"' in html
+        assert html.count(f'hx-get="/cameras/{cid}/edit-form"') == 2
+
+    def test_viewer_row_is_not_clickable(self, viewer_client: TestClient) -> None:
+        _seed_camera(name="vcam2", geo_source=None)
+        html = viewer_client.get("/cameras").text
+        assert "vcam2" in html
+        assert "camera-row-clickable" not in html
+        assert "camera-open-link" not in html
+        assert "edit-form" not in html

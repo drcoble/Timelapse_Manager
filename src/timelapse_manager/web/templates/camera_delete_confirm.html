@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Delete camera — {{ camera.name }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}Delete camera{% endblock %}
+
+{% block breadcrumb %}
+  <a href="/cameras" style="color:var(--color-text-muted);text-decoration:none;">Cameras</a>
+  <span style="color:var(--color-text-dim);">/</span>
+  <span class="ctx-current">Delete</span>
+{% endblock %}
+
+{# The no-JavaScript confirmation step for deleting a camera (#123). With
+   JavaScript the row's hx-confirm asks instead; this page is only reached when
+   the row's form submits without it. #}
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Delete camera</h1>
+  </div>
+</div>
+
+<div class="card" style="max-width:560px;">
+  <div class="card-body" style="padding:var(--sp-6);">
+    <p>
+      Delete camera &ldquo;{{ camera.name }}&rdquo; ({{ camera.address }})?
+      This cannot be undone.
+    </p>
+    <form method="post" action="/cameras/{{ camera.id }}/delete"
+          style="display:flex;gap:var(--sp-3);align-items:center;">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-danger">Yes, delete</button>
+      <a href="/cameras" class="btn btn-ghost">Cancel</a>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

@@ -114,17 +114,22 @@ def test_daemon_starts_and_serves_healthz_and_api() -> None:
                 f"Server at {healthz_url} did not become ready within 30 s"
             )
 
-            # --- /healthz must return 5-field body ---
+            # --- /healthz over loopback returns the full readiness body ---
             r = httpx.get(healthz_url, timeout=5.0)
             assert r.status_code == 200
             body = r.json()
             assert set(body.keys()) == {
+                "status",
                 "app_version",
                 "ffmpeg_version",
                 "ffmpeg_path",
                 "db_status",
                 "alembic_revision",
+                "components",
+                "checks",
             }
+            # The literal tlm-upgrade.sh matches, on the raw text.
+            assert f'"app_version":"{body["app_version"]}"' in r.text
             assert isinstance(body["app_version"], str) and body["app_version"]
             assert isinstance(body["ffmpeg_version"], str) and body["ffmpeg_version"]
             assert isinstance(body["ffmpeg_path"], str) and body["ffmpeg_path"]

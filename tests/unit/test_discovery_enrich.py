@@ -3,10 +3,10 @@
 Covers:
 - ``OnvifAdapter.resolve_uris`` returns both URIs on success, ``(None, None)``
   when both resolvers fail (without raising), and a partial pair when one fails.
-- ``resolve_discovered_uris`` enriches an ONVIF camera with the supplied
-  credentials, leaves a non-ONVIF camera untouched, skips a camera whose address
-  is denied by the SSRF guard, isolates a per-camera failure/timeout, passes the
-  credentials through to the adapter, and never overwrites an already-set URI.
+- ``resolve_discovered_uris`` enriches an ONVIF camera, leaves a non-ONVIF
+  camera untouched, skips a camera whose address is denied by the SSRF guard,
+  isolates a per-camera failure/timeout, builds the adapter with **no**
+  credentials (#67-S3, CAM-S4), and never overwrites an already-set URI.
 
 No real network sockets are opened; the SOAP resolvers and the adapter are
 mocked throughout.
@@ -126,22 +126,22 @@ class TestResolveUris:
 
 
 class TestResolveDiscoveredUris:
-    async def test_enriches_onvif_with_supplied_credentials(self) -> None:
+    async def test_enriches_onvif_without_credentials(self) -> None:
         camera = _onvif()
         client = AsyncMock()
         resolve = AsyncMock(
             return_value=("http://192.0.2.10/snap.jpg", "rtsp://192.0.2.10/s")
         )
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "resolve_uris", resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            result = await resolve_discovered_uris([camera], ("joe", "secret"), client)
+            result = await resolve_discovered_uris([camera], client)
         assert result[0].snapshot_uri == "http://192.0.2.10/snap.jpg"
         assert result[0].stream_uri == "rtsp://192.0.2.10/s"
 
-    async def test_credentials_reach_the_adapter(self) -> None:
+    async def test_no_credentials_reach_the_adapter(self) -> None:
         camera = _onvif()
         client = AsyncMock()
         captured: dict[str, object] = {}
@@ -153,15 +153,17 @@ class TestResolveDiscoveredUris:
             original_init(self, *args, **kwargs)  # type: ignore[arg-type]
 
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "__init__", _spy_init),
             patch.object(
                 OnvifAdapter, "resolve_uris", AsyncMock(return_value=(None, None))
             ),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            await resolve_discovered_uris([camera], ("joe", "secret"), client)
-        assert captured["credentials"] == ("joe", "secret")
+            await resolve_discovered_uris([camera], client)
+        # Enrichment sends no login at all (#67-S3, CAM-S4).
+        assert "credentials" in captured
+        assert captured["credentials"] is None
 
     async def test_non_onvif_camera_left_untouched(self) -> None:
         camera = DiscoveredCamera(
@@ -175,11 +177,11 @@ class TestResolveDiscoveredUris:
         client = AsyncMock()
         resolve = AsyncMock(return_value=("http://x/snap", "rtsp://x/s"))
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "resolve_uris", resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            result = await resolve_discovered_uris([camera], ("joe", "pw"), client)
+            result = await resolve_discovered_uris([camera], client)
         assert result[0].snapshot_uri is None
         assert result[0].stream_uri is None
         resolve.assert_not_called()
@@ -190,13 +192,13 @@ class TestResolveDiscoveredUris:
         resolve = AsyncMock(return_value=("http://x/snap", "rtsp://x/s"))
         with (
             patch(
-                f"{_ENRICH}.resolve_camera_host",
+                f"{_ENRICH}.resolve_camera_host_async",
                 side_effect=SsrfError("address denied"),
             ),
             patch.object(OnvifAdapter, "resolve_uris", resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            result = await resolve_discovered_uris([camera], ("joe", "pw"), client)
+            result = await resolve_discovered_uris([camera], client)
         assert result[0].snapshot_uri is None
         assert result[0].stream_uri is None
         # A denied address never builds an adapter or resolves anything.
@@ -216,11 +218,11 @@ class TestResolveDiscoveredUris:
 
         client = AsyncMock()
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "resolve_uris", _resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            result = await resolve_discovered_uris([good, bad], ("joe", "pw"), client)
+            result = await resolve_discovered_uris([good, bad], client)
         assert result[0].snapshot_uri == "http://192.0.2.40/snap.jpg"
         # The failing camera is returned unchanged.
         assert result[1].snapshot_uri is None
@@ -231,11 +233,11 @@ class TestResolveDiscoveredUris:
         client = AsyncMock()
         resolve = AsyncMock(return_value=("http://device/other.jpg", "rtsp://device/s"))
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "resolve_uris", resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            result = await resolve_discovered_uris([camera], ("joe", "pw"), client)
+            result = await resolve_discovered_uris([camera], client)
         # The pre-set snapshot is preserved; only the None stream is filled.
         assert result[0].snapshot_uri == "http://operator/confirmed.jpg"
         assert result[0].stream_uri == "rtsp://device/s"
@@ -245,9 +247,9 @@ class TestResolveDiscoveredUris:
         client = AsyncMock()
         resolve = AsyncMock(return_value=("http://new/snap", "rtsp://new/s"))
         with (
-            patch(f"{_ENRICH}.resolve_camera_host", side_effect=lambda a: a),
+            patch(f"{_ENRICH}.resolve_camera_host_async", side_effect=lambda a: a),
             patch.object(OnvifAdapter, "resolve_uris", resolve),
             patch.object(OnvifAdapter, "close", AsyncMock()),
         ):
-            await resolve_discovered_uris([camera], ("joe", "pw"), client)
+            await resolve_discovered_uris([camera], client)
         resolve.assert_not_called()

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import struct
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -188,7 +188,9 @@ class TestJpegUpload:
                 ),
             )
 
-        ts = datetime(2026, 3, 1, 12, 0, 0, tzinfo=_UTC)
+        # Newer than the two captured frames, so it keeps the next index (an
+        # older upload is renumbered into place, #144).
+        ts = datetime.now(_UTC) + timedelta(days=1)
         frame = frame_service.upload_frame(
             migrated_factory,
             settings,
@@ -361,6 +363,31 @@ class TestInvalidUpload:
         with contextlib.suppress(InvalidImageError):
             frame_service.upload_frame(
                 migrated_factory, settings, project_id, b"garbage", None, ts, _ACTOR
+            )
+
+        with session_scope(migrated_factory) as session:
+            count = session.query(Frame).filter(Frame.project_id == project_id).count()
+        assert count == 0
+
+    def test_oversized_dimension_raises_invalid_image_error(
+        self, migrated_factory, tmp_path: Path
+    ) -> None:
+        """A header declaring a dimension above the cap is refused at ingest."""
+        settings = _make_settings(tmp_path)
+        cap = settings.capture.max_image_dimension_px
+        ctx = _seed_project(migrated_factory, tmp_path, "up-oversize-dim")
+        project_id = ctx["project_id"]
+        ts = datetime(2026, 3, 1, 10, 0, 0, tzinfo=_UTC)
+
+        with pytest.raises(InvalidImageError, match="dimensions|maximum"):
+            frame_service.upload_frame(
+                migrated_factory,
+                settings,
+                project_id,
+                make_png(cap + 1, 100),
+                None,
+                ts,
+                _ACTOR,
             )
 
         with session_scope(migrated_factory) as session:

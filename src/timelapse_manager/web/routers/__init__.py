@@ -43,6 +43,7 @@ from . import (
     notifications,
     projects,
     renders,
+    reports,
     settings,
     users,
 )
@@ -66,6 +67,7 @@ for _module in (
     milestones,
     projects,
     settings,
+    reports,
     account,
     users,
     events,

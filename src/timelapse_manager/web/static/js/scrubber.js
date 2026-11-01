@@ -60,6 +60,16 @@
     return new Date(epochSeconds * 1000).toISOString();
   }
 
+  // The same minute in the viewer's zone (timezone.js), the zone the tiles show
+  // and the server reads a naive date-jump value in (#70 F-R5). Display and
+  // pre-fill only: the in_range descriptor below stays UTC (isoFull).
+  function localMinute(epochSeconds) {
+    if (typeof window.tlmLocalInputValue === "function") {
+      return window.tlmLocalInputValue(epochSeconds);
+    }
+    return isoMinute(epochSeconds);
+  }
+
   // --- Viewport "you are here" rect ---------------------------------------
   function ensureRect(inner) {
     var rect = inner.querySelector(".ribbon-viewport-rect");
@@ -128,7 +138,7 @@
     var el = zoomStrip();
     if (el) {
       el.hidden = true;
-      el.innerHTML = "";
+      el.replaceChildren();
     }
     zoomWindow = null;
   }
@@ -212,7 +222,7 @@
 
   function prefillDateJump(epochSeconds) {
     var input = document.getElementById("frame-jump-at");
-    if (input) input.value = isoMinute(epochSeconds);
+    if (input) input.value = localMinute(epochSeconds);
   }
 
   function onSliderKey(e) {
@@ -350,6 +360,7 @@
     dragMoved = false;
     document.addEventListener("pointermove", onPointerMove);
     document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
   }
 
   function onPointerMove(e) {
@@ -373,9 +384,29 @@
     }
   }
 
+  // The browser took the gesture over (a touch drag became a scroll or zoom):
+  // no pointerup will follow. Abandon the drag without selecting anything, or
+  // the move/up listeners and the half-drawn span would be stranded.
+  function onPointerCancel() {
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+    document.removeEventListener("pointercancel", onPointerCancel);
+    var wrap = ribbonWrap();
+    if (wrap) {
+      var tip = wrap.querySelector(".scrubber-tooltip");
+      if (tip) tip.hidden = true;
+    }
+    if (dragMoved) clearDragSpan();
+    dragStartX = null;
+    dragStartEpoch = null;
+    dragCurrentEpoch = null;
+    dragMoved = false;
+  }
+
   function onPointerUp() {
     document.removeEventListener("pointermove", onPointerMove);
     document.removeEventListener("pointerup", onPointerUp);
+    document.removeEventListener("pointercancel", onPointerCancel);
     var wrap = ribbonWrap();
     if (wrap) {
       var tip = wrap.querySelector(".scrubber-tooltip");
@@ -397,15 +428,10 @@
   }
 
   // --- Span -> descriptor --------------------------------------------------
-  function csrfToken() {
-    var meta = document.querySelector('meta[name="csrf-token"]');
-    return meta ? meta.getAttribute("content") : "";
-  }
-
   function rangeLabel(fromEpoch, toEpoch) {
-    // Compact "YYYY-MM-DD HH:MM – YYYY-MM-DD HH:MM" (UTC), the same axis the
-    // ribbon and date-jump use.
-    return isoMinute(fromEpoch).replace("T", " ") + " – " + isoMinute(toEpoch).replace("T", " ");
+    // Compact "YYYY-MM-DD HH:MM – YYYY-MM-DD HH:MM" in the viewer's zone, the
+    // same zone the tiles and the date-jump use.
+    return localMinute(fromEpoch).replace("T", " ") + " – " + localMinute(toEpoch).replace("T", " ");
   }
 
   // Build the in_range descriptor for the dragged span and POST it to
@@ -427,22 +453,17 @@
     };
     var label = rangeLabel(lo, hi);
     if (typeof htmx === "undefined" || !window.frameSelection) return;
-    fetch("/frames/range/count", {
+    // net.js: the CSRF token from the meta tag, an error toast on failure, and
+    // the newest drag wins -- an older count still in flight is aborted, so its
+    // stale estimate can never land after this one.
+    var pending = window.tlmRequest("range-count", {
+      url: "/frames/range/count",
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-CSRF-Token": csrfToken(),
-        "HX-Request": "true",
-      },
-      body:
-        "descriptor=" +
-        encodeURIComponent(JSON.stringify(descriptor)) +
-        "&csrf_token=" +
-        encodeURIComponent(csrfToken()),
-    })
-      .then(function (r) {
-        return r.ok ? r.json() : null;
-      })
+      body: { descriptor: JSON.stringify(descriptor) },
+      supersede: true,
+    });
+    if (!pending) return;
+    pending
       .then(function (data) {
         var count = data && typeof data.count === "number" ? data.count : null;
         if (count === null) return;

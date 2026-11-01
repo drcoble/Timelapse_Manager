@@ -8,9 +8,20 @@
   never include credentials in the address string passed to templates.
   Geolocation is optional; may be None/null.
 #}
-<tr id="camera-row-{{ camera.id }}">
+{# An operator's row opens the edit form on a click anywhere (row-click.js);
+   the name is the real control behind that click, so Tab and Enter work too
+   and the row click is only an enhancement. A viewer cannot open the form, so
+   the row is not clickable and the name stays plain text (#302). #}
+<tr id="camera-row-{{ camera.id }}"{% if can_operate %} class="camera-row-clickable"{% endif %}>
   <td>
+    {% if can_operate %}
+    <button type="button" class="camera-open-link"
+            hx-get="/cameras/{{ camera.id }}/edit-form"
+            hx-target="#camera-row-{{ camera.id }}"
+            hx-swap="outerHTML">{{ camera.name }}</button>
+    {% else %}
     <div style="font-weight:500;">{{ camera.name }}</div>
+    {% endif %}
   </td>
   <td>
     <span class="status-badge" style="font-size:0.7rem;background:var(--color-surface-2);color:var(--color-text-muted);border-color:var(--color-border);">
@@ -49,20 +60,26 @@
                 hx-target="#camera-row-{{ camera.id }}"
                 hx-swap="outerHTML">Edit</button>
 
+        {# A probe waits on the camera, so it gets the same 45 s as Poll camera
+           instead of the global 30 s (#98). #}
         <form method="post" action="/cameras/{{ camera.id }}/validate" style="margin:0;"
               hx-post="/cameras/{{ camera.id }}/validate"
+              hx-request='{"timeout":45000}'
               hx-target="#camera-test-result-{{ camera.id }}"
               hx-swap="innerHTML">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" role="menuitem">Test connection</button>
         </form>
 
-        <form method="post" action="/cameras/{{ camera.id }}" style="margin:0;"
+        {# With JavaScript, htmx asks (hx-confirm) and sends DELETE /cameras/{id}
+           with the X-CSRF-Token header. Without it the form submits as a GET to
+           the confirmation page, whose button posts to /cameras/{id}/delete
+           (#70 F-R9, #123). No token rides in the GET query string. #}
+        <form method="get" action="/cameras/{{ camera.id }}/delete-confirm" style="margin:0;"
               hx-delete="/cameras/{{ camera.id }}"
               hx-target="#camera-row-{{ camera.id }}"
               hx-swap="outerHTML"
               hx-confirm="Delete camera '{{ camera.name }}'? This cannot be undone.">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" role="menuitem" class="danger">Delete</button>
         </form>
       </div>

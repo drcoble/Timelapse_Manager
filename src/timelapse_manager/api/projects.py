@@ -16,15 +16,15 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..capture.schedule import parse_schedule
-from ..db.models import Camera, Project
-from ..db.session import get_session
+from ..db.models import Project
+from ..db.session import DbSessionDep
 from ..runtime import get_context
-from ..security import require_operator_or_admin_principal
-from ..storage.projects import delete_project_with_files
+from ..security import Principal, require_operator_or_admin_principal
+from ..services import projects as project_service
+from ..services._base import Actor, run_effects
+from ..services.projects import ProjectSpec
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -211,129 +211,6 @@ def _get_project_or_404(session: Session, project_id: int) -> Project:
     return project
 
 
-def _require_capture_camera(session: Session, camera_id: int) -> Camera:
-    """Return a camera that exists (404) and carries a protocol (422)."""
-    camera = session.get(Camera, camera_id)
-    if camera is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"camera {camera_id} not found",
-        )
-    if camera.protocol is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="the selected camera has no protocol configured",
-        )
-    return camera
-
-
-def _require_unique_name(
-    session: Session, name: str, *, exclude_id: int | None = None
-) -> None:
-    """Raise a 409 if another project already uses ``name``.
-
-    ``exclude_id`` skips the project being edited so saving an unchanged name is
-    not mistaken for a duplicate. This is a friendly pre-check; the UNIQUE
-    constraint plus the caller's flush is the authoritative guard against a
-    concurrent insert.
-    """
-    stmt = select(Project.id).where(Project.name == name)
-    if exclude_id is not None:
-        stmt = stmt.where(Project.id != exclude_id)
-    if session.execute(stmt).scalar_one_or_none() is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"a project named {name!r} already exists",
-        )
-
-
-def _validate_schedule(field: str, schedule: dict[str, Any] | None) -> None:
-    """Reject a schedule that is enabled but has no positive interval.
-
-    A ``None`` schedule (clearing it off), one with ``enabled`` falsy/absent, or
-    one missing ``interval_seconds`` while disabled is allowed -- the scheduler
-    reads all of those as "off". Only an *enabled* schedule must carry a positive
-    numeric ``interval_seconds``. Extra keys (e.g. ``output_settings``) are left
-    untouched.
-    """
-    if schedule is None:
-        return
-    if not schedule.get("enabled", False):
-        return
-    raw = schedule.get("interval_seconds")
-    try:
-        interval = float(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        interval = 0.0
-    if interval <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                f"{field}: an enabled schedule requires a positive interval_seconds"
-            ),
-        )
-
-
-def _validate_capture_schedule(schedule: dict[str, Any] | None) -> None:
-    """Reject a malformed capture-gating schedule with a clear 422.
-
-    Unlike the render/archive schedules, a capture schedule carries no
-    ``interval_seconds`` -- it only *gates* when capture is allowed (wall-clock
-    windows, weekdays, campaign bounds and an optional sun-relative window). A
-    ``None`` schedule clears it off (an always-open gate) and is accepted. Any
-    present schedule is validated by parsing it; a malformed field raises
-    ``ValueError`` naming the offending key, which is surfaced verbatim as a 422.
-    """
-    if schedule is None:
-        return
-    try:
-        parse_schedule(schedule)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"schedule: {exc}",
-        ) from exc
-
-
-def _validate_post_render_actions(actions: Any) -> None:
-    """Reject a post-render action list that is not a well-formed list of types.
-
-    A ``None`` value (clearing the actions off) is allowed. Otherwise the value
-    must be a ``list`` and each element must be a ``dict`` carrying a non-empty
-    string ``type``. Per-action keys are deliberately *not* validated here: the
-    dispatcher logs and ignores unknown types and each handler validates its own
-    keys when the action actually runs.
-    """
-    if actions is None:
-        return
-    if not isinstance(actions, list):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="post_render_actions must be a list of action objects",
-        )
-    for index, action in enumerate(actions):
-        if not isinstance(action, dict):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=(f"post_render_actions[{index}] must be an object with a type"),
-            )
-        action_type = action.get("type")
-        if not isinstance(action_type, str) or not action_type.strip():
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=(
-                    f"post_render_actions[{index}] requires a non-empty string type"
-                ),
-            )
-
-
-def _notify_reconcile() -> None:
-    """Wake the capture supervisor, if one is running, to converge to the DB."""
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
-
-
 @router.post(
     "",
     response_model=ProjectOut,
@@ -342,7 +219,8 @@ def _notify_reconcile() -> None:
 )
 def create_project(
     payload: ProjectCreate,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ProjectOut:
     """Create a project and start capturing it live.
 
@@ -351,72 +229,27 @@ def create_project(
     and the running capture supervisor is notified so capture begins without a
     restart.
     """
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="name is required",
-        )
-
-    camera = session.get(Camera, payload.camera_id)
-    if camera is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"camera {payload.camera_id} not found",
-        )
-    if camera.protocol is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="the selected camera has no protocol configured",
-        )
-
-    # Validate any capture-gating schedule before touching the session, so a
-    # malformed schedule is a clean 422 and never autoflushes a half-built row.
-    _validate_capture_schedule(payload.schedule)
-
-    existing = session.execute(
-        select(Project.id).where(Project.name == name)
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"a project named {name!r} already exists",
-        )
-
-    project = Project(
+    spec = ProjectSpec(
+        name=payload.name,
         camera_id=payload.camera_id,
-        name=name,
         capture_interval_seconds=payload.capture_interval_seconds,
         start_date=payload.start_date,
         end_date=payload.end_date,
         max_frame_count=payload.max_frame_count,
         schedule=payload.schedule,
-        lifecycle_state="active",
     )
-    session.add(project)
-    try:
-        session.flush()
-    except IntegrityError as exc:
-        # Lost the uniqueness race against a concurrent create.
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"a project named {name!r} already exists",
-        ) from exc
-
-    out = _to_out(project, session)
-    # Commit before notifying: the supervisor reconciles in a fresh session on
-    # another thread and would not see an uncommitted row.
+    result = project_service.create_project(session, Actor.of(principal), spec)
+    out = _to_out(result.value, session)
+    # Commit before running effects: the supervisor reconciles in a fresh session
+    # on another thread and would not see an uncommitted row.
     session.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
+    run_effects(result.effects, get_context())
     return out
 
 
 @router.get("", response_model=list[ProjectOut])
 def list_projects(
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
 ) -> list[ProjectOut]:
     """List every project with its current status, ordered by id.
 
@@ -430,7 +263,7 @@ def list_projects(
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(
     project_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
 ) -> ProjectOut:
     """Return a single project's full status."""
     project = _get_project_or_404(session, project_id)
@@ -445,7 +278,8 @@ def get_project(
 def update_project(
     project_id: int,
     payload: ProjectUpdate,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ProjectOut:
     """Apply a partial edit to a project and reconcile its live capture.
 
@@ -455,44 +289,14 @@ def update_project(
     and the running supervisor is notified so an interval/camera/storage change
     takes effect without a restart.
     """
-    project = _get_project_or_404(session, project_id)
     fields = payload.model_dump(exclude_unset=True)
-
-    if "name" in fields:
-        name = fields["name"].strip()
-        if not name:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="name is required",
-            )
-        _require_unique_name(session, name, exclude_id=project_id)
-        fields["name"] = name
-    if "camera_id" in fields:
-        _require_capture_camera(session, fields["camera_id"])
-    if "schedule" in fields:
-        _validate_capture_schedule(fields["schedule"])
-    if "render_schedule" in fields:
-        _validate_schedule("render_schedule", fields["render_schedule"])
-    if "archive_schedule" in fields:
-        _validate_schedule("archive_schedule", fields["archive_schedule"])
-    if "post_render_actions" in fields:
-        _validate_post_render_actions(fields["post_render_actions"])
-
-    for key, value in fields.items():
-        setattr(project, key, value)
-    try:
-        session.flush()
-    except IntegrityError as exc:
-        # Lost the uniqueness race against a concurrent rename/create.
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="a project with that name already exists",
-        ) from exc
-
-    out = _to_out(project, session)
+    spec = ProjectSpec(**fields, fields_set=frozenset(fields))
+    result = project_service.update_project(
+        session, Actor.of(principal), project_id, spec, settings=get_context().settings
+    )
+    out = _to_out(result.value, session)
     session.commit()
-    _notify_reconcile()
+    run_effects(result.effects, get_context())
     return out
 
 
@@ -503,7 +307,8 @@ def update_project(
 )
 def delete_project(
     project_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> Response:
     """Delete a project, its cascaded child rows, and its on-disk files.
 
@@ -512,10 +317,11 @@ def delete_project(
     missing project is a ``404``. The supervisor is notified so it stops the
     project's capture loop promptly.
     """
-    project = _get_project_or_404(session, project_id)
-    delete_project_with_files(session, get_context().settings, project)
+    result = project_service.delete_project(
+        session, Actor.of(principal), project_id, settings=get_context().settings
+    )
     session.commit()
-    _notify_reconcile()
+    run_effects(result.effects, get_context())
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -528,7 +334,8 @@ def delete_project(
 def clone_project(
     project_id: int,
     payload: ProjectClone,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ProjectOut:
     """Create a new active project copying a source's capture configuration.
 
@@ -537,29 +344,16 @@ def clone_project(
     (``404``). On success the clone is committed and the supervisor notified so it
     begins capturing without a restart.
     """
-    source = _get_project_or_404(session, project_id)
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="name is required",
-        )
-    _require_unique_name(session, name)
-
-    clone = _clone_from(source, name)
-    session.add(clone)
-    try:
-        session.flush()
-    except IntegrityError as exc:
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"a project named {name!r} already exists",
-        ) from exc
-
-    out = _to_out(clone, session)
+    result = project_service.clone_project(
+        session,
+        Actor.of(principal),
+        project_id,
+        name=payload.name,
+        settings=get_context().settings,
+    )
+    out = _to_out(result.value, session)
     session.commit()
-    _notify_reconcile()
+    run_effects(result.effects, get_context())
     return out
 
 
@@ -570,7 +364,8 @@ def clone_project(
 )
 def pause_project(
     project_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ProjectOut:
     """Pause a project's capture, stopping just that project's loop.
 
@@ -579,11 +374,10 @@ def pause_project(
     process restart. Idempotent: pausing an already-paused project simply leaves
     it paused. A missing project is a ``404``.
     """
-    project = _get_project_or_404(session, project_id)
-    project.lifecycle_state = "paused"
-    out = _to_out(project, session)
+    result = project_service.pause_project(session, Actor.of(principal), project_id)
+    out = _to_out(result.value, session)
     session.commit()
-    _notify_reconcile()
+    run_effects(result.effects, get_context())
     return out
 
 
@@ -594,7 +388,8 @@ def pause_project(
 )
 def resume_project(
     project_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
+    principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ProjectOut:
     """Resume a paused project's capture, relaunching just that project's loop.
 
@@ -605,41 +400,8 @@ def resume_project(
     paused project this sets it ``active`` and wakes the supervisor so its capture
     task is relaunched without a restart. A missing project is a ``404``.
     """
-    project = _get_project_or_404(session, project_id)
-    if project.lifecycle_state != "paused":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"project {project_id} is not paused",
-        )
-    project.lifecycle_state = "active"
-    out = _to_out(project, session)
+    result = project_service.resume_project(session, Actor.of(principal), project_id)
+    out = _to_out(result.value, session)
     session.commit()
-    _notify_reconcile()
+    run_effects(result.effects, get_context())
     return out
-
-
-def _clone_from(source: Project, name: str) -> Project:
-    """Build a new active project copying ``source``'s capture configuration.
-
-    Copies the capture/render/archive configuration, the campaign bounds (start
-    date, end date, frame cap) and the storage path but nothing
-    project-instance-specific: the clone starts ``active`` with a zero frame
-    count and no frames or renders of its own. (Copying a past end date means the
-    clone archives itself on the next reconcile, which is the intended literal
-    copy of the source's configuration.)
-    """
-    return Project(
-        camera_id=source.camera_id,
-        name=name,
-        capture_interval_seconds=source.capture_interval_seconds,
-        start_date=source.start_date,
-        end_date=source.end_date,
-        max_frame_count=source.max_frame_count,
-        schedule=source.schedule,
-        render_schedule=source.render_schedule,
-        archive_schedule=source.archive_schedule,
-        post_render_actions=source.post_render_actions,
-        storage_path=source.storage_path,
-        lifecycle_state="active",
-        frame_count=0,
-    )

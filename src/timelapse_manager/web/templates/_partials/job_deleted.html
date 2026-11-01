@@ -1,0 +1,12 @@
+{#
+  Partial: job_deleted.html — the HTMX answer to a render/export delete.
+
+  Out-of-band only (the form posts with hx-swap="none"): removes the list row
+  (row_id, when the delete succeeded) on whichever screen the dialog was opened
+  from, and appends a toast to the page's #toast-region. On success the route
+  also sends HX-Trigger: modal:close so the dialog closes.
+
+  Context: msg — {type, message}; row_id — str | None.
+#}
+{% if row_id %}<div id="{{ row_id }}" hx-swap-oob="delete"></div>{% endif %}
+<div hx-swap-oob="beforeend:#toast-region">{% include '_partials/toast.html' %}</div>

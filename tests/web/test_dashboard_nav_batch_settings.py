@@ -163,6 +163,7 @@ def test_settings_tab_dom_order(admin_client: TestClient) -> None:
         "tab-ldap",
         "tab-notifications",
         "tab-credentials",
+        "tab-reports",
     ], targets
     # The panels are rendered in the same order so the no-JS document flow and
     # the tablist agree.
@@ -172,6 +173,7 @@ def test_settings_tab_dom_order(admin_client: TestClient) -> None:
         "tab-ldap",
         "tab-notifications",
         "tab-credentials",
+        "tab-reports",
     }
     panel_order = [
         m for m in re.findall(r'id="(tab-[a-z]+)"', html) if m in expected_tabs
@@ -182,4 +184,5 @@ def test_settings_tab_dom_order(admin_client: TestClient) -> None:
         "tab-ldap",
         "tab-notifications",
         "tab-credentials",
+        "tab-reports",
     ], panel_order

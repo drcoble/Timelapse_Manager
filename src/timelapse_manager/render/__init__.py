@@ -14,6 +14,7 @@ application lifespan calls on shutdown.
 
 from __future__ import annotations
 
+from .fps_suggest import FpsSuggestion, suggest_for_project, suggest_fps
 from .queue import Clock, RenderQueue
 from .scheduler import RenderScheduler
 from .settings import (
@@ -26,6 +27,7 @@ from .spec import SpecBuildError, build_render_spec, project_render_root
 
 __all__ = [
     "Clock",
+    "FpsSuggestion",
     "RenderQueue",
     "RenderScheduler",
     "SpecBuildError",
@@ -35,4 +37,6 @@ __all__ = [
     "output_settings_from_schedule",
     "project_render_root",
     "render_settings_view",
+    "suggest_for_project",
+    "suggest_fps",
 ]

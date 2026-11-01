@@ -235,29 +235,29 @@ class TestWindowClosedBlocksRetry:
     def test_closed_gate_waits_even_with_past_retry_at(self) -> None:
         now = datetime(2026, 6, 1, 12, 0, tzinfo=_UTC)
         # Retry is due (in the past), but gate is closed
-        past_retry = now - timedelta(seconds=10)
         decision = _plan_next(
             now,
             is_open=False,
             next_change=now + timedelta(hours=4),
             interval=60.0,
             max_idle_sleep=300.0,
-            last_capture=None,
-            next_retry_at=past_retry,
+            now_mono=500.0,
+            next_due_mono=None,
+            next_retry_mono=490.0,
         )
         assert decision.action == "wait"
 
     def test_open_gate_with_past_retry_at_captures(self) -> None:
         now = datetime(2026, 6, 1, 12, 0, tzinfo=_UTC)
-        past_retry = now - timedelta(seconds=10)
         decision = _plan_next(
             now,
             is_open=True,
             next_change=None,
             interval=60.0,
             max_idle_sleep=300.0,
-            last_capture=None,
-            next_retry_at=past_retry,
+            now_mono=500.0,
+            next_due_mono=None,
+            next_retry_mono=490.0,
         )
         assert decision.action == "capture"
 

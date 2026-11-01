@@ -32,6 +32,10 @@ _EXPECTED_TABLES = frozenset(
         "camera_default_credentials",
         "ssrf_settings",
         "exact_time_fire",
+        "login_attempt",
+        "report",
+        "notification_cursor",
+        "secrets_meta",
     }
 )
 

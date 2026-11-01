@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{#
+  job_card_page.html — a render or export card as a page: the no-JavaScript
+  fallback (and a card link opened in a new tab). The dialog loads the same
+  fragment (card_template) via HTMX instead.
+#}
+{% block title %}{{ 'Export' if card.kind == 'export' else 'Render' }} #{{ card.id }} — Timelapse Manager{% endblock %}
+{% block page_title_short %}{{ 'Export' if card.kind == 'export' else 'Render' }} #{{ card.id }}{% endblock %}
+
+{% block content %}
+<div class="card job-card-page">
+  {% include card_template %}
+</div>
+{% endblock %}

@@ -9,13 +9,22 @@
 }
 
 .project-card {
+  /* Containing block for the stretched name link below (#23). */
+  position: relative;
+  cursor: pointer;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  transition: border-color var(--transition-mid);
+  transition: border-color var(--transition-mid), box-shadow var(--transition-mid);
 }
-.project-card:hover { border-color: var(--color-border-2); }
+/* Hover/focus must stay above the .status-* rules: equal specificity, so a
+   later border-color would wipe the status accent on the left border. */
+.project-card:hover,
+.project-card:focus-within {
+  border-color: var(--color-border-2);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
 .project-card.status-running { border-left: 3px solid var(--color-running); }
 .project-card.status-paused  { border-left: 3px solid var(--color-paused); }
 .project-card.status-stopped { border-left: 3px solid var(--color-stopped); }
@@ -50,6 +59,42 @@
   margin-bottom: 2px;
 }
 
+/* Stretched link (#23): the name link's ::after covers the whole card, so a
+   click anywhere opens the project with one tab stop per card and no JS (it
+   survives the dashboard's 30 s HTMX swap). Nothing between the link and
+   .project-card may be positioned, or the overlay shrinks to that box; the
+   name's overflow:hidden does not clip it because .project-card-name is not
+   the containing block. */
+.project-card-link {
+  color: inherit;
+  text-decoration: none;
+}
+.project-card-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.project-card:hover .project-card-link { text-decoration: underline; }
+/* The focus ring is drawn on the overlay so it outlines the whole card. */
+.project-card-link:focus-visible { outline: none; }
+.project-card-link:focus-visible::after {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+/* Raised above the overlay so they keep their own behaviour: the action forms
+   act instead of navigating, and the Overdue badge keeps its title tooltip.
+   Only the forms are raised, not the footer, so the footer's empty space
+   still opens the project. The card's time ribbon is display-only (h=20 is
+   not the interactive variant) and deliberately stays under the overlay. */
+.project-card-footer form,
+.project-card-overdue {
+  position: relative;
+  z-index: 1;
+}
+.project-card-overdue { cursor: help; }
+
 .project-card-camera {
   font-size: 0.75rem;
   color: var(--color-text-muted);
@@ -65,6 +110,9 @@
   border-bottom: 1px solid var(--color-border);
   gap: var(--sp-3);
 }
+/* No footer (viewer, archived): the stats end the card, so drop the divider
+   that would otherwise double up with the card's own bottom border. */
+.project-card-stats:last-child { border-bottom: none; }
 
 .stat-cell {
   display: flex;
@@ -154,6 +202,18 @@
   text-decoration: none;
 }
 .projects-table .project-cell-name a:hover { text-decoration: underline; }
+/* Clickable project row (#317): the whole row follows the name link
+   (row-click.js). Hover tint and a focus ring on the name keep it discoverable. */
+.projects-table tbody tr.project-row-clickable { cursor: pointer; }
+.projects-table tbody tr.project-row-clickable:hover td,
+.projects-table tbody tr.project-row-clickable:focus-within td {
+  background: var(--color-surface-2);
+}
+.projects-table .project-cell-name a:focus-visible {
+  outline: 2px solid var(--color-accent, currentColor);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 .projects-table .project-cell-camera { color: var(--color-text-muted); }
 .projects-table .project-cell-empty {
   color: var(--color-text-muted);
@@ -175,7 +235,7 @@
 }
 
 /* Hide the lower-priority columns on narrow screens so the essentials
-   (Name · Camera · Status · Actions) stay readable without horizontal scroll. */
+   (Name · Camera · Status) stay readable without horizontal scroll. */
 @media (max-width: 600px) {
   .projects-table .col-hide-mobile {
     display: none;

@@ -23,8 +23,10 @@ from ...monitoring import (
     get_events,
 )
 from ...monitoring.events import _levels_at_or_above
+from ...security.ldap_settings_service import load_settings as load_ldap_settings
 from .. import dependencies as deps
 from ..dependencies import (
+    ADMIN_ROLE,
     AdminUser,
     CurrentUser,
     DbDep,
@@ -57,6 +59,41 @@ _AUDIT_EVENT_TYPES = (
     EventType.AUDIT_CONTROL_ACTION.value,
     EventType.SECURITY_AUTH_EVENT.value,
 )
+
+
+# Upper bound on the length of a message-search term. A term longer than this is
+# silently truncated (matching the router's other degrade-silently input
+# handling, e.g. a malformed ``?at=`` is ignored) so an over-long query cannot be
+# used to drive an unbounded scan.
+_MAX_SEARCH_LEN = 200
+
+
+def _normalize_q(q: str | None) -> str | None:
+    """Strip, length-cap, and reduce a raw search term to ``None`` if empty.
+
+    Whitespace is trimmed, the term is capped at :data:`_MAX_SEARCH_LEN` chars,
+    and a blank/whitespace-only term collapses to ``None`` (no filter applied).
+    This is the single normalization point for every route's ``?q=``; escaping of
+    LIKE metacharacters happens separately at the query site (see
+    :func:`_escape_like`).
+    """
+    if not q:
+        return None
+    trimmed = q.strip()[:_MAX_SEARCH_LEN]
+    return trimmed or None
+
+
+def _escape_like(term: str) -> str:
+    """Escape LIKE wildcards so a user term matches literally, not as a pattern.
+
+    ``%`` and ``_`` are SQL ``LIKE`` metacharacters and the backslash is the
+    escape character chosen for our ``ilike``/``like`` calls; all three are
+    backslash-escaped here. Every ``.ilike(...)``/``.like(...)`` built from user
+    input must pair this helper with ``escape="\\"`` so these escapes are
+    honoured. Without it a user-supplied ``%`` or ``_`` would act as a wildcard --
+    an unbounded full-table scan and injected pattern semantics.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @dataclass(frozen=True)
@@ -176,7 +213,7 @@ def _operational_events_keyset(
     if levels:
         query = query.filter(Event.level.in_(levels))
     if q:
-        query = query.filter(Event.message.ilike(f"%{q}%"))
+        query = query.filter(Event.message.ilike(f"%{_escape_like(q)}%", escape="\\"))
     if before_id is not None:
         query = query.filter(Event.id < before_id)
     return query.order_by(Event.id.desc()).limit(max(1, limit)).all()
@@ -226,7 +263,7 @@ def _audit_events_keyset(
     type_expr = func.json_extract(Event.event_metadata, "$.type")
     query = db.query(Event).filter(type_expr.in_(_AUDIT_EVENT_TYPES))
     if q:
-        query = query.filter(Event.message.ilike(f"%{q}%"))
+        query = query.filter(Event.message.ilike(f"%{_escape_like(q)}%", escape="\\"))
     if before_id is not None:
         query = query.filter(Event.id < before_id)
     return query.order_by(Event.id.desc()).limit(max(1, limit)).all()
@@ -253,19 +290,24 @@ def _audit_filter_qs(q: str | None) -> str:
     return urlencode({"q": q}) if q else ""
 
 
-def _parse_at(at: str | None) -> datetime.datetime | None:
+def _parse_at(at: str | None, viewer_tz: str | None) -> datetime.datetime | None:
     """Parse the ``?at=`` ISO-8601 jump anchor, or ``None`` if absent/invalid.
 
     Accepts the ``datetime-local`` form the jump form submits (no offset) as well
-    as a full offset-aware ISO string. A malformed value is ignored rather than
-    erroring, so a hand-edited URL degrades to the plain newest-first first page.
+    as a full offset-aware ISO string. A naive value is wall-clock time in the
+    viewer's zone ``viewer_tz`` (UTC when unset), the zone every timestamp on the
+    page is shown in (#70 F-R5); an offset-aware value (a link shared between
+    users) keeps its own offset. The result is aware UTC. A malformed value is
+    ignored rather than erroring, so a hand-edited URL degrades to the plain
+    newest-first first page.
     """
     if not at:
         return None
     try:
-        return datetime.datetime.fromisoformat(at)
+        parsed = datetime.datetime.fromisoformat(at)
     except ValueError:
         return None
+    return deps.viewer_local_to_utc(parsed, viewer_tz)
 
 
 def _to_naive_utc(value: datetime.datetime) -> datetime.datetime:
@@ -339,7 +381,7 @@ def events_batch(
     the start of the log. All active filters ride the sentinel's cursor URL.
     """
     levels = _parse_levels(level)
-    qval = (q or "").strip() or None
+    qval = _normalize_q(q)
     scopeval = (scope or "").strip() or None
     events, next_before = _events_batch(
         db, before_id=before, levels=levels, q=qval, scope=scopeval
@@ -384,12 +426,12 @@ def events_page(
     its continuation; ``at`` itself is single-shot (not carried by the sentinel).
     """
     levels = _parse_levels(level)
-    qval = (q or "").strip() or None
+    qval = _normalize_q(q)
     scopeval = (scope or "").strip() or None
 
     events: list[_EventView]
     next_before: int | None
-    anchor = _parse_at(at)
+    anchor = _parse_at(at, user.viewer_timezone)
     if anchor is not None:
         before_at = _before_id_at_or_before(db, anchor)
         if before_at is None:
@@ -464,7 +506,7 @@ def _count_operational_events_newer_than(
     if levels:
         query = query.filter(Event.level.in_(levels))
     if q:
-        query = query.filter(Event.message.ilike(f"%{q}%"))
+        query = query.filter(Event.message.ilike(f"%{_escape_like(q)}%", escape="\\"))
     return int(query.scalar() or 0)
 
 
@@ -485,7 +527,7 @@ def events_since(
     actually appear in the current view. A cheap COUNT only; no rows are returned.
     """
     levels = _parse_levels(level)
-    qval = (q or "").strip() or None
+    qval = _normalize_q(q)
     scopeval = (scope or "").strip() or None
     count = _count_operational_events_newer_than(
         db, after_id=after, levels=levels, q=qval, scope=scopeval
@@ -510,7 +552,7 @@ def audit_batch(
     ``hx-trigger="revealed"`` that swaps itself for the next (older) batch, with
     the active search filter riding its cursor URL.
     """
-    qval = (q or "").strip() or None
+    qval = _normalize_q(q)
     events, next_before = _audit_batch(db, before_id=before, q=qval)
     return templates.TemplateResponse(
         request,
@@ -542,7 +584,7 @@ def audit_events_page(
     (keyset by id); ``?before=`` is the no-JS pagination fallback and ``?q=``
     filters by message text.
     """
-    qval = (q or "").strip() or None
+    qval = _normalize_q(q)
     events, next_before = _audit_batch(db, before_id=before, q=qval)
     return templates.TemplateResponse(
         request,
@@ -568,6 +610,11 @@ def partial_status(request: Request, db: DbDep, user: CurrentUser) -> Response:
     fragment rather than failing the page. This is why the banner is a lazy
     partial and not a synchronous query in the base template -- a monitoring
     query hiccup must never 500 every authenticated page.
+
+    An administrator also sees a warning while directory authentication is
+    enabled with the TLS mode ``none`` (#67 S9): the service-account password and
+    every user's password then cross the network in clear text. No other role
+    sees it, and it is not rendered for anyone when LDAP is off or encrypted.
     """
     try:
         recent, total = get_events(db, level_floor="error", limit=1, offset=0)
@@ -581,6 +628,27 @@ def partial_status(request: Request, db: DbDep, user: CurrentUser) -> Response:
         request,
         "_partials/status_banner.html",
         deps.base_context(
-            request, db, user, error_count=error_count, latest_error=latest
+            request,
+            db,
+            user,
+            error_count=error_count,
+            latest_error=latest,
+            ldap_plaintext_warning=_ldap_plaintext_warning(db, user),
         ),
     )
+
+
+def _ldap_plaintext_warning(db: DbSession, user: object) -> bool:
+    """Return whether the admin banner for plaintext LDAP should show.
+
+    Failure-isolated like the rest of the banner: any error reads as "no
+    warning" so the banner can never fail a page.
+    """
+    if getattr(user, "role", None) != ADMIN_ROLE:
+        return False
+    try:
+        view = load_ldap_settings(db)
+    except Exception:  # noqa: BLE001 - the banner must never fail the page
+        logger.exception("status banner LDAP check failed")
+        return False
+    return view.enabled and view.tls_mode == "none"

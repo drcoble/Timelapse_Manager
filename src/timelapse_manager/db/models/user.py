@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Enum, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, Enum, Index, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
+from ...usernames import username_key
 from .base import Base, TimestampMixin
 
 _auth_source_enum = Enum(
@@ -32,9 +33,18 @@ class User(TimestampMixin, Base):
     """
 
     __tablename__ = "user"
+    # AUTOINCREMENT (migration 031, #17): a deleted user's id is never reused,
+    # so a new user does not inherit the old one's references.
+    __table_args__ = (
+        Index("ix_user_username_key", "username_key", unique=True),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    # Case-insensitive identity (#4): stripped, NFKC, casefolded ``username``,
+    # unique, maintained by :meth:`_sync_username_key`. Look users up by this.
+    username_key: Mapped[str] = mapped_column(String, nullable=False)
     auth_source: Mapped[str] = mapped_column(
         _auth_source_enum, nullable=False, default="local"
     )
@@ -48,3 +58,9 @@ class User(TimestampMixin, Base):
         String, nullable=False, default="system"
     )
     viewer_timezone: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    @validates("username")
+    def _sync_username_key(self, _key: str, value: str) -> str:
+        """Keep ``username_key`` in step with every assignment to ``username``."""
+        self.username_key = username_key(value)
+        return value

@@ -1,12 +1,16 @@
 """Web tests for the compact projects management table.
 
 The projects list is a scannable table (Name / Camera / Status / Frames /
-Interval / Actions) with an Open link per row, an archived-projects disclosure,
-and an empty state that opens the New Project drawer.
+Interval) whose name is a real link and whose whole row follows it, with an
+archived-projects disclosure and an empty state that opens the New Project
+drawer.
 """
 
 from __future__ import annotations
 
+import re
+
+import pytest
 from fastapi.testclient import TestClient
 
 from timelapse_manager.db.models import Camera, Project
@@ -44,24 +48,32 @@ def _seed_project(
         return proj.id
 
 
-def test_projects_table_renders_six_columns(admin_client: TestClient) -> None:
-    """The list renders a table with the six management columns."""
+def test_projects_table_renders_five_columns(admin_client: TestClient) -> None:
+    """The list renders the five columns and no Actions column (#317)."""
     cam = _seed_camera(name="table-cam")
     _seed_project(name="Rooftop", camera_id=cam, interval=60)
     html = admin_client.get("/projects").text
     assert '<table class="data-table projects-table">' in html
-    for header in ("Name", "Camera", "Status", "Frames", "Interval", "Actions"):
+    for header in ("Name", "Camera", "Status", "Frames", "Interval"):
         assert f">{header}</th>" in html
+    assert ">Actions</th>" not in html
+    assert "project-cell-actions" not in html
 
 
-def test_projects_table_has_open_link_per_project(admin_client: TestClient) -> None:
-    """Each project row carries an Open link to its detail page."""
+def test_projects_table_name_is_a_link_and_rows_are_clickable(
+    admin_client: TestClient,
+) -> None:
+    """The name is a real link to the project; row-click.js is on the page (#317)."""
     cam = _seed_camera(name="open-cam")
     pid = _seed_project(name="Garden", camera_id=cam)
     html = admin_client.get("/projects").text
     assert "Garden" in html
     assert f'href="/projects/{pid}"' in html
-    assert ">Open</a>" in html
+    assert f'class="project-open-link" href="/projects/{pid}">Garden</a>' in html
+    assert ">Open</a>" not in html
+    assert 'class="project-row-clickable"' in html
+    assert 'data-row-click=".project-open-link"' in html
+    assert "js/row-click.js" in html
 
 
 def test_projects_table_shows_archived_disclosure(admin_client: TestClient) -> None:
@@ -85,6 +97,39 @@ def test_projects_table_interval_column_handles_no_interval(
     _seed_project(name="Unset", camera_id=cam, interval=0)
     html = admin_client.get("/projects").text
     assert "Unset" in html
+    assert _interval_cell(html) == "\u2014"
+
+
+def _interval_cell(html: str) -> str:
+    """Return the text of the first Interval cell in the page."""
+    match = re.search(
+        r'<td class="project-cell-interval[^"]*">\s*(.*?)\s*</td>', html, re.S
+    )
+    assert match is not None
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "shown"),
+    [(30, "30s"), (900, "15m"), (7200, "2h"), (5400, "90m"), (86400, "1d")],
+)
+def test_projects_table_interval_is_shown_compactly(
+    admin_client: TestClient, seconds: int, shown: str
+) -> None:
+    """A project with an interval shows it in the largest whole unit (#316)."""
+    cam = _seed_camera(name="interval-cam")
+    _seed_project(name="Timed", camera_id=cam, interval=seconds)
+    html = admin_client.get("/projects").text
+    assert _interval_cell(html) == shown
+
+
+def test_projects_table_archived_interval_is_shown(admin_client: TestClient) -> None:
+    """The archived table shows the interval too (#316)."""
+    cam = _seed_camera(name="arch-interval-cam")
+    _seed_project(name="Old", camera_id=cam, interval=900, lifecycle="archived")
+    html = admin_client.get("/projects").text
+    archived = html.split("projects-archived", 1)[1]
+    assert _interval_cell(archived) == "15m"
 
 
 def test_projects_empty_state_opens_new_project_drawer(

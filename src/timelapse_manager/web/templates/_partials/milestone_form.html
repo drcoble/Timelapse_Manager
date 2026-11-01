@@ -92,7 +92,7 @@
                        value="frame"
                        id="{{ uid }}-type-frame"
                        {% if _pos_type == 'frame' %}checked{% endif %}
-                       onchange="tlmMsReveal('{{ uid }}', 'frame');"
+                       data-action="ms-reveal" data-uid="{{ uid }}"
                        style="accent-color:var(--color-accent);">
                 <span style="font-weight:500;">Frame index</span>
               </label>
@@ -103,7 +103,7 @@
                        value="time"
                        id="{{ uid }}-type-time"
                        {% if _pos_type == 'time' %}checked{% endif %}
-                       onchange="tlmMsReveal('{{ uid }}', 'time');"
+                       data-action="ms-reveal" data-uid="{{ uid }}"
                        style="accent-color:var(--color-accent);">
                 <span style="font-weight:500;">Date &amp; time</span>
               </label>
@@ -132,21 +132,23 @@
           {# ── Timestamp sub-panel ────────────────────────────────────────── #}
           {#
             datetime-local value must be YYYY-MM-DDTHH:MM.
-            position_timestamp is a naive-UTC datetime; isoformat() gives the
-            correct format and the backend parses incoming values as UTC as well
-            (both ends agree on UTC, no conversion mismatch).
+            position_timestamp is a naive-UTC datetime. The prefill converts it to
+            the viewer's zone (localdt with a datetime-local format), and the
+            backend reads the submitted value in that same zone and stores naive
+            UTC, so both ends agree (#70 F-R5).
           #}
           <div id="{{ uid }}-time-panel"
                {% if _pos_type != 'time' %}hidden{% endif %}>
             <div class="form-group">
-              <label class="form-label" for="{{ uid }}-timestamp">Date &amp; time (UTC)</label>
+              <label class="form-label" for="{{ uid }}-timestamp">Date &amp; time ({{ viewer_timezone | tz_label(milestone.position_timestamp if editing and milestone.position_timestamp is not none else none) }})</label>
               <input type="datetime-local"
                      id="{{ uid }}-timestamp"
                      name="milestone_timestamp"
                      class="form-control mono"
-                     value="{{ milestone.position_timestamp.strftime('%Y-%m-%dT%H:%M') if editing and milestone.position_timestamp is not none else '' }}"
+                     value="{{ milestone.position_timestamp | localdt('%Y-%m-%dT%H:%M') if editing and milestone.position_timestamp is not none else '' }}"
+                     aria-describedby="{{ uid }}-timestamp-hint"
                      style="max-width:20rem;">
-              <span class="form-hint">Enter the capture date and time in UTC.</span>
+              <span class="form-hint" id="{{ uid }}-timestamp-hint">Enter the capture date and time in your display time zone ({{ viewer_timezone or 'UTC' }}). At a daylight-saving change, a repeated hour means its first occurrence.</span>
             </div>
           </div>
 
@@ -166,17 +168,3 @@
     </div>{# /card-body #}
   </div>{# /card #}
 </div>{# /milestone-table (shared root id) #}
-
-{# ── Inline controller: reveals frame or time sub-panel on radio change ─── #}
-<script>
-(function () {
-  function tlmMsReveal(uid, posType) {
-    var framePanel = document.getElementById(uid + '-frame-panel');
-    var timePanel  = document.getElementById(uid + '-time-panel');
-    if (framePanel) framePanel.hidden = (posType !== 'frame');
-    if (timePanel)  timePanel.hidden  = (posType !== 'time');
-  }
-  /* Expose globally so inline onchange= attributes can reach it. */
-  window.tlmMsReveal = tlmMsReveal;
-}());
-</script>

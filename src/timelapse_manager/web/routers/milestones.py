@@ -24,6 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
 from ...db.models import Milestone, Project, User
+from ...services import milestones as milestone_service
+from ...services._base import Actor
+from ...services.errors import AppError
+from ...services.milestones import MilestoneSpec
 from .. import dependencies as deps
 from ..dependencies import (
     DbDep,
@@ -32,7 +36,6 @@ from ..dependencies import (
     templates,
 )
 from ._shared import (
-    _audit,
     _get_project_or_404,
     _parse_optional_datetime,
 )
@@ -47,14 +50,21 @@ router = APIRouter()
 # generous for that while keeping the stored value sane.
 _LABEL_MAX_LENGTH = 200
 
+# The web form always submits a complete milestone (a label plus exactly one
+# chosen position, the other position field cleared), so every web spec marks all
+# three fields set -- an edit fully replaces the position rather than patching it.
+_ALL_MILESTONE_FIELDS = frozenset(
+    {"label", "position_frame_index", "position_timestamp"}
+)
+
 
 class _MilestoneView:
     """A milestone projected onto exactly the fields the templates read.
 
     The timestamp is kept as a (naive-UTC) ``datetime`` -- not a pre-formatted
-    string -- so the template can run it through the ``localdt`` filter for
-    display and ``.isoformat()`` for a ``datetime-local`` edit prefill. A
-    pre-stringified value would break both.
+    string -- so the template can run it through the ``localdt`` filter both for
+    display and, with a ``datetime-local`` format, for the edit prefill in the
+    viewer's zone. A pre-stringified value would break both.
     """
 
     __slots__ = ("id", "label", "position_frame_index", "position_timestamp")
@@ -147,12 +157,15 @@ def _get_milestone_or_404(
 
 
 def _parse_milestone_form(
-    form: dict[str, str],
+    form: dict[str, str], viewer_tz: str | None
 ) -> tuple[str | None, int | None, datetime.datetime | None, str | None]:
     """Validate the milestone form, returning ``(label, frame_index, ts, error)``.
 
     On success ``error`` is ``None`` and exactly one of ``frame_index`` /
-    ``ts`` (a naive-UTC ``datetime``) is set, per the chosen position type. On
+    ``ts`` (a naive-UTC ``datetime``) is set, per the chosen position type. The
+    submitted date and time is read in the viewer's zone ``viewer_tz`` (UTC when
+    unset), the zone the form labels it with and prefills it in (#70 F-R5), and
+    stored as naive UTC like every other timestamp. On
     failure the first three values are unspecified and ``error`` carries a
     friendly inline message. The label is required, trimmed, and length-capped.
     A frame index of ``0`` is valid (it is the first frame), so it is range-
@@ -189,7 +202,8 @@ def _parse_milestone_form(
             return None, None, None, err
         if timestamp is None:
             return None, None, None, "Enter a date and time for this milestone."
-        return label, None, timestamp, None
+        utc = deps.viewer_local_to_utc(timestamp, viewer_tz)
+        return label, None, utc.replace(tzinfo=None), None
     return None, None, None, "Choose whether to place this milestone by frame or time."
 
 
@@ -214,27 +228,25 @@ def create_milestone(
     the refreshed table fragment is returned.
     """
     project = _get_project_or_404(db, project_id)
-    label, frame_index, timestamp, error = _parse_milestone_form(form)
+    label, frame_index, timestamp, error = _parse_milestone_form(
+        form, user.viewer_timezone
+    )
     if error is not None:
         return _form_response(request, db, user, project, milestone=None, error=error)
 
-    milestone = Milestone(
-        project_id=project_id,
-        user_id=user.id,
+    spec = MilestoneSpec(
         label=label,
         position_frame_index=frame_index,
         position_timestamp=timestamp,
+        fields_set=_ALL_MILESTONE_FIELDS,
     )
-    db.add(milestone)
-    db.flush()
-    _audit(
-        db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"milestone {milestone.id} created",
-    )
-    db.flush()
+    try:
+        milestone_service.create_milestone(db, Actor.of(user), project_id, spec)
+    except AppError as exc:
+        db.rollback()
+        return _form_response(
+            request, db, user, project, milestone=None, error=exc.detail
+        )
     return _table_response(request, db, user, project)
 
 
@@ -279,23 +291,35 @@ def edit_milestone(
     """
     project = _get_project_or_404(db, project_id)
     milestone = _get_milestone_or_404(db, project_id, milestone_id)
-    label, frame_index, timestamp, error = _parse_milestone_form(form)
+    label, frame_index, timestamp, error = _parse_milestone_form(
+        form, user.viewer_timezone
+    )
     if error is not None:
         return _form_response(
             request, db, user, project, milestone=_MilestoneView(milestone), error=error
         )
 
-    milestone.label = label
-    milestone.position_frame_index = frame_index
-    milestone.position_timestamp = timestamp
-    _audit(
-        db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"milestone {milestone_id} updated",
+    spec = MilestoneSpec(
+        label=label,
+        position_frame_index=frame_index,
+        position_timestamp=timestamp,
+        fields_set=_ALL_MILESTONE_FIELDS,
     )
-    db.flush()
+    try:
+        milestone_service.update_milestone(
+            db, Actor.of(user), project_id, milestone_id, spec
+        )
+    except AppError as exc:
+        db.rollback()
+        milestone = _get_milestone_or_404(db, project_id, milestone_id)
+        return _form_response(
+            request,
+            db,
+            user,
+            project,
+            milestone=_MilestoneView(milestone),
+            error=exc.detail,
+        )
     return _table_response(request, db, user, project)
 
 
@@ -343,14 +367,8 @@ def delete_milestone(
 ) -> Response:
     """Delete a milestone and return the refreshed table."""
     project = _get_project_or_404(db, project_id)
-    milestone = _get_milestone_or_404(db, project_id, milestone_id)
-    db.delete(milestone)
-    _audit(
-        db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"milestone {milestone_id} deleted",
-    )
-    db.flush()
+    # Resolve up front so an unknown id is a clean 404 (the service also validates
+    # it, but this preserves the existing HTTP 404 for the fragment surface).
+    _get_milestone_or_404(db, project_id, milestone_id)
+    milestone_service.delete_milestone(db, Actor.of(user), project_id, milestone_id)
     return _table_response(request, db, user, project)

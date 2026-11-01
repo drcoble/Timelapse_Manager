@@ -3,7 +3,7 @@
 Covers the pure math (average-size fallback vs derivation, finite vs open-ended
 projection, the frame-cap bound, degenerate inputs) and the database-aware
 wrapper over a real migrated project (zero-frames default, with-frames average,
-open-ended sentinel, frames-remaining floor).
+open-ended sentinel, frames-remaining floor, anchor-only campaigns, #22).
 
 Fixtures local to this file by design, so this suite does not edit the shared
 conftest.
@@ -57,9 +57,9 @@ class TestAverageFrameSize:
 
 class TestEstimateProjectStorage:
     def test_finite_duration_projects_finite_values(self) -> None:
-        # 1 day / 60s interval = 1440 frames; * 1000 bytes each.
+        # 1 day at 1440 captures/day = 1440 frames; * 1000 bytes each.
         frames, total = estimate_project_storage(
-            interval_seconds=60,
+            captures_per_day=1440,
             duration_seconds=_DAY,
             average_frame_size_bytes=1000,
         )
@@ -67,24 +67,30 @@ class TestEstimateProjectStorage:
         assert total == 1_440_000
 
     def test_open_ended_duration_returns_sentinel(self) -> None:
-        assert estimate_project_storage(60, None, 1000) == (None, None)
+        assert estimate_project_storage(1440, None, 1000) == (None, None)
 
-    def test_missing_interval_returns_sentinel(self) -> None:
+    def test_no_planned_captures_returns_sentinel(self) -> None:
         assert estimate_project_storage(None, _DAY, 1000) == (None, None)
 
-    def test_non_positive_interval_returns_sentinel(self) -> None:
+    def test_non_positive_rate_returns_sentinel(self) -> None:
         assert estimate_project_storage(0, _DAY, 1000) == (None, None)
+
+    def test_fractional_rate_projects_over_the_duration(self) -> None:
+        # One anchor a day over a 10-day campaign -> 10 frames.
+        frames, total = estimate_project_storage(1.0, 10 * _DAY, 1000)
+        assert frames == 10
+        assert total == 10_000
 
     def test_negative_duration_floors_to_zero(self) -> None:
         # An end already in the past must not project a negative frame count.
-        frames, total = estimate_project_storage(60, -_DAY, 1000)
+        frames, total = estimate_project_storage(1440, -_DAY, 1000)
         assert frames == 0
         assert total == 0
 
     def test_frame_cap_bounds_the_projection(self) -> None:
         # Duration alone would yield 1440 frames; the cap of 100 wins.
         frames, total = estimate_project_storage(
-            interval_seconds=60,
+            captures_per_day=1440,
             duration_seconds=_DAY,
             average_frame_size_bytes=1000,
             max_frame_count=100,
@@ -95,7 +101,7 @@ class TestEstimateProjectStorage:
     def test_frame_cap_above_duration_does_not_raise_projection(self) -> None:
         # A cap larger than the duration-based count leaves the projection alone.
         frames, _ = estimate_project_storage(
-            interval_seconds=60,
+            captures_per_day=1440,
             duration_seconds=_DAY,
             average_frame_size_bytes=1000,
             max_frame_count=100_000,
@@ -210,6 +216,53 @@ class TestEstimateForProject:
             total, remaining = estimate_for_project(session, session.get(Project, pid))
         assert total == 100 * DEFAULT_AVERAGE_FRAME_SIZE_BYTES
         assert remaining == 100
+
+    def test_anchor_only_projects_one_frame_per_day(self, migrated_factory) -> None:  # type: ignore[no-untyped-def]
+        # #22: no interval, one daily 12:00 anchor over a 10-day campaign.
+        start = datetime(2026, 7, 1, 0, 0)
+        pid = _seed_project(
+            migrated_factory,
+            name="anchor-only",
+            interval=None,
+            start_date=start,
+            end_date=start + timedelta(days=10),
+        )
+        with session_scope(migrated_factory) as session:
+            project = session.get(Project, pid)
+            assert project is not None
+            project.exact_time_anchors = [
+                {"id": "a", "kind": "clock", "time": "12:00", "enabled": True}
+            ]
+        with session_scope(migrated_factory) as session:
+            total, remaining = estimate_for_project(session, session.get(Project, pid))
+        assert total == 10 * DEFAULT_AVERAGE_FRAME_SIZE_BYTES
+        assert remaining == 10
+
+    def test_nothing_planned_returns_sentinel(self, migrated_factory) -> None:  # type: ignore[no-untyped-def]
+        # No interval and no anchor: nothing to project, even with an end date.
+        start = datetime(2026, 7, 1, 0, 0)
+        pid = _seed_project(
+            migrated_factory,
+            name="nothing-planned",
+            interval=None,
+            start_date=start,
+            end_date=start + timedelta(days=1),
+        )
+        with session_scope(migrated_factory) as session:
+            result = estimate_for_project(session, session.get(Project, pid))
+        assert result == (None, None)
+
+    def test_campaign_already_ended_projects_zero(self, migrated_factory) -> None:  # type: ignore[no-untyped-def]
+        # An end in the past with no start: zero frames, not "cannot project".
+        pid = _seed_project(
+            migrated_factory,
+            name="ended",
+            interval=60,
+            end_date=datetime(2020, 1, 1, 0, 0),
+        )
+        with session_scope(migrated_factory) as session:
+            total, remaining = estimate_for_project(session, session.get(Project, pid))
+        assert (total, remaining) == (0, 0)
 
     def test_frames_remaining_floors_at_zero(self, migrated_factory) -> None:  # type: ignore[no-untyped-def]
         # Already captured more than the projection allows -> remaining floors at 0.

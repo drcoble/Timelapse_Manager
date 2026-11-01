@@ -16,11 +16,10 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
-from ..db.session import get_session
+from ..db.session import DbSessionDep
 from ..monitoring import (
     ALERT_LEVEL_THRESHOLD,
     ActiveAlert,
@@ -76,10 +75,10 @@ def _alert_out(alert: ActiveAlert) -> AlertOut:
 
 @router.get("", response_model=AlertListOut)
 def list_alerts(
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     scope: str | None = None,
     scope_id: int | None = None,
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: int = 0,
 ) -> AlertListOut:
     """List the active alerts (newest first) with the total active count.
@@ -101,7 +100,7 @@ def list_alerts(
 @router.post("/{alert_id}/clear", response_model=ClearResult)
 def clear_one_alert(
     alert_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ClearResult:
     """Clear one active alert by event id, attributed to the principal.
@@ -122,7 +121,7 @@ def clear_one_alert(
     status_code=status.HTTP_200_OK,
 )
 def clear_all(
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> ClearResult:
     """Clear every active alert, attributed to the principal.

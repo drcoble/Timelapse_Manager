@@ -47,10 +47,22 @@ class TestRenderComboCheck:
         )
         assert resp.status_code == 200
         # VP9+MKV is a valid (muxable) combination, so there is no incompatibility
-        # warning. It is not browser-streamable, however, so the download-only
-        # info notice is expected.
+        # warning. It is not H.264/MP4, however, so the "plays only in browsers
+        # that support VP9" info notice is expected.
         assert 'class="alert warning"' not in resp.text
-        assert "Download only" in resp.text
+        assert "Plays only in browsers that support VP9 in MKV" in resp.text
+
+    def test_webm_advisory_uses_the_viewer_facing_container_name(
+        self, admin_client: TestClient
+    ) -> None:
+        # Same "<codec> in <container>" wording as the can't-play note (#36).
+        resp = admin_client.get(
+            "/renders/combo-check",
+            params={"render_encoder": "libvpx-vp9", "render_container": "webm"},
+        )
+        assert resp.status_code == 200
+        assert "Plays only in browsers that support VP9 in WebM;" in resp.text
+        assert "WEBM" not in resp.text
 
     def test_requires_authentication(self, web_client: TestClient) -> None:
         # Anonymous request is redirected to login (operator gate), never 200.

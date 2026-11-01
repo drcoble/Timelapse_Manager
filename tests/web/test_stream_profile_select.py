@@ -72,13 +72,14 @@ def _stub_adapter(result: StreamProfileResult) -> MagicMock:
 def _patches(result: StreamProfileResult):
     """Patch the SSRF guard (allow) and build_adapter to return a stub.
 
-    ``build_adapter``/``resolve_camera_host`` are imported inside the route at
-    call time, so they are patched at their source module.
+    ``build_adapter`` is imported inside the route at call time, so it is
+    patched at its source module; the probe's SSRF guard is the async
+    ``_resolve_camera_host_async`` in ``_shared`` (#66 N2).
     """
     return (
         patch(
-            "timelapse_manager.cameras.resolve_camera_host",
-            side_effect=lambda a: a,
+            "timelapse_manager.web.routers._shared._resolve_camera_host_async",
+            new=AsyncMock(return_value=None),
         ),
         patch(
             "timelapse_manager.cameras.build_adapter",

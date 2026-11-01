@@ -281,3 +281,19 @@ uv run pre-commit install
 The hooks defined in `.pre-commit-config.yaml` run ruff (lint + format) and mypy
 on every `git commit`. They mirror the CI gates so failures surface locally
 before they reach the remote.
+
+---
+
+## Feature requests
+
+Feature requests are issues on the project's GitHub issue tracker. Describe the
+problem, the outcome you want, who is affected, the area of the app, any
+constraints and how you would know it works, so a request can be evaluated
+without a long back-and-forth.
+Something broken rather than missing goes through **Report a problem** in the
+app instead (see [docs/operations/problem-reports.md](docs/operations/problem-reports.md)).
+
+A maintainer evaluates each request against those points: is the problem clear,
+is the outcome testable, and does it fit the project's constraints (Raspberry Pi,
+offline use, no new runtime dependency, LDAP and security impact)? Questions are
+asked as issue comments.

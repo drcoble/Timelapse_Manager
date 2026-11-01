@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of
-from timelapse_manager.db.models import Camera
+from timelapse_manager.db.models import Camera, CameraDefaultCredentials
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
 from timelapse_manager.security.crypto import decrypt_credentials, is_encrypted
@@ -78,6 +78,17 @@ class TestCameraAddForm:
         assert resp.status_code == 403
 
 
+def _enable_defaults() -> None:
+    """Usable default credentials, so the form renders the inherit checkbox (#318)."""
+    with session_scope(get_context().session_factory) as db:
+        row = db.get(CameraDefaultCredentials, 1)
+        if row is None:
+            row = CameraDefaultCredentials(id=1)
+            db.add(row)
+        row.enabled = True
+        row.username = "shared-user"
+
+
 class TestCameraFormLayout:
     """The form is address-first with an Advanced disclosure for rare fields."""
 
@@ -134,6 +145,7 @@ class TestCameraFormLayout:
         assert 'name="geo_source"' in advanced
 
     def test_add_form_keeps_every_field_name(self, admin_client: TestClient) -> None:
+        _enable_defaults()
         text = admin_client.get("/cameras/add-form").text
         for field in self._FIELD_NAMES:
             assert f'name="{field}"' in text, f"missing field name: {field}"
@@ -141,6 +153,7 @@ class TestCameraFormLayout:
     def test_inherit_default_checkbox_pre_checked(
         self, admin_client: TestClient
     ) -> None:
+        _enable_defaults()
         text = admin_client.get("/cameras/add-form").text
         import re
 
@@ -476,360 +489,17 @@ class TestCameraDetectProtocol:
         assert 'hx-post="/cameras/query"' in resp.text
         assert 'id="camera-query-results"' in resp.text
 
-    def test_multi_candidate_fragment_renders_indicator_and_recommended(
-        self, admin_client: TestClient
-    ) -> None:
-        csrf = csrf_of(admin_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=_detection_outcome()),
-            ),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        text = resp.text
-        # The ">1 detected" indicator banner.
-        assert "2 protocols detected" in text
-        # Both responders rendered as radios; the misses are not selectable.
-        assert 'value="vapix"' in text
-        assert 'value="onvif"' in text
-        # The recommended primary is the pre-selected radio.
-        import re
+    def test_detect_protocol_form_route_is_gone(self, admin_client: TestClient) -> None:
+        """#227: nothing in the UI reached the HTML detect route, so it was removed.
 
-        recommended = re.search(r'<input[^>]*value="vapix"[^>]*>', text, re.DOTALL)
-        assert recommended is not None
-        assert "checked" in recommended.group(0)
-
-    def test_detect_blocks_denied_address_without_probing(
-        self, admin_client: TestClient
-    ) -> None:
-        csrf = csrf_of(admin_client, "/cameras")
-        with patch("timelapse_manager.cameras.detect_protocols") as mock_detect:
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _METADATA_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        # Fragment swaps on 200; the error is rendered, and no probe ran.
-        assert resp.status_code == 200
-        assert "rejected" in resp.text.lower()
-        mock_detect.assert_not_called()
-
-    def test_detect_forbidden_for_viewer(self, viewer_client: TestClient) -> None:
-        csrf = csrf_of(viewer_client, "/cameras")
-        resp = viewer_client.post(
-            "/cameras/detect-protocol",
-            data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            follow_redirects=False,
-        )
-        assert resp.status_code == 403
-
-    def test_detect_fragment_never_echoes_credentials(
-        self, admin_client: TestClient
-    ) -> None:
-        csrf = csrf_of(admin_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=_detection_outcome()),
-            ),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={
-                    "address": _ALLOWED_ADDRESS,
-                    "username": "joe",
-                    "password": "sup3r-secret",
-                    "csrf_token": csrf,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        assert "sup3r-secret" not in resp.text
-
-    def test_blank_credentials_substitute_saved_default(
-        self, admin_client: TestClient
-    ) -> None:
-        """Blank form creds → the saved global default reaches detect_protocols."""
-        from timelapse_manager.db.session import session_scope
-        from timelapse_manager.runtime import get_context
-        from timelapse_manager.security.camera_defaults_service import (
-            CameraDefaultsUpdate,
-            update_settings,
-        )
-
-        ctx = get_context()
-        with session_scope(ctx.session_factory) as db:
-            update_settings(
-                db,
-                CameraDefaultsUpdate(
-                    enabled=True, username="default-joe", password="default-pass"
-                ),
-            )
-
-        csrf = csrf_of(admin_client, "/cameras")
-        mock_detect = AsyncMock(return_value=_detection_outcome())
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch("timelapse_manager.cameras.detect_protocols", mock_detect),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        assert mock_detect.await_args.args[1] == ("default-joe", "default-pass")
-
-    def test_detect_allowed_for_operator(self, operator_client: TestClient) -> None:
-        """Operator role (not just admin) must be permitted to use detect."""
-        csrf = csrf_of(operator_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=_detection_outcome()),
-            ),
-        ):
-            resp = operator_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-
-    def test_supplied_credentials_reach_detect_protocols(
-        self, admin_client: TestClient
-    ) -> None:
-        """When form supplies username+password, that pair reaches detect_protocols.
-
-        Distinct from the blank-creds test: this proves the supplied pair is NOT
-        replaced by the default when credentials are explicitly given.
+        The camera form's only probe action is Query camera; the JSON API's
+        ``/api/v1/cameras/detect-protocol`` is a separate, kept endpoint.
         """
-        csrf = csrf_of(admin_client, "/cameras")
-        mock_detect = AsyncMock(return_value=_detection_outcome())
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch("timelapse_manager.cameras.detect_protocols", mock_detect),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={
-                    "address": _ALLOWED_ADDRESS,
-                    "username": "form-user",
-                    "password": "form-pass",
-                    "csrf_token": csrf,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        # The credentials passed to detect_protocols must be exactly what the form
-        # supplied -- not the saved default.
-        assert mock_detect.called
-        passed_credentials = mock_detect.await_args.args[1]
-        assert passed_credentials == ("form-user", "form-pass")
-
-    def test_single_candidate_fragment_shows_one_detected_not_banner(
-        self, admin_client: TestClient
-    ) -> None:
-        """Exactly one responder renders '1 protocol detected', not the >1 banner."""
-        from timelapse_manager.cameras.probing import (
-            Confidence,
-            DetectionOutcome,
-            ProtocolCandidate,
-        )
-
-        single_outcome = DetectionOutcome(
-            candidates=[
-                ProtocolCandidate(
-                    protocol="vapix",
-                    ok=True,
-                    snapshot_uri="http://192.168.1.50/axis-cgi/jpg/image.cgi",
-                    confidence=Confidence.HIGH,
-                    detail="Axis VAPIX snapshot CGI responded with an image.",
-                ),
-                ProtocolCandidate(
-                    protocol="onvif", ok=False, confidence=Confidence.HIGH, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="rtsp", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="http", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-            ],
-            recommended_primary="vapix",
-        )
-        csrf = csrf_of(admin_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=single_outcome),
-            ),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        text = resp.text
-        # Single-responder message; NOT the multi-responder banner.
-        assert "1 protocol detected" in text
-        assert "2 protocols detected" not in text
-        # The single ok candidate is rendered as a checked radio.
-        assert 'value="vapix"' in text
-        assert "checked" in text
-        # The non-ok candidates must not appear as selectable radios.
-        assert 'value="onvif"' not in text
-
-    def test_zero_candidates_fragment_shows_nothing_detected(
-        self, admin_client: TestClient
-    ) -> None:
-        """When no protocol responds the fragment shows the 'nothing detected' state."""
-        from timelapse_manager.cameras.probing import (
-            Confidence,
-            DetectionOutcome,
-            ProtocolCandidate,
-        )
-
-        zero_outcome = DetectionOutcome(
-            candidates=[
-                ProtocolCandidate(
-                    protocol="vapix", ok=False, confidence=Confidence.HIGH, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="onvif", ok=False, confidence=Confidence.HIGH, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="rtsp", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="http", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-            ],
-            recommended_primary=None,
-        )
-        csrf = csrf_of(admin_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=zero_outcome),
-            ),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        text = resp.text
-        # The "nothing responded" fallback branch must be shown.
-        assert "no protocols responded" in text.lower()
-        # No radio inputs should appear (nothing to select).
-        assert 'type="radio"' not in text
-
-    def test_detect_fragment_never_echoes_credentials_in_uri(
-        self, admin_client: TestClient
-    ) -> None:
-        """A mock outcome whose URIs contain no credentials: verify the fragment too.
-
-        The companion invariant-2 unit tests (TestNoCredentialInUri) exercise the
-        real probe helpers. This web-layer test verifies the fragment itself when
-        the mock outcome supplies clean URIs -- ensuring the template does not add
-        any credential-containing suffix and that the full rendered text contains
-        neither the username nor the password sent in the form post.
-        """
-        from timelapse_manager.cameras.probing import (
-            Confidence,
-            DetectionOutcome,
-            ProtocolCandidate,
-        )
-
-        outcome_with_uris = DetectionOutcome(
-            candidates=[
-                ProtocolCandidate(
-                    protocol="vapix",
-                    ok=True,
-                    snapshot_uri="http://192.168.1.50/axis-cgi/jpg/image.cgi",
-                    confidence=Confidence.HIGH,
-                    detail="ok",
-                ),
-                ProtocolCandidate(
-                    protocol="onvif",
-                    ok=True,
-                    snapshot_uri="http://192.168.1.50/onvif/snap",
-                    stream_uri="rtsp://192.168.1.50/onvif/stream",
-                    confidence=Confidence.HIGH,
-                    detail="ok",
-                ),
-                ProtocolCandidate(
-                    protocol="rtsp", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-                ProtocolCandidate(
-                    protocol="http", ok=False, confidence=Confidence.LOW, detail="no"
-                ),
-            ],
-            recommended_primary="vapix",
-        )
-
-        csrf = csrf_of(admin_client, "/cameras")
-        with (
-            patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
-            ),
-            patch(
-                "timelapse_manager.cameras.detect_protocols",
-                AsyncMock(return_value=outcome_with_uris),
-            ),
-        ):
-            resp = admin_client.post(
-                "/cameras/detect-protocol",
-                data={
-                    "address": _ALLOWED_ADDRESS,
-                    "username": "cam-user",
-                    "password": "cam-secret",
-                    "csrf_token": csrf,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        assert resp.status_code == 200
-        text = resp.text
-        # Neither credential must appear anywhere in the rendered fragment.
-        assert "cam-secret" not in text
-        assert "cam-user" not in text
+        form = admin_client.get("/cameras/add-form").text
+        assert "detect-protocol" not in form
+        assert "camera-detect-results" not in form
+        paths = {getattr(r, "path", "") for r in admin_client.app.routes}  # type: ignore[attr-defined]
+        assert "/cameras/detect-protocol" not in paths
 
 
 def _query_result(
@@ -886,8 +556,8 @@ class TestCameraQuery:
         mock_query = AsyncMock(return_value=_query_result())
         with (
             patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
             ),
             patch("timelapse_manager.cameras.autoquery.query_camera", mock_query),
         ):
@@ -918,8 +588,8 @@ class TestCameraQuery:
         )
         with (
             patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
             ),
             patch("timelapse_manager.cameras.autoquery.query_camera", mock_query),
         ):
@@ -943,8 +613,8 @@ class TestCameraQuery:
         mock_query = AsyncMock(return_value=_query_result(auth_rejected=True))
         with (
             patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
             ),
             patch("timelapse_manager.cameras.autoquery.query_camera", mock_query),
         ):
@@ -975,8 +645,8 @@ class TestCameraQuery:
         )
         with (
             patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
             ),
             patch("timelapse_manager.cameras.autoquery.query_camera", mock_query),
         ):
@@ -1007,8 +677,8 @@ class TestCameraQuery:
         mock_query = AsyncMock(return_value=_query_result())
         with (
             patch(
-                "timelapse_manager.cameras.resolve_camera_host",
-                side_effect=lambda a: a,
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
             ),
             patch("timelapse_manager.cameras.autoquery.query_camera", mock_query),
         ):
@@ -1175,7 +845,7 @@ class TestCameraDiscoverFragment:
                 new=AsyncMock(return_value=found),
             ),
             patch(
-                "timelapse_manager.cameras.discovery.resolve_camera_host",
+                "timelapse_manager.cameras.discovery.resolve_camera_host_async",
                 side_effect=lambda a: a,
             ),
             patch(
@@ -1204,7 +874,25 @@ class TestCameraDiscoverFragment:
         assert "stream: rtsp://192.168.1.50/stream" in text
 
     def test_discover_fragment_no_cameras(self, operator_client: TestClient) -> None:
-        """The empty branch still renders the 'No cameras found.' message."""
+        """An empty range scan renders the 'No cameras found.' message."""
+        csrf = csrf_of(operator_client, "/cameras")
+        with patch(
+            "timelapse_manager.cameras.scan_range",
+            new=AsyncMock(return_value=[]),
+        ):
+            resp = operator_client.post(
+                "/cameras/discover",
+                data={"csrf_token": csrf, "scan_range": "192.168.1.0/24"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        assert resp.status_code == 200
+        assert "No cameras found." in resp.text
+        assert "routed VLANs" not in resp.text
+
+    def test_empty_multicast_explains_it_does_not_cross_vlans(
+        self, operator_client: TestClient
+    ) -> None:
+        """An empty multicast result says why, and points at a range scan."""
         csrf = csrf_of(operator_client, "/cameras")
         with patch(
             "timelapse_manager.cameras.discover_onvif",
@@ -1216,7 +904,8 @@ class TestCameraDiscoverFragment:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         assert resp.status_code == 200
-        assert "No cameras found." in resp.text
+        assert "does not cross routed VLANs" in resp.text
+        assert "Scan a range instead" in resp.text
 
     def test_blank_range_triggers_multicast_and_keeps_enrichment(
         self, operator_client: TestClient
@@ -1241,7 +930,7 @@ class TestCameraDiscoverFragment:
             patch("timelapse_manager.cameras.discover_onvif", new=multicast),
             patch("timelapse_manager.cameras.scan_range", new=scan),
             patch(
-                "timelapse_manager.cameras.discovery.resolve_camera_host",
+                "timelapse_manager.cameras.discovery.resolve_camera_host_async",
                 side_effect=lambda a: a,
             ),
             patch(
@@ -1294,7 +983,7 @@ class TestCameraDiscoverFragment:
             patch("timelapse_manager.cameras.scan_range", new=scan),
             patch("timelapse_manager.cameras.discover_onvif", new=multicast),
             patch(
-                "timelapse_manager.cameras.discovery.resolve_camera_host",
+                "timelapse_manager.cameras.discovery.resolve_camera_host_async",
                 side_effect=lambda a: a,
             ),
             patch(
@@ -1399,3 +1088,95 @@ class TestCameraUriPersistence:
             ).scalar_one()
             assert cam.snapshot_uri == "http://192.168.1.50/snap.jpg"
             assert cam.stream_uri == "rtsp://192.168.1.50/stream"
+
+
+class TestProbeRoutesUseProbeClient:
+    """Operator probes borrow the probe pool, never the capture pool (#69 CAM-P2)."""
+
+    def test_validate_builds_the_adapter_on_the_probe_client(
+        self, admin_client: TestClient
+    ) -> None:
+        from timelapse_manager.cameras.base import ValidationResult
+
+        supervisor = get_context().capture_supervisor
+        assert supervisor is not None
+        camera_id = _seed_camera(name="probe-pool-cam")
+        adapter = AsyncMock()
+        adapter.validate_connection.return_value = ValidationResult(
+            ok=True, reason=None, message="ok"
+        )
+        build = patch("timelapse_manager.cameras.build_adapter", return_value=adapter)
+        csrf = csrf_of(admin_client, "/cameras")
+        with (
+            patch(
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
+            ),
+            build as mock_build,
+        ):
+            resp = admin_client.post(
+                f"/cameras/{camera_id}/validate",
+                data={"csrf_token": csrf},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        assert resp.status_code == 200
+        client = mock_build.call_args.args[1]
+        assert client is supervisor.client_for("probe")
+        assert client is not supervisor.http_client
+
+
+class TestCameraProbeBounds:
+    """Detect, query and validate are bounded and time out inline (#69 CAM-P5).
+
+    A wedged probe used to surface as a 500 (detect's ``wait_for`` timeout was
+    not caught) or hang the request (query and validate had no outer bound).
+    Each now renders an inline notice at 200, so HTMX swaps it in.
+    """
+
+    @staticmethod
+    async def _hang(*_args: object, **_kwargs: object) -> None:
+        import asyncio
+
+        await asyncio.sleep(3600)
+
+    def test_query_timeout_renders_inline(self, admin_client: TestClient) -> None:
+        csrf = csrf_of(admin_client, "/cameras")
+        with (
+            patch(
+                "timelapse_manager.web.routers.cameras._resolve_camera_host_async",
+                AsyncMock(return_value=None),
+            ),
+            patch("timelapse_manager.web.routers.cameras._QUERY_TIMEOUT_SECONDS", 0.1),
+            patch("timelapse_manager.cameras.autoquery.query_camera", self._hang),
+        ):
+            resp = admin_client.post(
+                "/cameras/query",
+                data={"address": _ALLOWED_ADDRESS, "csrf_token": csrf},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        assert resp.status_code == 200
+        assert "camera query timed out" in resp.text
+
+    def test_validate_timeout_renders_inline(self, admin_client: TestClient) -> None:
+        from unittest.mock import MagicMock
+
+        camera_id = _seed_camera(name="slow-validate")
+        csrf = csrf_of(admin_client, "/cameras")
+        adapter = MagicMock()
+        adapter.validate_connection = self._hang
+        adapter.close = AsyncMock()
+        with (
+            patch(
+                "timelapse_manager.web.routers.cameras._validate_bound_seconds",
+                return_value=0.1,
+            ),
+            patch("timelapse_manager.cameras.build_adapter", return_value=adapter),
+        ):
+            resp = admin_client.post(
+                f"/cameras/{camera_id}/validate",
+                data={"csrf_token": csrf},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        assert resp.status_code == 200
+        assert "did not answer" in resp.text
+        adapter.close.assert_awaited_once()

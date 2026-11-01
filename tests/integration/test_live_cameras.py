@@ -11,6 +11,9 @@ Required environment variables:
     TLM_TEST_AXIS_PASS   — camera password
 
 Optional:
+    TLM_TEST_AXIS_ADMIN_USER  — an Administrator account on the same camera, for
+    TLM_TEST_AXIS_ADMIN_PASS    the geolocation access tests (#68); TLM_TEST_AXIS_USER
+                                must then be an operator or viewer account
     TLM_TEST_DISCOVERY_RANGE  — CIDR or dash-range to scan (e.g. "192.168.1.0/24")
     TLM_TEST_RTSP_URL         — full RTSP URL; if absent, built from host
 
@@ -31,7 +34,7 @@ import httpx
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from timelapse_manager.cameras.base import CapturedFrame
+from timelapse_manager.cameras.base import CapturedFrame, GeolocationAccessDenied
 from timelapse_manager.cameras.discovery import scan_range
 from timelapse_manager.cameras.rtsp import RtspAdapter
 from timelapse_manager.cameras.vapix import VapixAdapter
@@ -272,17 +275,53 @@ class TestLiveVapixStreamProfiles:
 
 @pytest.mark.live
 class TestLiveVapixGeolocation:
-    async def test_get_geolocation_does_not_raise(self) -> None:
+    async def test_get_geolocation_returns_or_reports_denial(self) -> None:
+        """A location, None, or a typed denial -- never any other exception."""
         host = _axis_host()
         creds = (_axis_user(), _axis_pass())
         async with httpx.AsyncClient() as client:
             adapter = VapixAdapter(client, address=host, credentials=creds)
-            geo = await adapter.get_geolocation()
+            try:
+                geo = await adapter.get_geolocation()
+            except GeolocationAccessDenied as exc:
+                # An operator/viewer account: Axis serves get.cgi to admins only.
+                assert exc.required_role == "Administrator"
+                return
         # geo may be None if the camera has no location configured — that is ok
         if geo is not None:
             assert -90 <= geo.latitude <= 90
             assert -180 <= geo.longitude <= 180
             assert geo.source == "camera"
+
+
+@pytest.mark.live
+class TestLiveVapixGeolocationAccess:
+    """Requires TLM_TEST_AXIS_USER to be a non-admin account, plus
+    TLM_TEST_AXIS_ADMIN_USER / TLM_TEST_AXIS_ADMIN_PASS (#68)."""
+
+    async def test_operator_account_is_denied(self) -> None:
+        host = _axis_host()
+        creds = (_axis_user(), _axis_pass())
+        _require_env("TLM_TEST_AXIS_ADMIN_USER")  # only meaningful alongside admin
+        async with httpx.AsyncClient() as client:
+            adapter = VapixAdapter(client, address=host, credentials=creds)
+            with pytest.raises(GeolocationAccessDenied) as excinfo:
+                await adapter.get_geolocation()
+        assert excinfo.value.status in (401, 403)
+
+    async def test_admin_account_reads_get_cgi(self) -> None:
+        host = _axis_host()
+        creds = (
+            _require_env("TLM_TEST_AXIS_ADMIN_USER"),
+            _require_env("TLM_TEST_AXIS_ADMIN_PASS"),
+        )
+        async with httpx.AsyncClient() as client:
+            adapter = VapixAdapter(client, address=host, credentials=creds)
+            geo = await adapter.read_geolocation_api()
+        # None means the camera answered 2xx but has no position configured.
+        if geo is not None:
+            assert -90 <= geo.latitude <= 90
+            assert -180 <= geo.longitude <= 180
 
 
 # ---------------------------------------------------------------------------

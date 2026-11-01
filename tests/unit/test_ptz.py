@@ -244,7 +244,7 @@ class TestVapixMoveTo:
         adapter = _vapix()
         captured: list[str] = []
 
-        async def _record(client, url, creds, timeout):  # type: ignore[no-untyped-def]
+        async def _record(client, url, creds, timeout, **_kw):  # type: ignore[no-untyped-def]
             captured.append(url)
             return b"OK"
 
@@ -255,9 +255,12 @@ class TestVapixMoveTo:
             patch(f"{_VAPIX}.asyncio.sleep", new=sleep),
         ):
             await adapter.move_to(preset_id="Position 1")
-        assert len(captured) == 1
+        # The move, then one position query (#69 CAM-R4); this fake reports no
+        # position, so the adapter falls back to the fixed settle.
+        assert len(captured) == 2
         assert PTZ_PATH in captured[0]
         assert "gotoserverpresetname=Position" in captured[0]
+        assert "query=position" in captured[1]
         # A clean success must wait the bounded settle delay exactly once.
         sleep.assert_awaited_once()
 
@@ -265,7 +268,7 @@ class TestVapixMoveTo:
         adapter = _vapix()
         captured: list[str] = []
 
-        async def _record(client, url, creds, timeout):  # type: ignore[no-untyped-def]
+        async def _record(client, url, creds, timeout, **_kw):  # type: ignore[no-untyped-def]
             captured.append(url)
             return b""
 

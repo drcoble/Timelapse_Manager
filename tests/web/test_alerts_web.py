@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from urllib.parse import quote
 
 from fastapi.testclient import TestClient
@@ -100,11 +101,19 @@ class TestAlertsSummary:
         assert "NOT-AN-ALERT" not in resp.text
 
     def test_aria_label_includes_count(self, admin_client: TestClient) -> None:
-        """The focusable indicator carries the count in its accessible label."""
+        """The toggle's accessible name carries the count (#70 F-R6).
+
+        The name comes from the visually hidden ``#alerts-count-label`` inside
+        the static toggle, which the summary replaces out of band.
+        """
         _seed_alert(level="warning", message="ALERT-ARIA")
         _seed_alert(level="warning", message="ALERT-ARIA-2")
         resp = admin_client.get("/alerts/summary", follow_redirects=False)
-        assert 'aria-label="Active alerts: 2"' in resp.text
+        assert re.search(
+            r'<span id="alerts-count-label"[^>]*hx-swap-oob="true">'
+            r"Active alerts: 2</span>",
+            resp.text,
+        )
 
 
 # ---------------------------------------------------------------------------

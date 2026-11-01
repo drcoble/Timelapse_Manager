@@ -1,0 +1,22 @@
+{#
+  Partial: ptz_preset_picker.html — the GET /cameras/ptz-presets response.
+
+  The PTZ conflict warning (#151) followed by the preset / position picker
+  (_partials/ptz_preset_select.html, whose context it passes through). Swapped
+  into a project form's #ptz-preset-container when the camera changes.
+
+  Context (beyond ptz_preset_select.html's):
+    ptz_conflicts — list of "name (position)" strings, one per other active
+                    project on the camera with a PTZ position; empty for none.
+#}
+{% if ptz_conflicts %}
+<div class="alert alert-warning" role="status" id="ptz-conflict-warning">
+  Other active projects on this camera point it at a PTZ position:
+  {{ ptz_conflicts | join(", ") }}.
+  Unless this project uses the same position, the camera moves between their
+  captures, and captures on it run one at a time, so a frame can be a few
+  seconds later than its scheduled time. With no position set, this project
+  captures wherever the camera was last pointed.
+</div>
+{% endif %}
+{% include "_partials/ptz_preset_select.html" %}

@@ -6,6 +6,7 @@ JPEGs committed under tests/fixtures/frames/ — they are decodable by ffmpeg.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -297,9 +298,18 @@ class _StubProcess:
     """
 
     returncode = 0
+    pid = 0
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return b"", b""
+    def __init__(self) -> None:
+        # The encoder reads ffmpeg's progress (stdout) and stderr pipes while it
+        # waits; the stub's pipes are already at EOF.
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        return self.returncode
 
 
 @pytest.mark.parametrize("container", ["mp4", "mkv"])

@@ -6,11 +6,15 @@ new value overwrites; webhook URLs and routing_rules round-trip.
 
 from __future__ import annotations
 
+import pytest
+
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.monitoring.settings_service import (
     MASK_SENTINEL,
+    NotificationSettingsError,
     NotificationSettingsUpdate,
     load_settings,
+    resolve_smtp_password,
     update_settings,
 )
 
@@ -176,3 +180,98 @@ class TestWebhookUrlsAndRulesRoundTrip:
             view = load_settings(session)
         assert view.smtp_server == "smtp.custom.com"
         assert view.smtp_port == 465
+
+
+class TestSmtpRetargetClearsStoredSecret:
+    """Repointing the SMTP target must not carry the old password along (#67 S9)."""
+
+    @staticmethod
+    def _stored(factory) -> str | None:
+        with session_scope(factory) as session:
+            return resolve_smtp_password(session)
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"smtp_server": "other.example.com"},
+            {"smtp_port": 25},
+            {"smtp_security": "tls"},
+            {"smtp_username": "someone-else"},
+            {"smtp_username": None},
+        ],
+    )
+    @pytest.mark.parametrize("submitted", [None, "", MASK_SENTINEL])
+    def test_retarget_with_blank_or_masked_password_clears_it(
+        self, migrated_factory, change: dict, submitted: str | None
+    ) -> None:
+        _store_with_password(migrated_factory, "old-server-password")
+        with session_scope(migrated_factory) as session:
+            view = update_settings(
+                session, _base_update(smtp_password=submitted, **change)
+            )
+        assert view.smtp_password_set is False
+        assert view.smtp_password == ""
+        assert self._stored(migrated_factory) is None
+
+    def test_retarget_with_a_new_password_stores_it(self, migrated_factory) -> None:
+        _store_with_password(migrated_factory, "old-server-password")
+        with session_scope(migrated_factory) as session:
+            update_settings(
+                session,
+                _base_update(
+                    smtp_server="other.example.com", smtp_password="new-one-1234"
+                ),
+            )
+        assert self._stored(migrated_factory) == "new-one-1234"
+
+    @pytest.mark.parametrize("submitted", [None, "", MASK_SENTINEL])
+    def test_unchanged_target_keeps_the_secret(
+        self, migrated_factory, submitted: str | None
+    ) -> None:
+        _store_with_password(migrated_factory, "kept-password")
+        with session_scope(migrated_factory) as session:
+            update_settings(
+                session,
+                _base_update(
+                    smtp_password=submitted,
+                    smtp_from_address="other-from@example.com",
+                    smtp_recipients=["a@example.com", "b@example.com"],
+                ),
+            )
+        assert self._stored(migrated_factory) == "kept-password"
+
+    def test_the_update_repr_never_shows_the_password(self) -> None:
+        assert "hunter2-secret" not in repr(
+            _base_update(smtp_password="hunter2-secret")
+        )
+
+
+class TestUnknownSecurityModeIsRejected:
+    """A typo must never become plaintext SMTP (#214)."""
+
+    @pytest.mark.parametrize("mode", ["", "TLS", "ssl", "starttls ", "off", "None"])
+    def test_unknown_mode_raises_and_writes_nothing(
+        self, migrated_factory, mode: str
+    ) -> None:
+        _store_with_password(migrated_factory, "kept-password")
+        with (
+            pytest.raises(NotificationSettingsError, match="security mode"),
+            session_scope(migrated_factory) as session,
+        ):
+            update_settings(
+                session,
+                _base_update(smtp_security=mode, smtp_server="other.example.com"),
+            )
+        with session_scope(migrated_factory) as session:
+            view = load_settings(session)
+            assert resolve_smtp_password(session) == "kept-password"
+        assert view.smtp_security == "starttls"
+        assert view.smtp_server == "mail.example.com"
+
+    @pytest.mark.parametrize("mode", ["none", "tls", "starttls"])
+    def test_known_modes_are_stored_as_submitted(
+        self, migrated_factory, mode: str
+    ) -> None:
+        with session_scope(migrated_factory) as session:
+            view = update_settings(session, _base_update(smtp_security=mode))
+        assert view.smtp_security == mode

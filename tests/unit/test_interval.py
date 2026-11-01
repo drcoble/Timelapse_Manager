@@ -11,6 +11,7 @@ import pytest
 from timelapse_manager.web.interval import (
     UNIT_FACTORS,
     decompose_seconds,
+    format_interval_compact,
     parse_interval_to_seconds,
 )
 
@@ -101,3 +102,28 @@ class TestDecomposeSeconds:
     def test_none_falls_back_to_default(self) -> None:
         # Nullable column: an unset interval must not divide by None.
         assert decompose_seconds(None) == (1, "minutes")
+
+
+class TestFormatIntervalCompact:
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (30, "30s"),
+            (90, "90s"),
+            (60, "1m"),
+            (900, "15m"),
+            (7200, "2h"),
+            (5400, "90m"),
+            (86400, "1d"),
+            (604800, "7d"),
+            (1, "1s"),
+            (3600, "1h"),
+            (129600, "36h"),
+        ],
+    )
+    def test_uses_the_largest_whole_unit(self, seconds: int, expected: str) -> None:
+        assert format_interval_compact(seconds) == expected
+
+    @pytest.mark.parametrize("seconds", [None, 0, -60])
+    def test_no_interval_is_a_dash(self, seconds: int | None) -> None:
+        assert format_interval_compact(seconds) == "\u2014"

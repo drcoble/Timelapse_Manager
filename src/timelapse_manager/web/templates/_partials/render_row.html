@@ -1,20 +1,44 @@
 {#
   Partial: render_row.html
-  Context: render — {id, kind, status, created_at, browser_streamable,
-                     download_url, stream_url}
+  Context: render — {id, kind, status, created_at, created_at_raw,
+                     browser_streamable, download_url, stream_url, card_url,
+                     project_name, playback}
            current_user — {username, role}
            csrf_token — str
 
-  Returned standalone by the render queue partial endpoint.
-  kind values: manual | scheduled | archive
-  status values: queued | running | complete | error | cancelled
+  Shared by the project Renders tab and the global Renders page.
+  kind values: manual | scheduled | archive (exports are listed on the
+               project Frames tab, see export_row.html)
+  status values: queued | running | complete | error
+
+  The "Render #N" link opens the render card in the page's job-card dialog
+  (_partials/job_card_modal.html, mounted outside any polled list). Its id is
+  stable across the Renders page's 10 s refresh, so modal.js can return focus
+  to it after the list has been re-rendered. Without JavaScript the link opens
+  the card as a page.
+  project_name is set only on the global page, where projects mix.
+
+  Play (#25): every finished render with a file has a stream_url. The page
+  asks this browser whether it can play it (_playback.html, playability.js) and
+  shows Play or a "can't play" note beside Download. Without JavaScript, Play
+  shows only for browser_streamable renders (H.264/MP4), as before.
 #}
+{% from '_partials/_playback.html' import playback_attrs, cant_play_note %}
 <div class="job-item" id="render-row-{{ render.id }}" role="row">
   <div class="job-meta">
     <div class="job-name">
       <span class="kind-badge {{ render.kind }}">{{ render.kind | capitalize }}</span>
       &nbsp;
-      Render #{{ render.id }}
+      <a href="{{ render.card_url }}"
+         id="render-open-{{ render.id }}"
+         class="job-open"
+         data-modal-open="#job-card-modal"
+         hx-get="{{ render.card_url }}"
+         hx-target="#job-card-content"
+         hx-swap="innerHTML">Render #{{ render.id }}</a>
+      {% if render.project_name %}
+        <span class="job-project">&middot; {{ render.project_name }}</span>
+      {% endif %}
     </div>
     <div class="job-detail">
       {{ render.created_at_raw | localdt if render.created_at_raw else render.created_at }}
@@ -26,28 +50,33 @@
           <span class="spinner htmx-indicator" aria-hidden="true"></span>
           Rendering&hellip;
         </span>
-        <div class="progress-bar" role="progressbar" aria-label="Render progress">
-          <div class="progress-fill" style="width:50%;"></div>
+        {# No real progress is recorded, so the bar is indeterminate (no
+           aria-valuenow) rather than a made-up percentage. #}
+        <div class="progress-bar indeterminate" role="progressbar"
+             aria-label="Render in progress">
+          <div class="progress-fill"></div>
         </div>
       {% elif render.status == 'complete' %}
         <span style="color:var(--color-running);">Complete</span>
       {% elif render.status == 'error' %}
         <span style="color:var(--color-error);">Error</span>
-      {% elif render.status == 'cancelled' %}
-        <span style="color:var(--color-stopped);">Cancelled</span>
       {% endif %}
     </div>
   </div>
 
   <div class="job-actions">
     {% if render.status == 'complete' %}
-      {% if render.browser_streamable and render.stream_url %}
-        <a href="{{ render.stream_url }}"
-           class="btn btn-ghost btn-sm"
-           target="_blank"
-           rel="noopener">
-          &#9654; Play
-        </a>
+      {% if render.stream_url and render.playback %}
+        <span class="playability" {{ playback_attrs(render.playback) }}>
+          <a href="{{ render.stream_url }}"
+             class="btn btn-ghost btn-sm"
+             target="_blank"
+             rel="noopener"
+             data-play-ok{% if not render.browser_streamable %} hidden{% endif %}>
+            &#9654; Play
+          </a>
+          {{ cant_play_note(render.playback) }}
+        </span>
       {% endif %}
       {% if render.download_url %}
         <a href="{{ render.download_url }}"

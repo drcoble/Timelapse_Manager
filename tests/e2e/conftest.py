@@ -20,6 +20,7 @@ Boot sequence
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
 import socket
@@ -33,6 +34,8 @@ from pathlib import Path
 import pytest
 from alembic import command as alembic_command
 from alembic.config import Config
+
+from tests import loop_guard_support
 
 # ---------------------------------------------------------------------------
 # Marker registration
@@ -118,6 +121,17 @@ def _seed_admin(db_url: str, data_dir: Path) -> None:
         _crypto_mod.set_key_provider(None)
 
 
+def loop_guard_args(data_dir: Path) -> list[str]:
+    """Return the server arguments that log loop-DB violations for this test.
+
+    The server writes each violation to a file under ``data_dir``; the autouse
+    guard fixture in ``tests/conftest.py`` reads it once the server has stopped.
+    """
+    log = data_dir / "loop-guard.jsonl"
+    loop_guard_support.watch_server_log(log)
+    return ["--loop-guard-log", str(log)]
+
+
 # ---------------------------------------------------------------------------
 # Browser availability gate
 #
@@ -171,13 +185,17 @@ def _chromium_page() -> Generator[object, None, None]:
 def _boot_app(
     tmp_path: Path,
     extra_seed: Callable[[str, Path], None] | None = None,
+    *,
+    server_args: list[str] | None = None,
 ) -> tuple[subprocess.Popen[bytes], str]:
     """Boot the app subprocess against a fresh seeded DB; return (proc, base_url).
 
     Seeds the initial admin, then optionally runs ``extra_seed(db_url, data_dir)``
     before the subprocess starts, so the server sees a ready DB on first
-    lifespan init. Warms /healthz then /login (45 s budget) so the first test
-    never races a not-fully-ready server. xdist-safe (per-worker tmp_path/port).
+    lifespan init. ``server_args`` are appended to the ``_serve.py`` command line
+    (e.g. ``["--idle-timeout-seconds", "8"]``). Warms /healthz then /login
+    (45 s budget) so the first test never races a not-fully-ready server.
+    xdist-safe (per-worker tmp_path/port).
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -190,6 +208,8 @@ def _boot_app(
 
     port = _free_port()
     serve_script = Path(__file__).parent / "_serve.py"
+    log_path = tmp_path / "server.log"
+    server_log = log_path.open("wb")
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -200,10 +220,17 @@ def _boot_app(
             str(data_dir),
             "--port",
             str(port),
+            *loop_guard_args(data_dir),
+            *(server_args or []),
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # A file, not a pipe: nothing reads a pipe while the test runs, so a
+        # server that logs more than the pipe buffer (64 KiB) blocked in
+        # write(), stopped serving and ignored SIGTERM, and the teardown's
+        # wait() hung the whole run (#107).
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
+    server_log.close()
 
     base_url = f"http://127.0.0.1:{port}"
     healthz_url = f"{base_url}/healthz"
@@ -226,17 +253,29 @@ def _boot_app(
         time.sleep(0.2)
 
     if not ready:
-        proc.terminate()
-        try:
-            _, err = proc.communicate(timeout=5)
-        except Exception:  # noqa: BLE001
-            err = b""
-        tail = err.decode("utf-8", "replace")[-2000:] if err else "(no stderr)"
+        stop_app(proc)
+        output = log_path.read_bytes()
+        tail = output.decode("utf-8", "replace")[-2000:] if output else "(no output)"
         raise RuntimeError(
             f"E2E app server did not become ready within 45 s on port {port}.\n"
-            f"--- server stderr tail ---\n{tail}"
+            f"--- server output tail ({log_path}) ---\n{tail}"
         )
     return proc, base_url
+
+
+def stop_app(proc: subprocess.Popen[bytes], timeout: float = 10.0) -> None:
+    """Stop an app subprocess: SIGTERM, then SIGKILL if it outlives ``timeout``.
+
+    A bare ``wait()`` after ``terminate()`` hangs forever when the server is
+    wedged, and pytest-timeout does not cover a teardown that runs after the
+    test's own timeout fired (#107).
+    """
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
 
 
 @pytest.fixture()
@@ -246,8 +285,7 @@ def live_server(tmp_path: Path) -> Generator[str, None, None]:
     try:
         yield base_url
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_app(proc)
 
 
 def _seed_demo_data(db_url: str, data_dir: Path) -> None:
@@ -303,7 +341,9 @@ def _seed_demo_data(db_url: str, data_dir: Path) -> None:
                         capture_timestamp=(
                             datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=i)
                         ).replace(tzinfo=None),
-                        file_path=f"/frames/{proj.id}/{i:08d}.jpg",
+                        # Relative, as stored for a default-layout project:
+                        # gather_frames drops paths outside the tree (#67 S16).
+                        file_path=f"{i:08d}.jpg",
                         capture_status="captured",
                         origin="captured",
                         lifecycle_state="active",
@@ -332,8 +372,7 @@ def live_server_with_data(tmp_path: Path) -> Generator[str, None, None]:
     try:
         yield base_url
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_app(proc)
 
 
 def make_frame_seeder(
@@ -390,7 +429,7 @@ def make_frame_seeder(
                             project_id=proj.id,
                             sequence_index=i,
                             capture_timestamp=ts.replace(tzinfo=None),
-                            file_path=f"/frames/{proj.id}/{i:08d}.jpg",
+                            file_path=f"{i:08d}.jpg",
                             capture_status="captured",
                             origin="captured",
                             lifecycle_state="active",
@@ -477,8 +516,7 @@ def live_server_events(tmp_path: Path) -> Generator[str, None, None]:
     try:
         yield base_url
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_app(proc)
 
 
 @pytest.fixture()
@@ -514,8 +552,7 @@ def live_server_audit(tmp_path: Path) -> Generator[str, None, None]:
     try:
         yield base_url
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_app(proc)
 
 
 @pytest.fixture()
@@ -542,8 +579,7 @@ def live_server_scroll_frames(tmp_path: Path) -> Generator[str, None, None]:
     try:
         yield base_url
     finally:
-        proc.terminate()
-        proc.wait()
+        stop_app(proc)
 
 
 @pytest.fixture()
@@ -652,3 +688,107 @@ def logged_in_data_page(
     """
     login(_chromium_page, live_server_with_data)
     return _chromium_page, live_server_with_data
+
+
+# ---------------------------------------------------------------------------
+# Extra browser contexts and security-event capture (#70 WP-70-B).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def browser_context_factory(
+    _chromium_page: object,
+) -> Generator[Callable[..., object], None, None]:
+    """Build extra contexts on the test's Chromium browser, sharing its login.
+
+    ``make(**opts)`` returns ``browser.new_context(**opts)`` with the main page's
+    cookies copied in (pass ``copy_cookies=False`` for a signed-out context). Use
+    it for ``timezone_id``, ``java_script_enabled=False``, a mobile viewport, or a
+    second tab with its own session state. Every context it made is closed at
+    teardown, before the browser itself.
+    """
+    created: list[object] = []
+
+    def make(*, copy_cookies: bool = True, **opts: object) -> object:
+        source = _chromium_page.context  # type: ignore[attr-defined]
+        context = source.browser.new_context(**opts)
+        created.append(context)
+        if copy_cookies:
+            context.add_cookies(source.cookies())
+        return context
+
+    yield make
+    for context in created:
+        # A test may already have closed it.
+        with contextlib.suppress(Exception):
+            context.close()  # type: ignore[attr-defined]
+
+
+# Records every CSP violation through a binding, so the record survives
+# navigations (a page-global array would reset on each one).
+_CSP_RECORDER_SCRIPT = """
+document.addEventListener("securitypolicyviolation", function (e) {
+  if (typeof window.__tlmReportCsp === "function") {
+    window.__tlmReportCsp({
+      directive: e.violatedDirective,
+      blocked: String(e.blockedURI || ""),
+      source: String(e.sourceFile || ""),
+      line: e.lineNumber || 0,
+      sample: String(e.sample || "")
+    });
+  }
+});
+"""
+
+
+class SecurityEvents:
+    """Console errors, page errors and CSP violations seen by one page.
+
+    ``console_errors`` holds ``(text, url)`` pairs, ``url`` being the console
+    message's source location (for a failed resource load, the resource's URL),
+    so a test can exempt a known, harmless resource error by URL.
+    """
+
+    def __init__(self) -> None:
+        self.console_errors: list[tuple[str, str]] = []
+        self.page_errors: list[str] = []
+        self.csp_violations: list[dict[str, object]] = []
+
+    def clear(self) -> None:
+        """Forget everything recorded so far (e.g. after the login step)."""
+        self.console_errors.clear()
+        self.page_errors.clear()
+        self.csp_violations.clear()
+
+    def _on_csp(self, violation: dict[str, object]) -> None:
+        self.csp_violations.append(violation)
+
+    def _on_console(self, message: object) -> None:
+        if message.type == "error":  # type: ignore[attr-defined]
+            location = message.location or {}  # type: ignore[attr-defined]
+            self.console_errors.append(
+                (message.text, str(location.get("url", "")))  # type: ignore[attr-defined]
+            )
+
+
+@pytest.fixture()
+def security_events() -> Callable[[object], SecurityEvents]:
+    """Return ``watch(page) -> SecurityEvents``, which starts recording on ``page``.
+
+    Call it before the navigations you want covered: the CSP listener is an init
+    script, so it runs in every document ``page`` loads from then on. Works on any
+    Playwright page, so a test can watch a Firefox or WebKit page as well as the
+    shared Chromium one.
+    """
+
+    def watch(page: object) -> SecurityEvents:
+        events = SecurityEvents()
+        page.expose_function("__tlmReportCsp", events._on_csp)  # type: ignore[attr-defined]
+        page.add_init_script(_CSP_RECORDER_SCRIPT)  # type: ignore[attr-defined]
+        page.on("console", events._on_console)  # type: ignore[attr-defined]
+        page.on(  # type: ignore[attr-defined]
+            "pageerror", lambda exc: events.page_errors.append(str(exc))
+        )
+        return events
+
+    return watch

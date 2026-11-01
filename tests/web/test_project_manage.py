@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from tests.conftest import csrf_of
 from timelapse_manager.db.models import Camera, Frame, Project, RenderJob
 from timelapse_manager.db.session import session_scope
+from timelapse_manager.render.spec import project_render_root
 from timelapse_manager.runtime import get_context
 from timelapse_manager.storage import paths
 
@@ -339,7 +340,14 @@ class TestDeleteProject:
         frame_dir.mkdir(parents=True, exist_ok=True)
         frame_file = frame_dir / "000001.jpg"
         frame_file.write_bytes(b"\xff\xd8\xff\xd9")
-        render_file = frame_dir / "out.mp4"
+        # Renders live under the project's render root; the delete unlinks
+        # outputs only there (#170).
+        with session_scope(ctx.session_factory) as db:
+            project_row = db.get(Project, pid)
+            assert project_row is not None
+            render_root = project_render_root(ctx.settings, project_row)
+        render_root.mkdir(parents=True, exist_ok=True)
+        render_file = render_root / "out.mp4"
         render_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
         with session_scope(ctx.session_factory) as db:
             db.add(
@@ -728,7 +736,8 @@ class TestEditProjectRenderSettings:
         fps_input = re.search(r'<input[^>]*id="render_fps"[^>]*>', text)
         assert fps_input is not None
         assert 'type="number"' in fps_input.group(0)
-        assert "tlmSetRenderFps(" in text
+        assert 'data-action="set-render-fps"' in text
+        assert re.search(r'data-fps="\d+"', text)
 
     def test_out_of_range_fps_rejected_with_400_and_unchanged(
         self, admin_client: TestClient
@@ -807,15 +816,17 @@ class TestEditProjectRenderSettings:
 class TestRenderComboCheck:
     """The live encoder/container advisory endpoint."""
 
-    def test_download_only_notice_for_av1(self, admin_client: TestClient) -> None:
+    def test_browser_support_notice_for_av1(self, admin_client: TestClient) -> None:
         resp = admin_client.get(
             "/renders/combo-check",
             params={"render_encoder": "libsvtav1", "render_container": "mp4"},
         )
         assert resp.status_code == 200
-        # AV1 is muxable into MP4 but not browser-streamable -> info notice, no
-        # mux warning.
-        assert "Download only" in resp.text
+        # AV1 is muxable into MP4 but not H.264/MP4 -> info notice (plays only
+        # where the browser supports AV1), no mux warning.
+        assert 'class="alert info"' in resp.text
+        assert "Plays only in browsers that support AV1 in MP4" in resp.text
+        assert "others download it" in resp.text
         assert "cannot be stored" not in resp.text
 
     def test_streamable_combo_returns_empty(self, admin_client: TestClient) -> None:
@@ -832,9 +843,9 @@ class TestRenderComboCheck:
             params={"render_encoder": "libvpx-vp9", "render_container": "mp4"},
         )
         assert resp.status_code == 200
-        # VP9 + MP4 cannot be muxed: show the mux warning, not the download notice.
+        # VP9 + MP4 cannot be muxed: show the mux warning, not the browser notice.
         assert "cannot be stored" in resp.text
-        assert "Download only" not in resp.text
+        assert "Plays only in browsers" not in resp.text
 
 
 class TestManualRenderUsesStoredSettings:

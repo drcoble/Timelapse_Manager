@@ -12,7 +12,11 @@ unrecognised name fail loudly rather than silently falling back.
 from __future__ import annotations
 
 from .encoder import Encoder, EncoderError
-from .ffmpeg_impl import FfmpegEncoder
+from .ffmpeg_impl import (
+    DEFAULT_MAX_JOB_SECONDS,
+    DEFAULT_STALL_TIMEOUT_SECONDS,
+    FfmpegEncoder,
+)
 
 # Engine names accepted by :func:`build_encoder`, in preference order.
 SUPPORTED_ENGINES: tuple[str, ...] = ("ffmpeg",)
@@ -26,6 +30,8 @@ def build_encoder(
     hwaccel_enabled: bool = False,
     hwaccel_api: str | None = None,
     hwaccel_device: str | None = None,
+    stall_timeout_seconds: float = DEFAULT_STALL_TIMEOUT_SECONDS,
+    max_job_seconds: float = DEFAULT_MAX_JOB_SECONDS,
 ) -> Encoder:
     """Construct the encoder engine named by ``engine``.
 
@@ -42,6 +48,10 @@ def build_encoder(
         ``"qsv"``, or ``"vaapi"``), or ``None`` for software-only.
     :param hwaccel_device: optional device selector for the chosen API (a VA-API
         render-node path or NVENC GPU index); the API default is used when unset.
+    :param stall_timeout_seconds: render watchdog stall timeout for the FFmpeg
+        engine (see :class:`FfmpegEncoder`).
+    :param max_job_seconds: render watchdog wall-clock ceiling for the FFmpeg
+        engine; ``0`` derives it from the frame count.
     :raises EncoderError: if ``engine`` names an unknown engine.
     """
     normalized = (engine or "ffmpeg").strip().lower()
@@ -55,12 +65,16 @@ def build_encoder(
                 hwaccel_enabled=hwaccel_enabled,
                 hwaccel_api=hwaccel_api,
                 hwaccel_device=hwaccel_device,
+                stall_timeout_seconds=stall_timeout_seconds,
+                max_job_seconds=max_job_seconds,
             )
         return FfmpegEncoder(
             font_path=font_path,
             hwaccel_enabled=hwaccel_enabled,
             hwaccel_api=hwaccel_api,
             hwaccel_device=hwaccel_device,
+            stall_timeout_seconds=stall_timeout_seconds,
+            max_job_seconds=max_job_seconds,
         )
     raise EncoderError(
         f"unknown encoder engine {engine!r}; supported: {', '.join(SUPPORTED_ENGINES)}"

@@ -18,7 +18,9 @@
  *  3. New-frames pill — polls /frames/since on a ~30s cadence and reveals a
  *     "N new frames" pill only on a 0->N transition (so assistive tech is not
  *     re-announced every tick). Refresh reloads the grid and the baseline resets
- *     from the new grid's newest id.
+ *     from the newest id seen since page load (it never moves back on a jump
+ *     to an older window). The poll runs through tlmPoll (poll.js):
+ *     passive, paused while the tab is hidden, with backoff after errors.
  */
 (function () {
   "use strict";
@@ -130,10 +132,18 @@
   function reflectVisible() {
     var newest = null;
     var oldest = null;
-    visibleTiles.forEach(function (ts) {
+    var gone = [];
+    visibleTiles.forEach(function (ts, el) {
+      // A tile removed from the DOM (an OOB re-render, a grid swap) never gets
+      // an "exited" entry once unobserved; without this it would pin the cursor.
+      if (!el.isConnected) {
+        gone.push(el);
+        return;
+      }
       if (newest === null || ts > newest) newest = ts;
       if (oldest === null || ts < oldest) oldest = ts;
     });
+    for (var g = 0; g < gone.length; g++) visibleTiles.delete(gone[g]);
     if (newest !== null) placeCursor(newest);
     if (newest !== null && oldest !== null) {
       document.dispatchEvent(
@@ -157,7 +167,7 @@
   }
 
   // --- 3. New-frames pill --------------------------------------------------
-  var pollTimer = null;
+  var POLL_NAME = "frames-since";
   var lastCount = 0;
 
   function pill() {
@@ -165,52 +175,65 @@
   }
 
   function newestGridId() {
-    // The sentinel/end-cap carries the grid's newest frame id.
-    var marker = document.querySelector(
-      "#frame-grid .frame-sentinel, #frame-grid .frame-end-cap"
-    );
-    if (!marker) return null;
-    var id = parseInt(marker.getAttribute("data-newest-id"), 10);
-    return isNaN(id) ? null : id;
+    // The newest frame id across every tile in the grid. The sentinel/end-cap's
+    // data-newest-id describes only the latest loaded batch, so after scrolling
+    // back through older batches it names an older frame and the pill would
+    // count frames already on screen (#199). Tile ids are "frame-tile-<id>".
+    var tiles = document.querySelectorAll("#frame-grid .frame-tile[id]");
+    var newest = null;
+    for (var i = 0; i < tiles.length; i++) {
+      var id = parseInt(tiles[i].id.replace("frame-tile-", ""), 10);
+      if (!isNaN(id) && (newest === null || id > newest)) newest = id;
+    }
+    return newest;
   }
 
-  function poll() {
+  // The newest frame id seen since the page loaded. It only ever grows: a
+  // time jump to an older window must not lower the pill's baseline, or the
+  // pill would count every frame between that window and the newest one as
+  // "new" although the viewer already had them at load (#262).
+  var seenNewest = null;
+
+  function noteNewestSeen() {
+    var n = newestGridId();
+    if (n !== null && (seenNewest === null || n > seenNewest)) seenNewest = n;
+  }
+
+  // A tlmPoll (poll.js) callback: `request` sends the passive-poll headers and
+  // rejects on an error, which tlmPoll answers with backoff.
+  function poll(request) {
     var p = pill();
     if (!p || !window.fetch) return;
-    var after = newestGridId();
+    noteNewestSeen();
+    var after = seenNewest;
     if (after === null) return;
     var url = "/frames/since?after=" + encodeURIComponent(after);
     var projectId = p.getAttribute("data-project-id");
     if (projectId) url += "&project_id=" + encodeURIComponent(projectId);
     if (p.getAttribute("data-show-deleted")) url += "&show_deleted=1";
-    window
-      .fetch(url, { headers: { "X-Requested-With": "fetch" } })
-      .then(function (r) {
-        return r.ok ? r.json() : null;
-      })
-      .then(function (data) {
-        if (!data || typeof data.count !== "number") return;
-        var n = data.count;
-        // Announce only on a 0->N edge, not on every tick that still has N.
-        if (n > 0 && lastCount === 0) {
-          var label = n === 1 ? "1 new frame" : n + " new frames";
-          var span = p.querySelector("[data-new-count]");
-          if (span) span.textContent = label;
-          p.hidden = false;
-        } else if (n === 0) {
-          p.hidden = true;
-        }
-        lastCount = n;
-      })
-      .catch(function () {
-        /* transient network error -> retry next tick */
-      });
+    return request(url).then(function (data) {
+      if (!data || typeof data.count !== "number") return;
+      var n = data.count;
+      // Announce only on a 0->N edge, not on every tick that still has N.
+      if (n > 0 && lastCount === 0) {
+        var label = n === 1 ? "1 new frame" : n + " new frames";
+        var span = p.querySelector("[data-new-count]");
+        if (span) span.textContent = label;
+        p.hidden = false;
+      } else if (n === 0) {
+        p.hidden = true;
+      }
+      lastCount = n;
+    });
   }
 
   function startPolling() {
-    if (pollTimer) window.clearInterval(pollTimer);
-    if (!pill()) return;
-    pollTimer = window.setInterval(poll, POLL_MS);
+    if (!window.tlmPoll) return;
+    if (!pill()) {
+      window.tlmPoll.stop(POLL_NAME);
+      return;
+    }
+    window.tlmPoll.every(POLL_NAME, poll, POLL_MS);
   }
 
   function resetBaseline() {
@@ -223,6 +246,7 @@
 
   // --- Wiring --------------------------------------------------------------
   function init() {
+    noteNewestSeen();
     rebuildObserver();
     startPolling();
   }
@@ -252,6 +276,7 @@
   // first frame rather than leaving focus on the (now off-screen) control.
   document.body.addEventListener("htmx:afterSwap", function (e) {
     if (e.target && e.target.id === "frame-grid") {
+      noteNewestSeen();
       resetBaseline();
       var firstThumb = e.target.querySelector(".frame-thumb");
       if (firstThumb && typeof firstThumb.focus === "function") {

@@ -6,7 +6,9 @@
   result list into #scan-results inside the modal.
 
   Context:
-    csrf_token — str, required on the mutating scan form.
+    csrf_token         — str, required on the mutating scan form.
+    scan_range_default — str, optional; the range to prefill (the first
+                         allowed private subnet that fits the scan cap).
 
   The opener that toggles this lives on the Cameras page
   (`<button data-modal-open="#discover-modal">`). modal.js opens/closes it,
@@ -28,6 +30,7 @@
             style="display:flex;gap:var(--sp-2);align-items:flex-end;
                    flex-wrap:wrap;"
             hx-post="/cameras/discover"
+            hx-request='{"timeout":300000}'
             hx-target="#scan-results"
             hx-swap="innerHTML"
             hx-indicator="#scan-spinner">
@@ -41,10 +44,17 @@
                  name="scan_range"
                  class="form-control mono"
                  placeholder="192.168.1.0/24"
+                 value="{{ scan_range_default or '' }}"
                  autocomplete="off"
                  spellcheck="false">
           <span class="form-hint">
-            Leave blank to scan the local network.
+            {% if scan_range_default %}
+              Prefilled from your allowed private subnets. Clear it to listen
+              for cameras on this server's own network segment only.
+            {% else %}
+              Leave blank to listen for cameras on this server's own network
+              segment; multicast does not cross routed VLANs.
+            {% endif %}
           </span>
         </div>
         <button type="submit" class="btn btn-primary">

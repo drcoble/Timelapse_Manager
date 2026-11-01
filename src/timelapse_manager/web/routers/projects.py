@@ -13,11 +13,17 @@ from fastapi.responses import (
 )
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
+from starlette.concurrency import run_in_threadpool
 
 from ...cameras.base import PTZPresetsResult, StreamProfileResult
+from ...capture.camera_sessions import describe_ptz_position, ptz_position_of
 from ...db.models import Camera, Project, User
 from ...render import settings as render_settings
 from ...runtime import get_context
+from ...services import projects as project_service
+from ...services._base import Actor, Effect, run_effects
+from ...services.errors import ConflictError, NotFoundError, ValidationError
+from ...services.projects import ProjectSpec
 from .. import dependencies as deps
 from ..dependencies import (
     DbDep,
@@ -31,7 +37,6 @@ from ._shared import (
     EVENT_TRIGGERS_MARKER,
     EXACT_TIME_MARKER,
     EventTopicsResult,
-    _audit,
     _build_event_triggers_from_form,
     _build_exact_time_anchors_from_form,
     _build_schedule_from_form,
@@ -58,9 +63,11 @@ from ._shared import (
     build_solar_preview_from_rows,
     capture_mode_of,
 )
+from ._values import load_camera_with_facts
 from ._viewmodels import (
     _camera_view,
     _project_view,
+    _ProjectView,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,41 +75,70 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _settings_form_context(
-    request: Request, db: DbSession, user: User, project: Project
-) -> dict[str, object]:
-    """Assemble the context the project-settings form needs.
+def _settings_form_reads(
+    db: DbSession, project_id: int
+) -> tuple[Project, _ProjectView, list[Camera], Camera | None, list[str]]:
+    """Load what the settings form needs before its camera probes (#46).
 
-    Shared by the standalone settings page and the in-page settings tab fragment
-    so the two cannot drift. The stream-profile and PTZ pickers are server-
-    rendered for the saved camera (preselected on load); enumeration is best-
-    effort -- an unreachable camera renders the partial's inline notice rather
-    than failing.
+    Runs in the threadpool. Returns the project (404 when missing), its view,
+    every camera, the saved camera (``None`` when it no longer exists) and the
+    PTZ conflicts on that camera (see :func:`_ptz_conflicts`).
     """
+    project = _get_project_or_404(db, project_id)
     project_view = _project_view(db, project)
-    cameras = db.execute(select(Camera).order_by(Camera.id)).scalars().all()
-
-    # Each enumerator detaches (``db.expunge``) the camera it probes, so the saved
-    # camera is re-fetched between the two probes.
+    cameras = list(db.execute(select(Camera).order_by(Camera.id)).scalars().all())
     camera = db.get(Camera, project.camera_id)
-    if camera is None:
-        stream_result = StreamProfileResult(profiles=[], ok=False)
-    else:
-        stream_result = await _enumerate_stream_profiles(db, camera)
+    return project, project_view, cameras, camera, _ptz_conflicts(db, project)
 
-    camera = db.get(Camera, project.camera_id)
-    if camera is None:
-        ptz_result = PTZPresetsResult(presets=[], ptz_supported=False, ok=False)
-    else:
-        ptz_result = await _enumerate_ptz_presets(db, camera)
 
-    # Each probe detaches the camera, so re-fetch before the event-topic probe.
-    camera = db.get(Camera, project.camera_id)
-    if camera is None:
-        events_result = EventTopicsResult(events=[], ok=False)
-    else:
-        events_result = await _enumerate_event_topics(db, camera)
+def _ptz_conflicts(db: DbSession, project: Project) -> list[str]:
+    """Describe the other active projects that point this camera elsewhere.
 
+    One entry per active project on the same camera whose PTZ position differs
+    from ``project``'s, when either of them positions the camera (#69 CAM-R4):
+    ``"name (preset 'yard')"``. The camera then moves between their captures,
+    and captures on it run one at a time. Empty when nothing conflicts.
+    Synchronous; runs in the threadpool.
+    """
+    if project.camera_id is None:
+        return []
+    mine = ptz_position_of(project)
+    others = db.execute(
+        select(Project)
+        .where(
+            Project.camera_id == project.camera_id,
+            Project.id != project.id,
+            Project.lifecycle_state == "active",
+        )
+        .order_by(Project.name)
+    ).scalars()
+    conflicts: list[str] = []
+    for other in others:
+        theirs = ptz_position_of(other)
+        if theirs != mine and (theirs is not None or mine is not None):
+            conflicts.append(f"{other.name} ({describe_ptz_position(theirs)})")
+    return conflicts
+
+
+def _settings_form_response(
+    request: Request,
+    db: DbSession,
+    user: User,
+    template: str,
+    project: Project,
+    project_view: _ProjectView,
+    cameras: list[Camera],
+    camera: Camera | None,
+    stream_result: StreamProfileResult,
+    ptz_result: PTZPresetsResult,
+    events_result: EventTopicsResult,
+    ptz_conflicts: list[str],
+) -> Response:
+    """Render the settings form from the loaded rows and probe results.
+
+    Runs in the threadpool: ``deps.base_context`` and the template read the
+    database and the ORM rows, which must not happen on the event loop (#46).
+    """
     # Expose the persisted auto-chapters choice so the schedule template selects
     # the saved option. Normalized to none/weekly/monthly so a stale or
     # hand-edited value still renders as a valid select option.
@@ -110,7 +146,7 @@ async def _settings_form_context(
         "auto_chapters": render_settings.auto_chapters_choice(project.render_schedule)
     }
 
-    return deps.base_context(
+    context = deps.base_context(
         request,
         db,
         user,
@@ -126,6 +162,7 @@ async def _settings_form_context(
         ptz_pan=project.ptz_pan,
         ptz_tilt=project.ptz_tilt,
         ptz_zoom=project.ptz_zoom,
+        ptz_conflicts=ptz_conflicts,
         timezones=list(COMMON_TIMEZONES),
         current_schedule=_schedule_to_form(project.schedule),
         current_render_settings=current_render_settings,
@@ -142,6 +179,63 @@ async def _settings_form_context(
         events_discovery_message=events_result.message,
         current_triggers=_event_triggers_to_form(project.event_triggers),
     )
+    return templates.TemplateResponse(request, template, context)
+
+
+async def _settings_form(
+    request: Request, db: DbSession, user: User, project_id: int, template: str
+) -> Response:
+    """Render a project-settings form template with its full context.
+
+    Shared by the standalone settings page and the in-page settings tab fragment
+    so the two cannot drift. The stream-profile and PTZ pickers are server-
+    rendered for the saved camera (preselected on load); enumeration is best-
+    effort -- an unreachable camera renders the partial's inline notice rather
+    than failing.
+
+    The camera probes are awaited here on the event loop; every Session use runs
+    in the threadpool around them (#46).
+    """
+    project, project_view, cameras, camera, ptz_conflicts = await run_in_threadpool(
+        _settings_form_reads, db, project_id
+    )
+    camera_id = project_view.camera_id
+
+    # Each enumerator detaches (``db.expunge``) the camera it probes, so the saved
+    # camera is re-fetched between the two probes.
+    if camera is None:
+        stream_result = StreamProfileResult(profiles=[], ok=False)
+    else:
+        stream_result = await _enumerate_stream_profiles(db, camera)
+
+    camera = await run_in_threadpool(db.get, Camera, camera_id)
+    if camera is None:
+        ptz_result = PTZPresetsResult(presets=[], ptz_supported=False, ok=False)
+    else:
+        ptz_result = await _enumerate_ptz_presets(db, camera)
+
+    # Each probe detaches the camera, so re-fetch before the event-topic probe.
+    camera = await run_in_threadpool(db.get, Camera, camera_id)
+    if camera is None:
+        events_result = EventTopicsResult(events=[], ok=False)
+    else:
+        events_result = await _enumerate_event_topics(db, camera)
+
+    return await run_in_threadpool(
+        _settings_form_response,
+        request,
+        db,
+        user,
+        template,
+        project,
+        project_view,
+        cameras,
+        camera,
+        stream_result,
+        ptz_result,
+        events_result,
+        ptz_conflicts,
+    )
 
 
 @router.get("/projects/{project_id}/settings", response_class=HTMLResponse)
@@ -149,9 +243,7 @@ async def edit_project_form(
     request: Request, db: DbDep, user: OperatorUser, project_id: int
 ) -> Response:
     """Render the standalone edit-project form for an existing project."""
-    project = _get_project_or_404(db, project_id)
-    context = await _settings_form_context(request, db, user, project)
-    return templates.TemplateResponse(request, "edit_project.html", context)
+    return await _settings_form(request, db, user, project_id, "edit_project.html")
 
 
 @router.get("/projects/{project_id}/settings/form", response_class=HTMLResponse)
@@ -159,10 +251,8 @@ async def edit_project_form_fragment(
     request: Request, db: DbDep, user: OperatorUser, project_id: int
 ) -> Response:
     """Render just the settings form, for lazy-loading into the detail page tab."""
-    project = _get_project_or_404(db, project_id)
-    context = await _settings_form_context(request, db, user, project)
-    return templates.TemplateResponse(
-        request, "_partials/project_settings_form.html", context
+    return await _settings_form(
+        request, db, user, project_id, "_partials/project_settings_form.html"
     )
 
 
@@ -254,6 +344,18 @@ async def _edit_project_form_error(
 ) -> Response:
     """Re-render the edit-project form with an error toast and a 400 status.
 
+    The render reads the database, so it runs in the threadpool (#46).
+    """
+    return await run_in_threadpool(
+        _render_edit_project_form_error, request, db, user, project_id, message
+    )
+
+
+def _render_edit_project_form_error(
+    request: Request, db: DbSession, user: User, project_id: int, message: str
+) -> Response:
+    """Render the edit-project form with an error toast and a 400 status.
+
     Re-fetches the project so the form reflects committed values even after a
     rolled-back flush expired the in-session instance. Preserves the submitted
     capture mode (read from the already-parsed, cached form) so an error
@@ -291,10 +393,12 @@ async def edit_project(
     mutated, so a duplicate name re-renders the form with a 400 rather than
     surfacing as a 500. On success the project is committed and the supervisor is
     notified so an interval/camera/storage change takes effect without a restart.
-    """
-    from sqlalchemy.exc import IntegrityError
 
-    project = _get_project_or_404(db, project_id)
+    Form parsing and the camera probes are awaited on the event loop; every
+    Session use runs in the threadpool, and the post-commit effects run back on
+    the loop (#46).
+    """
+    existing_triggers = await run_in_threadpool(_stored_event_triggers, db, project_id)
 
     # Capture mode: "solar" means no recurring interval (anchor-only capture);
     # "interval" keeps the continuous cadence. Stashed on request.state up front
@@ -324,12 +428,14 @@ async def edit_project(
             return await _edit_project_form_error(request, db, user, project_id, err)
         assert capture_interval_seconds is not None  # err is None implies a value
 
-    camera = db.get(Camera, camera_id)
-    if camera is None:
+    camera, camera_facts = await run_in_threadpool(
+        load_camera_with_facts, db, camera_id
+    )
+    if camera is None or camera_facts is None:
         return await _edit_project_form_error(
             request, db, user, project_id, "Selected camera not found."
         )
-    if camera.protocol is None:
+    if camera_facts.protocol is None:
         return await _edit_project_form_error(
             request,
             db,
@@ -343,9 +449,7 @@ async def edit_project(
     # name is not mistaken for a duplicate; the UNIQUE constraint + flush below is
     # the authoritative guard. Validate everything before mutating so the error
     # re-render's camera SELECT cannot autoflush a poisoned (duplicate) name.
-    existing = db.execute(
-        select(Project.id).where(Project.name == name).where(Project.id != project_id)
-    ).scalar_one_or_none()
+    existing = await run_in_threadpool(_other_project_named, db, name, project_id)
     if existing is not None:
         return await _edit_project_form_error(
             request, db, user, project_id, f"A project named {name!r} already exists."
@@ -378,7 +482,7 @@ async def edit_project(
     exact_time_anchors = None
     if exact_time_present:
         exact_time_anchors, err = await _build_exact_time_anchors_from_form(
-            request, camera
+            request, camera_facts
         )
         if err:
             return await _edit_project_form_error(request, db, user, project_id, err)
@@ -407,13 +511,13 @@ async def edit_project(
     event_triggers = None
     if event_triggers_present:
         event_triggers, err = await _build_event_triggers_from_form(
-            request, camera, db, project.event_triggers
+            request, camera, db, existing_triggers
         )
         if err:
             return await _edit_project_form_error(request, db, user, project_id, err)
         # The event-topic probe detaches the camera; re-fetch so the stream-label
         # resolution and the mutations below have an attached row.
-        camera = db.get(Camera, camera_id)
+        camera = await run_in_threadpool(db.get, Camera, camera_id)
         if camera is None:
             return await _edit_project_form_error(
                 request, db, user, project_id, "Selected camera not found."
@@ -480,48 +584,109 @@ async def edit_project(
         stream_label_value = await _resolve_stream_label(db, camera, stream_id_value)
 
     storage_path = form.get("storage_path", "").strip() or None
-    project.name = name
-    project.camera_id = camera_id
-    project.capture_interval_seconds = capture_interval_seconds
-    project.start_date = start_date
-    project.end_date = end_date
-    project.max_frame_count = max_frame_count
-    project.storage_path = storage_path
-    if schedule_present:
-        project.schedule = schedule
-    if exact_time_present:
-        project.exact_time_anchors = exact_time_anchors
-    if event_triggers_present:
-        project.event_triggers = event_triggers
-    project.stream_id = stream_id_value
-    project.stream_label = stream_label_value
-    project.render_schedule = render_schedule
-    project.archive_schedule = archive_schedule
-    project.post_render_actions = post_render_actions
-    project.ptz_preset = ptz_preset
-    project.ptz_pan = ptz_pan
-    project.ptz_tilt = ptz_tilt
-    project.ptz_zoom = ptz_zoom
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        return await _edit_project_form_error(
-            request, db, user, project_id, f"A project named {name!r} already exists."
-        )
 
-    _audit(
-        db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"project {project_id} updated",
+    # Everything the form parsed is normalised; hand it to the project service as a
+    # spec. The schedule/anchor/trigger fields ride only when their fieldset was
+    # submitted (their presence markers), preserving the "leave unrelated stored
+    # config untouched" semantics of a partial settings POST.
+    fields_set = {
+        "name",
+        "camera_id",
+        "capture_interval_seconds",
+        "start_date",
+        "end_date",
+        "max_frame_count",
+        "storage_path",
+        "stream_id",
+        "stream_label",
+        "render_schedule",
+        "archive_schedule",
+        "post_render_actions",
+        "ptz_preset",
+        "ptz_pan",
+        "ptz_tilt",
+        "ptz_zoom",
+    }
+    if schedule_present:
+        fields_set.add("schedule")
+    if exact_time_present:
+        fields_set.add("exact_time_anchors")
+    if event_triggers_present:
+        fields_set.add("event_triggers")
+    spec = ProjectSpec(
+        name=name,
+        camera_id=camera_id,
+        capture_interval_seconds=capture_interval_seconds,
+        start_date=start_date,
+        end_date=end_date,
+        max_frame_count=max_frame_count,
+        storage_path=storage_path,
+        schedule=schedule,
+        render_schedule=render_schedule,
+        archive_schedule=archive_schedule,
+        post_render_actions=post_render_actions,
+        stream_id=stream_id_value,
+        stream_label=stream_label_value,
+        exact_time_anchors=exact_time_anchors,
+        event_triggers=event_triggers,
+        ptz_preset=ptz_preset,
+        ptz_pan=ptz_pan,
+        ptz_tilt=ptz_tilt,
+        ptz_zoom=ptz_zoom,
+        fields_set=frozenset(fields_set),
     )
-    db.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
+    effects, error = await run_in_threadpool(
+        _commit_project_update, db, user, project_id, spec
+    )
+    if effects is None:
+        return await _edit_project_form_error(request, db, user, project_id, error)
+
+    # Effects drive the supervisor and render queue, which belong to the event
+    # loop, so they run here rather than in the threadpool helper.
+    run_effects(effects, get_context())
     return RedirectResponse(url=f"/projects/{project_id}", status_code=303)
+
+
+def _stored_event_triggers(db: DbSession, project_id: int) -> object:
+    """Return the project's stored event triggers (plain JSON), or raise a 404.
+
+    Synchronous: the read happens in the threadpool, so the route never touches
+    the ``Project`` row's attributes on the event loop.
+    """
+    return _get_project_or_404(db, project_id).event_triggers
+
+
+def _other_project_named(db: DbSession, name: str, project_id: int) -> int | None:
+    """Return the id of another project already named *name*, if any."""
+    return db.execute(
+        select(Project.id).where(Project.name == name).where(Project.id != project_id)
+    ).scalar_one_or_none()
+
+
+def _commit_project_update(
+    db: DbSession, user: User, project_id: int, spec: ProjectSpec
+) -> tuple[tuple[Effect, ...] | None, str]:
+    """Apply *spec* through the project service and commit (threadpool, #46).
+
+    Returns ``(effects, "")`` once committed, or ``(None, detail)`` after rolling
+    back a validation/uniqueness/not-found failure for the form to re-render.
+    The effects are left for the caller to run on the event loop.
+    """
+    try:
+        result = project_service.update_project(
+            db, Actor.of(user), project_id, spec, settings=_settings()
+        )
+    except (ValidationError, ConflictError, NotFoundError) as exc:
+        # A validation/uniqueness failure rolls back the service's partial mutation
+        # and re-renders the form with the error, exactly as the pre-service handler
+        # did on a duplicate-name flush.
+        db.rollback()
+        return None, exc.detail
+
+    # Commit before running effects: the supervisor reconciles in a fresh session
+    # on another thread and would not see an uncommitted change.
+    db.commit()
+    return result.effects, ""
 
 
 def _suggested_clone_name(db: DbSession, base_name: str) -> str:
@@ -596,11 +761,10 @@ def clone_project(
     success the new active project is committed, the supervisor is notified, and
     the browser is redirected to the clone's detail page.
     """
-    from sqlalchemy.exc import IntegrityError
-
-    from ...api.projects import _clone_from
-
-    source = _get_project_or_404(db, project_id)
+    # Confirm the source exists up front so an unknown id is a clean 404, matching
+    # the pre-service handler (the clone service also validates it, but the form
+    # error re-render below needs a resolvable source).
+    _get_project_or_404(db, project_id)
 
     name = form.get("name", "").strip()
     if not name:
@@ -615,28 +779,17 @@ def clone_project(
             request, db, user, project_id, f"A project named {name!r} already exists."
         )
 
-    clone = _clone_from(source, name)
-    db.add(clone)
     try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        return _clone_project_form_error(
-            request, db, user, project_id, f"A project named {name!r} already exists."
+        result = project_service.clone_project(
+            db, Actor.of(user), project_id, name=name, settings=_settings()
         )
+    except (ValidationError, ConflictError, NotFoundError) as exc:
+        db.rollback()
+        return _clone_project_form_error(request, db, user, project_id, exc.detail)
 
-    clone_id = clone.id
-    _audit(
-        db,
-        scope="project",
-        scope_id=clone_id,
-        actor_user_id=user.id,
-        message=f"project {clone_id} cloned from {project_id}",
-    )
+    clone_id = result.value.id
     db.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
+    run_effects(result.effects, get_context())
     return RedirectResponse(url=f"/projects/{clone_id}", status_code=303)
 
 
@@ -650,21 +803,11 @@ def delete_project(
     render files. The delete is audited and the supervisor notified so the
     project's capture loop stops promptly, then the browser returns to the list.
     """
-    from ...storage.projects import delete_project_with_files
-
-    project = _get_project_or_404(db, project_id)
-    delete_project_with_files(db, _settings(), project)
-    _audit(
-        db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"project {project_id} deleted",
+    result = project_service.delete_project(
+        db, Actor.of(user), project_id, settings=_settings()
     )
     db.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
+    run_effects(result.effects, get_context())
     return RedirectResponse(url="/projects", status_code=303)
 
 
@@ -716,20 +859,16 @@ def project_action(
     """
     if action not in _PROJECT_ACTIONS:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    project = _get_project_or_404(db, project_id)
 
-    project.lifecycle_state = _ACTION_LIFECYCLE_STATE[action]
-    _audit(
+    result = project_service.set_project_lifecycle(
         db,
-        scope="project",
-        scope_id=project_id,
-        actor_user_id=user.id,
-        message=f"project {action} requested",
+        Actor.of(user),
+        project_id,
+        state=_ACTION_LIFECYCLE_STATE[action],
+        action=action,
     )
-    # Commit before notifying: the supervisor reconciles in a fresh session on
-    # another thread and would not see an uncommitted state change.
+    # Commit before running effects: the supervisor reconciles in a fresh session
+    # on another thread and would not see an uncommitted state change.
     db.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
+    run_effects(result.effects, get_context())
     return RedirectResponse(url=f"/projects/{project_id}", status_code=303)

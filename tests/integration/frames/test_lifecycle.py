@@ -454,3 +454,83 @@ class TestPermanentDelete:
             user = session.get(User, 1)
         assert user is not None
         assert user.username == "system"
+
+
+# ---------------------------------------------------------------------------
+# Thumbnail cleanup (#67 R12)
+# ---------------------------------------------------------------------------
+
+
+def _seed_thumbnails(settings: Settings, project_id: int, *names: str) -> Path:
+    from timelapse_manager.storage.paths import thumbnail_cache_dir
+
+    cache_dir = thumbnail_cache_dir(settings, project_id)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (cache_dir / name).write_bytes(b"THUMB")
+    return cache_dir
+
+
+class TestThumbnailCleanup:
+    def test_permanent_delete_removes_the_frames_thumbnails(
+        self, migrated_factory, tmp_path: Path
+    ) -> None:
+        settings = _make_settings(tmp_path)
+        ctx = _seed_project(migrated_factory, tmp_path, "pd-thumb")
+        frame_id, _ = _write_frame_via_writer(
+            migrated_factory, settings, ctx["project_id"]
+        )
+        other_id = frame_id + 1000
+        cache_dir = _seed_thumbnails(
+            settings,
+            ctx["project_id"],
+            f"{frame_id}.jpg",
+            f"{frame_id}_640.jpg",
+            f"{other_id}.jpg",
+        )
+
+        with session_scope(migrated_factory) as session:
+            frame_service.permanent_delete(
+                session, frame_id, _ACTOR_USER_ID, confirm=True, settings=settings
+            )
+
+        assert sorted(p.name for p in cache_dir.iterdir()) == [f"{other_id}.jpg"]
+
+    def test_soft_delete_keeps_the_thumbnails(
+        self, migrated_factory, tmp_path: Path
+    ) -> None:
+        settings = _make_settings(tmp_path)
+        ctx = _seed_project(migrated_factory, tmp_path, "sd-thumb")
+        frame_id, _ = _write_frame_via_writer(
+            migrated_factory, settings, ctx["project_id"]
+        )
+        cache_dir = _seed_thumbnails(settings, ctx["project_id"], f"{frame_id}.jpg")
+
+        with session_scope(migrated_factory) as session:
+            frame_service.soft_delete(session, frame_id, _ACTOR_USER_ID)
+
+        assert (cache_dir / f"{frame_id}.jpg").exists()
+
+    def test_project_delete_removes_the_thumbnail_directory(
+        self, migrated_factory, tmp_path: Path
+    ) -> None:
+        from timelapse_manager.storage.projects import delete_project_with_files
+
+        settings = _make_settings(tmp_path)
+        doomed = _seed_project(migrated_factory, tmp_path, "pdel-thumb")
+        kept = _seed_project(migrated_factory, tmp_path, "pkeep-thumb")
+        frame_id, _ = _write_frame_via_writer(
+            migrated_factory, settings, doomed["project_id"]
+        )
+        doomed_dir = _seed_thumbnails(
+            settings, doomed["project_id"], f"{frame_id}.jpg", f"{frame_id}_640.jpg"
+        )
+        kept_dir = _seed_thumbnails(settings, kept["project_id"], "1.jpg")
+
+        with session_scope(migrated_factory) as session:
+            project = session.get(Project, doomed["project_id"])
+            assert project is not None
+            delete_project_with_files(session, settings, project)
+
+        assert not doomed_dir.exists()
+        assert (kept_dir / "1.jpg").exists()

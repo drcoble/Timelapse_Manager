@@ -149,6 +149,14 @@ without waking every second. A long capture interval (longer than 300 seconds)
 is unaffected: the loop still delivers exactly one capture per interval when the
 gate is open.
 
+**Interval cadence.** Interval captures run on a grid anchored when the project's
+capture runner starts; it is not aligned to the wall clock. The grid is measured
+on a monotonic clock, so a change of system time does not move captures. After
+any attempt, successful or not, the next capture is the first grid slot after
+now: a slow capture does not push later frames out, and slots missed during a
+long capture or an outage are skipped, not made up in a burst. The schedule gate
+and exact-time anchors still use wall-clock time.
+
 ### Reconnect with exponential backoff
 
 When a capture fails (camera unreachable, network timeout, protocol error), the
@@ -163,8 +171,17 @@ backoff with jitter:
   in lockstep
 - The first successful capture resets the backoff counter
 
+A retry is never scheduled past the next interval slot, so the first frame after
+an outage arrives within one interval of the camera coming back. A refused login
+(an authentication failure) goes to `capture.backoff_max_seconds` at once, still
+capped at the next slot.
+
 The schedule gate is always authoritative: even if a backoff retry is due, the
 supervisor will not capture outside an open window.
+
+The runner's heartbeat (the age compared with the wedge threshold) is also
+monotonic, so a clock step neither relaunches healthy runners nor hides a stuck
+one. `/healthz` counts a stuck runner by the supervisor's own definition of one.
 
 ### Restart and downtime survival
 

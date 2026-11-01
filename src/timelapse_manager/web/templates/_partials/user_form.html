@@ -98,7 +98,7 @@
         <a href="/users" class="btn btn-ghost">Cancel</a>
       {% else %}
         <button type="button" class="btn btn-ghost"
-                onclick="document.getElementById('user-form-card').remove();">
+                data-action="remove-by-id" data-target="user-form-card">
           Cancel
         </button>
       {% endif %}

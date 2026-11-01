@@ -13,11 +13,19 @@
   padding: var(--sp-4);
   opacity: 0;
   pointer-events: none;
-  transition: opacity var(--transition-mid);
+  /* visibility: hidden takes a closed modal's controls out of the tab order and
+     the accessibility tree (opacity alone leaves them focusable, #277). It
+     flips only after the fade-out, so the fade still plays. */
+  visibility: hidden;
+  transition:
+    opacity var(--transition-mid),
+    visibility 0s linear var(--transition-mid);
 }
 .modal-backdrop.open {
   opacity: 1;
   pointer-events: auto;
+  visibility: visible;
+  transition-delay: 0s;
 }
 
 /* Scroll-lock the page behind an open modal (set by modal.js). */

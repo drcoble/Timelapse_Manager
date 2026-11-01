@@ -25,6 +25,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from timelapse_manager.db.migration_utils import suspend_foreign_keys
+
 # revision identifiers, used by Alembic.
 revision: str = "022_add_project_event_triggers"
 down_revision: str | None = "021_add_exact_time_fire_table"
@@ -42,15 +44,6 @@ def downgrade() -> None:
     # The implicit DROP of the old table cascades through the ON DELETE CASCADE
     # foreign keys on ``frame``/``render_job``/``milestone`` and would silently
     # delete those child rows. Suspend FK enforcement across the rebuild so child
-    # data survives; this works because Alembic applies SQLite DDL outside a
-    # transaction here (PRAGMA foreign_keys is a no-op mid-transaction).
-    bind = op.get_bind()
-    is_sqlite = bind.dialect.name == "sqlite"
-    if is_sqlite:
-        op.execute("PRAGMA foreign_keys=OFF")
-    try:
-        with op.batch_alter_table("project") as batch_op:
-            batch_op.drop_column("event_triggers")
-    finally:
-        if is_sqlite:
-            op.execute("PRAGMA foreign_keys=ON")
+    # data survives.
+    with suspend_foreign_keys(op), op.batch_alter_table("project") as batch_op:
+        batch_op.drop_column("event_triggers")

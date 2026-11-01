@@ -53,6 +53,18 @@ def _camera(camera_id: int) -> Camera | None:
         return db.get(Camera, camera_id)
 
 
+def _enable_defaults() -> None:
+    """Configure usable default credentials (the inherit flag needs them, #318)."""
+    ctx = get_context()
+    with session_scope(ctx.session_factory) as db:
+        row = db.get(CameraDefaultCredentials, 1)
+        if row is None:
+            row = CameraDefaultCredentials(id=1)
+            db.add(row)
+        row.enabled = True
+        row.username = "shared-user"
+
+
 def _seed_camera(
     *, name: str, inherit: bool, credentials: dict[str, object] | None = None
 ) -> int:
@@ -145,6 +157,7 @@ class TestDefaultsRoundTrip:
 
 class TestCameraInheritFlag:
     def test_create_persists_flag_on(self, admin_client: TestClient) -> None:
+        _enable_defaults()
         csrf = csrf_of(admin_client, "/cameras")
         resp = admin_client.post(
             "/cameras",
@@ -187,6 +200,7 @@ class TestCameraInheritFlag:
             assert cam.credentials_inherit_default is False
 
     def test_edit_toggles_flag_off(self, admin_client: TestClient) -> None:
+        _enable_defaults()
         camera_id = _seed_camera(name="toggle-cam", inherit=True)
         csrf = csrf_of(admin_client, "/cameras")
         resp = admin_client.post(
@@ -212,6 +226,7 @@ class TestCameraInheritFlag:
         # A camera that had its own username, switched to inherit the default.
         # Disabled inputs submit nothing, so the write path must drop the stored
         # own credentials -- otherwise own creds would keep overriding the default.
+        _enable_defaults()
         camera_id = _seed_camera(
             name="switch-cam",
             inherit=False,
@@ -242,6 +257,7 @@ class TestCameraInheritFlag:
     def test_edit_form_reflects_stored_flag_and_hides_password(
         self, admin_client: TestClient
     ) -> None:
+        _enable_defaults()
         camera_id = _seed_camera(name="reflect-cam", inherit=True)
         resp = admin_client.get(f"/cameras/{camera_id}/edit-form")
         assert resp.status_code == 200
@@ -251,3 +267,42 @@ class TestCameraInheritFlag:
         # A password value is never rendered into the edit form.
         assert 'name="password"' in resp.text
         assert f'id="cam-{camera_id}-password"' in resp.text
+
+
+class TestDefaultsSaveWakesReconcile:
+    """#152: cameras that inherit the defaults have them in a cached capture
+    session, so a save wakes the reconcile pass (which compares fingerprints
+    that include the defaults row) once the new values are committed."""
+
+    def test_save_runs_capture_reconcile_after_commit(
+        self, admin_client: TestClient
+    ) -> None:
+        from unittest.mock import patch
+
+        from sqlalchemy import select
+
+        from timelapse_manager.services._base import Effect
+
+        seen: list[tuple[tuple[Effect, ...], str | None]] = []
+
+        def recording_run_effects(effects: tuple[Effect, ...], ctx: Any) -> None:
+            # Read through a separate session: only committed values are visible.
+            with session_scope(get_context().session_factory) as db:
+                row = db.scalars(select(CameraDefaultCredentials)).first()
+                seen.append((effects, row.username if row else None))
+
+        with patch(
+            "timelapse_manager.web.routers.ldap.run_effects",
+            side_effect=recording_run_effects,
+        ):
+            resp = _post_defaults(
+                admin_client,
+                {
+                    "camera_defaults_enabled": "on",
+                    "camera_defaults_username": "reconcile-user",
+                    "camera_defaults_password": "s3cret-pass",
+                },
+            )
+
+        assert resp.status_code == 303
+        assert seen == [((Effect.CAPTURE_RECONCILE,), "reconcile-user")]

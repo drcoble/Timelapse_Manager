@@ -1,8 +1,7 @@
 {# Create-user form body, shared by the full page (/users/new) and the drawer
    (/drawers/new-user). Set ``in_drawer`` true to render Cancel as a
    drawer-close button. Roles match the rest of the app: Admin and Viewer. #}
-<form method="post" action="/users" novalidate
-      onsubmit="if(this.password.value!==this.password_confirm.value){this.querySelector('#new-user-pw-error').hidden=false;this.password_confirm.focus();return false;}return true;">
+<form method="post" action="/users" novalidate>
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <div class="form-stack">
     <div class="form-group">
@@ -39,7 +38,8 @@
             style="color:var(--color-error);" hidden>Passwords do not match.</span>
     </div>
     <div style="display:flex;gap:var(--sp-3);">
-      <button type="submit" class="btn btn-primary">Create User</button>
+      <button type="submit" class="btn btn-primary"
+              data-action="pw-match-check">Create User</button>
       {% if in_drawer %}
       <button type="button" class="btn btn-ghost" data-drawer-close>Cancel</button>
       {% else %}

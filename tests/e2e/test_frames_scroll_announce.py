@@ -59,4 +59,5 @@ class TestSettingsTabOrder:
             "LDAP",
             "Notifications",
             "Credentials",
+            "Problem reports",
         ], labels

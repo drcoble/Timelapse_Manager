@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import struct
@@ -21,6 +22,9 @@ import timelapse_manager.db.session as _db_session_mod
 import timelapse_manager.runtime as _runtime_mod
 import timelapse_manager.security.crypto as _crypto_mod
 import timelapse_manager.web.routers.auth as _web_auth_mod
+import timelapse_manager.web.routers.cameras as _web_cameras_mod
+from tests import loop_guard_support as _loop_guard
+from tests.presession_support import WebTestClient, presession_token, session_cookie
 from timelapse_manager.app import create_app
 from timelapse_manager.cameras.base import (
     CameraAdapter,
@@ -46,6 +50,10 @@ from timelapse_manager.db.session import create_session_factory, session_scope
 from timelapse_manager.security.keystore import KeyFileProvider
 from timelapse_manager.security.token import ensure_local_token
 from timelapse_manager.storage.monitor import DiskSpaceMonitor
+
+# Installed once per process, before any app is built: every request served
+# in this run is marked, so the guard below sees database work on the loop.
+_loop_guard.install()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -109,6 +117,8 @@ def _reset_globals() -> pytest.Generator[None, None, None]:
     # "testclient" as the client IP. Reset it so a bad-creds test in one
     # test does not throttle good-creds tests in later tests.
     _web_auth_mod._throttle = None  # noqa: SLF001
+    # The camera admin-read limiter (#68) is in-memory and per process.
+    _web_cameras_mod._geo_admin_limiter.clear()  # noqa: SLF001
 
     yield
 
@@ -116,6 +126,47 @@ def _reset_globals() -> pytest.Generator[None, None, None]:
     _runtime_mod.dispose()
     _db_session_mod._session_factory = None  # noqa: SLF001
     _web_auth_mod._throttle = None  # noqa: SLF001
+    # The camera admin-read limiter (#68) is in-memory and per process.
+    _web_cameras_mod._geo_admin_limiter.clear()  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# No database work on the event loop (autouse, #46-#50 requests, #62 background).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _loop_db_guard(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Fail a test whose requests or background work query on the event loop.
+
+    Request violations fail web/API/e2e tests; background violations (the
+    render queue, scheduler, dispatcher, report delivery, capture supervisor)
+    fail a test in any directory. Autouse, so it is set up before (and torn down
+    after) the test's client and live-server fixtures: by teardown every request
+    has finished and every e2e server has stopped and flushed its violation log.
+    Violations listed in ``KNOWN_LOOP_DB`` / ``KNOWN_BACKGROUND_LOOP_DB`` are
+    tolerated until their issue is fixed. In record-only mode
+    (``TLM_LOOP_GUARD_RECORD``) nothing fails and every test is recorded.
+    """
+    _loop_guard.reset()
+    yield
+    violations = _loop_guard.collect()
+    _loop_guard.reset()
+    record_dir = os.environ.get(_loop_guard.RECORD_ENV)
+    if record_dir:
+        _loop_guard.record_to(Path(record_dir), request.node.nodeid, violations)
+        return
+    test_dir = Path(str(request.node.path)).relative_to(Path(__file__).parent)
+    gated = test_dir.parts[0] in _loop_guard.GATED_TEST_DIRS
+    # Background work (#62) is gated in every directory: the render queue and
+    # the dispatcher run mostly in unit and integration tests.
+    offenders = [
+        violation
+        for violation in _loop_guard.unexpected(violations)
+        if gated or violation.background
+    ]
+    if offenders:
+        pytest.fail(_loop_guard.failure_message(offenders), pytrace=False)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +236,15 @@ def alembic_cfg(tmp_db_url: str) -> Config:
 # Phase 01 fixtures: settings, fully-wired TestClient, and auth token
 # ---------------------------------------------------------------------------
 
+# TCP peer for the TestClients that call the bearer-token API (#67 S1).
+# Starlette's default peer host is the literal "testclient", which is not an IP
+# address, so the local-token peer policy refuses it with 403. Every shared
+# TestClient fixture in this file presents this loopback peer, as the CLI does.
+# Tests that build their own TestClient for bearer calls pass
+# ``client=LOOPBACK_PEER``; tests that depend on a particular peer (the token
+# peer policy, trusted proxies) pass an explicit ``client=``.
+LOOPBACK_PEER = ("127.0.0.1", 50000)
+
 
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
@@ -221,7 +281,7 @@ def client(settings: Settings) -> pytest.Generator[TestClient, None, None]:
     that most route tests depend on.
     """
     app = create_app(settings)
-    with TestClient(app) as c:
+    with TestClient(app, client=LOOPBACK_PEER) as c:
         yield c
 
 
@@ -312,7 +372,7 @@ def migrated_client(
     alembic_command.upgrade(alembic_cfg, "head")
 
     app = create_app(settings_no_autostart)
-    with TestClient(app) as c:
+    with TestClient(app, client=LOOPBACK_PEER) as c:
         yield c
 
 
@@ -580,6 +640,8 @@ def permissive_disk_monitor() -> DiskSpaceMonitor:
 
 from timelapse_manager.config.settings import (  # noqa: E402
     AuthSettings,
+    ReportingGithubSettings,
+    ReportingSettings,
     ServerSettings,
     TlsSettings,
 )
@@ -621,6 +683,10 @@ def web_settings(tmp_path: Path) -> Settings:
         tls=TlsSettings(auto_generate=False),
         server=ServerSettings(redirect_http_to_https=True),
         secrets=SecretsSettings(use_os_keystore=False),
+        # The GitHub hand-off (#21) is on by default and anonymizes every
+        # report; the web tests keep #8's plain filing unless a test turns it
+        # on (tests/web/test_report_github.py).
+        reporting=ReportingSettings(github=ReportingGithubSettings(enabled=False)),
     )
 
 
@@ -651,7 +717,32 @@ def web_client(
     alembic_cfg.set_main_option("sqlalchemy.url", web_settings.database.url)
     alembic_command.upgrade(alembic_cfg, "head")
     app = create_app(web_settings)
-    with TestClient(app, base_url="https://testserver") as c:
+    with WebTestClient(app, base_url="https://testserver", client=LOOPBACK_PEER) as c:
+        yield c
+
+
+@pytest.fixture()
+def web_client_http(
+    web_settings: Settings,
+    alembic_cfg: Config,
+) -> Generator[TestClient, None, None]:
+    """Yield a redirect-enabled TestClient over a plain ``http`` base URL.
+
+    The connection scheme is genuinely ``http`` (not asserted via a forwarded
+    header), and the TestClient peer is not a trusted proxy, so the effective
+    scheme is ``http`` and the redirect middleware should bounce navigable
+    requests to ``https``. Use it to exercise the real 308 redirect path and to
+    confirm a direct client cannot forge ``X-Forwarded-Proto`` to dodge it.
+    """
+    alembic_cfg.set_main_option("sqlalchemy.url", web_settings.database.url)
+    alembic_command.upgrade(alembic_cfg, "head")
+    app = create_app(web_settings)
+    with WebTestClient(
+        app,
+        base_url="http://testserver",
+        follow_redirects=False,
+        client=LOOPBACK_PEER,
+    ) as c:
         yield c
 
 
@@ -668,7 +759,12 @@ def web_client_no_redirect(
     alembic_cfg.set_main_option("sqlalchemy.url", web_settings_no_redirect.database.url)
     alembic_command.upgrade(alembic_cfg, "head")
     app = create_app(web_settings_no_redirect)
-    with TestClient(app, base_url="http://testserver", follow_redirects=False) as c:
+    with WebTestClient(
+        app,
+        base_url="http://testserver",
+        follow_redirects=False,
+        client=LOOPBACK_PEER,
+    ) as c:
         yield c
 
 
@@ -706,7 +802,11 @@ def login(
     """
     resp = client.post(
         "/login",
-        data={"username": username, "password": password},
+        data={
+            "username": username,
+            "password": password,
+            "csrf_token": presession_token(client),
+        },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         follow_redirects=False,
     )
@@ -714,8 +814,7 @@ def login(
     assert resp.status_code == 303, (
         f"Login failed with {resp.status_code}: {resp.text[:200]}"
     )
-    cookie_name = get_context().settings.session.cookie_name
-    raw_token = client.cookies.get(cookie_name)
+    raw_token = session_cookie(client)
     assert raw_token is not None, "Session cookie not set after login"
     return raw_token
 
@@ -820,5 +919,5 @@ def cli_client(
     alembic_cfg.set_main_option("sqlalchemy.url", web_settings.database.url)
     alembic_command.upgrade(alembic_cfg, "head")
     app = create_app(web_settings)
-    with TestClient(app, base_url="https://testserver") as c:
+    with WebTestClient(app, base_url="https://testserver", client=LOOPBACK_PEER) as c:
         yield c

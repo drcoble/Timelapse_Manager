@@ -1,13 +1,46 @@
 {#
   Partial: latest_frame.html
   Context: project — {id, name, latest_frame_url}
-  Returned standalone by HTMX polling on project detail page.
+           latest_render — _LatestRenderView or none (project detail page only;
+                           the newest finished render whose file exists, #24)
+
+  With a render, the frame is a link to the render's stream with a play
+  overlay. Without JavaScript the link opens the video file. With JavaScript,
+  latest-render.js intercepts the click (and Enter / Space), runs the browser
+  playability check (#25, the data-* attributes) and plays the render in
+  #latest-render-player, which project_detail.html keeps outside this partial
+  so that swapping the frame cannot reset the video.
+  Without a render the frame is a plain image with a "No render yet" hint.
 #}
-<div class="frame-thumb thumb-preview" id="latest-frame-{{ project.id }}">
-  {% if project.latest_frame_url %}
+{% from '_partials/_playback.html' import playback_attrs %}
+{% set latest_render = latest_render | default(none) %}
+<div class="frame-thumb thumb-preview latest-frame" id="latest-frame-{{ project.id }}">
+  {% if latest_render %}
+    <a class="latest-frame-play"
+       href="{{ latest_render.stream_url }}"
+       aria-label="Play latest render"
+       data-latest-render
+       data-player="#latest-render-player"
+       {{ playback_attrs(latest_render.playback) }}>
+      {% if project.latest_frame_url %}
+        <img src="{{ project.latest_frame_url }}"
+             width="640" height="360"
+             alt="Latest captured frame for {{ project.name }}"
+             loading="lazy">
+      {% else %}
+        <span class="frame-thumb-label">
+          <span class="frame-thumb-icon" aria-hidden="true">&#127760;</span>
+          <span>No frames captured yet</span>
+        </span>
+      {% endif %}
+      <span class="latest-frame-play-icon" aria-hidden="true">&#9654;</span>
+    </a>
+  {% elif project.latest_frame_url %}
     <img src="{{ project.latest_frame_url }}"
+         width="640" height="360"
          alt="Latest captured frame for {{ project.name }}"
          loading="lazy">
+    <span class="latest-frame-hint">No render yet</span>
   {% else %}
     <div class="frame-thumb-label">
       <span class="frame-thumb-icon" aria-hidden="true">&#127760;</span>

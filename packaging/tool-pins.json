@@ -1,0 +1,21 @@
+{
+  "_comment": "Build tools the release workflow runs, pinned by version and sha256. The workflow fetches each from the generic registry mirror of the Gitea instance named by TLM_REGISTRY_URL and TLM_REGISTRY_OWNER (never from upstream); mirror_path is relative to <registry>/api/packages/<owner>/generic/ and refuses a sha256 mismatch. Seed a mirror once with dev/mirror-tools.sh. To upgrade: change the version, url, file and sha256 here (the sha256 comes from the upstream checksums file) and re-run dev/mirror-tools.sh.",
+  "nfpm": {
+    "version": "2.48.0",
+    "file": "nfpm_2.48.0_Linux_x86_64.tar.gz",
+    "sha256": "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750",
+    "binary": "nfpm",
+    "upstream_url": "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz",
+    "upstream_checksums_url": "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/checksums.txt",
+    "mirror_path": "ci-tools/nfpm-2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz"
+  },
+  "trivy": {
+    "version": "0.75.0",
+    "file": "trivy_0.75.0_Linux-64bit.tar.gz",
+    "sha256": "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f",
+    "binary": "trivy",
+    "upstream_url": "https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz",
+    "upstream_checksums_url": "https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_checksums.txt",
+    "mirror_path": "ci-tools/trivy-0.75.0/trivy_0.75.0_Linux-64bit.tar.gz"
+  }
+}

@@ -1,6 +1,6 @@
 """Event logging: the emit helper, the public taxonomies, and read queries.
 
-This module is the single front door for recording an operational or audit event
+This module is the single entry point for recording an operational or audit event
 and for reading events back:
 
 * :func:`log_event` persists an :class:`~timelapse_manager.db.models.Event` row
@@ -73,6 +73,12 @@ class EventType(enum.Enum):
     STORAGE_DISK_LOW = "storage.disk_low"
     RENDER_COMPLETE = "render.complete"
     RENDER_FAILED = "render.failed"
+    # A render a user stopped (cancel button, delete of a running render). Info
+    # level -- below the alert threshold -- and never a failure notification.
+    RENDER_CANCELLED = "render.cancelled"
+    # A render a clean service stop interrupted and put back to ``pending`` (#178).
+    # Info level, never a failure notification: the next start runs it again.
+    RENDER_REQUEUED = "render.requeued"
     EXPORT_COMPLETE = "export.complete"
     POSTACTION_FAILED = "postaction.failed"
     SECURITY_AUTH_EVENT = "security.auth_event"
@@ -93,7 +99,9 @@ _LEVEL_RANK: dict[str, int] = {
 }
 
 # Event types considered audit/security records, surfaced by get_audit_events.
-_AUDIT_EVENT_TYPES: frozenset[str] = frozenset(
+# Public so event retention (``monitoring.event_retention``) can always keep
+# them; one list, so the audit view and retention cannot drift apart.
+AUDIT_EVENT_TYPES: frozenset[str] = frozenset(
     {
         EventType.SECURITY_AUTH_EVENT.value,
         EventType.AUDIT_CONTROL_ACTION.value,
@@ -279,7 +287,7 @@ def get_audit_events(
         raise PermissionError("Admin role required to read the audit log.")
     query = session.query(Event).filter(
         func.json_extract(Event.event_metadata, f"$.{_TYPE_KEY}").in_(
-            sorted(_AUDIT_EVENT_TYPES)
+            sorted(AUDIT_EVENT_TYPES)
         )
     )
     query = _apply_event_filters(

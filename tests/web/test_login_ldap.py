@@ -16,6 +16,7 @@ realistic data.
 from __future__ import annotations
 
 import datetime
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,11 +24,13 @@ from fastapi.testclient import TestClient
 import timelapse_manager.security.session_revalidation as revalidation
 import timelapse_manager.web.routers.auth as routers
 from tests.conftest import seed_admin
+from tests.presession_support import without_token
 from timelapse_manager.db.models import Session as SessionRow
 from timelapse_manager.db.models import User
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
 from timelapse_manager.security.ldap_directory import (
+    DETAIL_NO_SERVER_REACHABLE,
     LdapAuthResult,
     LdapDirectoryState,
     LdapOutcome,
@@ -420,3 +423,226 @@ class TestSessionReevalOnRequest:
             "/", headers={"Accept": "text/html"}, follow_redirects=False
         )
         assert resp.status_code == 200  # local session unaffected
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (#67 R3)
+# ---------------------------------------------------------------------------
+
+
+def _unreachable_result() -> LdapAuthResult:
+    return LdapAuthResult(
+        LdapOutcome.SERVER_UNREACHABLE, detail=DETAIL_NO_SERVER_REACHABLE
+    )
+
+
+def _recording_connector(result: LdapAuthResult, *, stall: float = 0.0):
+    """A connector that answers ``result`` after ``stall`` seconds, counting calls."""
+    calls: list[str] = []
+
+    def _connector(*, settings, username, password, bind_password):  # noqa: ANN001
+        calls.append(username)
+        time.sleep(stall)
+        return result
+
+    return _connector, calls
+
+
+class TestDirectoryBreakerOnLogin:
+    def test_an_open_breaker_fails_login_fast_and_alike_for_every_name(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client, enabled=True)
+        connector, calls = _recording_connector(_unreachable_result(), stall=2.0)
+        monkeypatch.setattr(routers, "ldap_authenticate", connector)
+
+        first = _post_login(web_client, _LDAP_USER, _LDAP_PW)  # pays the stall
+        assert first.status_code == 401
+        assert calls == [_LDAP_USER]
+
+        bodies = {without_token(first.text)}
+        for name in ("someone.else", "admin", "nobody-at-all"):
+            started = time.monotonic()
+            resp = _post_login(web_client, name, "wrong-password-xyz")
+            elapsed = time.monotonic() - started
+            assert resp.status_code == 401
+            assert elapsed < 1.0  # no queueing behind the connect timeout
+            bodies.add(without_token(resp.text))
+        assert calls == [_LDAP_USER]  # the directory was not asked again
+        # One page for every name: nothing tells accounts apart (#67 S7).
+        assert len(bodies) == 1
+        assert "directory server could not be reached" in bodies.pop()
+
+    def test_the_local_account_still_signs_in_while_it_is_open(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client, enabled=True)
+        connector, _ = _recording_connector(_unreachable_result())
+        monkeypatch.setattr(routers, "ldap_authenticate", connector)
+        assert _post_login(web_client, _LDAP_USER, _LDAP_PW).status_code == 401
+        resp = _post_login(web_client, "admin", "AdminP@ssw0rd1234")
+        assert resp.status_code == 303
+
+    def test_the_directory_is_asked_again_when_the_breaker_closes(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client, enabled=True)
+        connector, calls = _recording_connector(_unreachable_result())
+        monkeypatch.setattr(routers, "ldap_authenticate", connector)
+        _post_login(web_client, _LDAP_USER, _LDAP_PW)
+        with session_scope(get_context().session_factory) as db:
+            revalidation.breaker_for(db).record_answered()  # the window is over
+        _post_login(web_client, _LDAP_USER, _LDAP_PW)
+        assert calls == [_LDAP_USER, _LDAP_USER]
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            LdapAuthResult(LdapOutcome.SERVER_UNREACHABLE, detail="directory error"),
+            LdapAuthResult(
+                LdapOutcome.INVALID_CREDENTIALS, detail="user bind rejected"
+            ),
+            LdapAuthResult(LdapOutcome.CONFIG_ERROR, detail="service bind failed"),
+        ],
+    )
+    def test_a_fault_a_request_can_provoke_never_opens_it(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch, result
+    ) -> None:
+        """A login must not be able to switch the directory off for everyone."""
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client, enabled=True)
+        connector, calls = _recording_connector(result)
+        monkeypatch.setattr(routers, "ldap_authenticate", connector)
+        for _ in range(3):
+            _post_login(web_client, _LDAP_USER, _LDAP_PW)
+        assert calls == [_LDAP_USER] * 3
+
+    def test_an_open_breaker_never_signs_a_directory_user_in(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail closed: no breaker state turns "cannot ask" into a session."""
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client, enabled=True)
+        connector, _ = _recording_connector(_unreachable_result())
+        monkeypatch.setattr(routers, "ldap_authenticate", connector)
+        _post_login(web_client, _LDAP_USER, _LDAP_PW)
+        # Even a connector that would now say yes is not consulted while open.
+        ok, calls = _recording_connector(_authenticated(frozenset({_ADMIN_GROUP})))
+        monkeypatch.setattr(routers, "ldap_authenticate", ok)
+        resp = _post_login(web_client, _LDAP_USER, _LDAP_PW)
+        assert resp.status_code == 401
+        assert "set-cookie" not in resp.headers
+        assert calls == []
+        assert _find_user(_LDAP_USER) is None  # and nothing was provisioned
+
+
+# ---------------------------------------------------------------------------
+# A directory that accepts the connection and stalls (#202)
+# ---------------------------------------------------------------------------
+
+
+def _stalling_connector(
+    *, before_bind: bool, calls: list[str], request_specific: bool = False
+):
+    """The real connector over a fake connection that stalls (no real directory)."""
+    from tests.unit.security.test_ldap_directory import (
+        _make_factory,
+        _memberof_entries,
+        _stall_factory,
+    )
+    from timelapse_manager.security.ldap_directory import authenticate
+
+    if request_specific:
+        from tests.unit.security.test_ldap_directory import (
+            _request_specific_stall_factory,
+        )
+
+        factory = _request_specific_stall_factory(_make_factory(_memberof_entries()))
+    else:
+        factory = _stall_factory(
+            _make_factory(_memberof_entries()),
+            on="service-bind" if before_bind else "search",
+        )
+
+    def _connector(*, settings, username, password, bind_password):  # noqa: ANN001
+        calls.append(username)
+        return authenticate(
+            settings=settings,
+            username=username,
+            password=password,
+            bind_password="service-bind-pw",
+            connection_factory=factory,
+            lock_attribute="",
+        )
+
+    return _connector
+
+
+class TestStalledDirectoryLogin:
+    def test_a_stall_before_the_bind_says_unavailable_for_every_name_and_opens_it(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from timelapse_manager.security.session_revalidation import breaker_for
+        from timelapse_manager.web.routers.auth import DIRECTORY_UNAVAILABLE_MESSAGE
+
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            routers,
+            "ldap_authenticate",
+            _stalling_connector(before_bind=True, calls=calls),
+        )
+        answers = {
+            name: _post_login(web_client, name, "whatever-password-1")
+            for name in ("ldapalice", "no-such-person")
+        }
+        # Identical for a real name and an unknown one (WP-67-H).
+        assert {r.status_code for r in answers.values()} == {401}
+        assert all(DIRECTORY_UNAVAILABLE_MESSAGE in r.text for r in answers.values())
+        # The first stall opened the breaker, so the second was refused unasked.
+        assert calls == ["ldapalice"]
+        with session_scope(get_context().session_factory) as db:
+            assert breaker_for(db).is_open() is True
+
+    def test_a_hang_after_the_bind_opens_it_for_every_name(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bind-then-hang (#216): the client-independent canary stalls too."""
+        from timelapse_manager.security.session_revalidation import breaker_for
+
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client)
+        monkeypatch.setattr(
+            routers,
+            "ldap_authenticate",
+            _stalling_connector(before_bind=False, calls=[]),
+        )
+        _post_login(web_client, "ldapalice", "whatever-password-1")
+        with session_scope(get_context().session_factory) as db:
+            assert breaker_for(db).is_open() is True
+
+    def test_a_request_specific_stall_is_a_plain_failure_and_never_opens_it(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from timelapse_manager.security.session_revalidation import breaker_for
+        from timelapse_manager.web.routers.auth import DIRECTORY_UNAVAILABLE_MESSAGE
+
+        seed_admin(web_client)
+        _seed_ldap_settings(web_client)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            routers,
+            "ldap_authenticate",
+            _stalling_connector(before_bind=False, calls=calls, request_specific=True),
+        )
+        for _ in range(3):  # a client cannot hold the breaker open by repeating it
+            resp = _post_login(web_client, "ldapalice", "whatever-password-1")
+            assert resp.status_code == 401
+            assert DIRECTORY_UNAVAILABLE_MESSAGE not in resp.text
+        assert len(calls) == 3
+        with session_scope(get_context().session_factory) as db:
+            assert breaker_for(db).is_open() is False

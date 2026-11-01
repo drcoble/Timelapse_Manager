@@ -21,7 +21,12 @@ from __future__ import annotations
 
 import socket
 
-from ..security.ssrf import resolve_and_check
+from ..security.ssrf import (
+    SsrfError,
+    pinned_addresses_async,
+    resolve_and_check,
+    resolve_and_check_async,
+)
 
 
 def resolve_camera_host(address: str) -> str:
@@ -48,5 +53,74 @@ def resolve_camera_host(address: str) -> str:
     except socket.gaierror:
         # Unresolvable at add time: defer enforcement to the fetch/probe path,
         # which re-validates fail-closed before connecting.
+        return address
+    return address
+
+
+def camera_allowed_subnets() -> tuple[str, ...]:
+    """Return the administrator's private-subnet opt-in for camera traffic.
+
+    Read from the running application's settings **at the call**, so an edit an
+    administrator makes applies to the next check and the next connection. With
+    no application context installed it returns no subnets, so private
+    addresses are denied (fail-closed) rather than the lookup raising.
+    """
+    from ..runtime import get_context
+
+    try:
+        ssrf = get_context().settings.ssrf
+    except RuntimeError:
+        return ()
+    return tuple(ssrf.allowed_private_subnets)
+
+
+async def check_camera_url_async(url: str) -> None:
+    """Validate a camera URL's host under the camera policy, off the event loop.
+
+    The coroutine counterpart of the ``assert_allowed_url`` calls the adapters
+    made inline, with the same verdicts: every address the host resolves to is
+    checked, and a host that does not resolve is a denial. The resolve runs in a
+    worker thread and an allowed answer is cached for a short time
+    (:func:`~timelapse_manager.security.ssrf.pinned_addresses_async`), which is
+    also what the camera clients connect to
+    (:mod:`timelapse_manager.security.pinned_http`): the address checked here is
+    the address dialled, and a name whose DNS answer changes is re-resolved and
+    re-checked once the cached answer expires.
+
+    :raises SsrfError: the URL has no usable host, the host does not resolve, or
+        any address it resolves to is denied.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url).hostname
+    except ValueError as exc:
+        raise SsrfError("outbound URL is malformed") from exc
+    if not host:
+        raise SsrfError(f"outbound URL has no host component: {url!r}")
+    await pinned_addresses_async(
+        host, allow_private=True, allowed_private_subnets=camera_allowed_subnets()
+    )
+
+
+async def resolve_camera_host_async(address: str) -> str:
+    """The coroutine form of :func:`resolve_camera_host`: same verdicts, no stall.
+
+    Validates ``address`` and returns it unchanged. A hostname that does not
+    resolve is allowed through, exactly as in the synchronous seam, so an
+    administrator can still add a camera while it is offline. The resolve runs
+    in a worker thread.
+
+    :raises SsrfError: the address (or a name it resolves to) is denied.
+    """
+    if not address:
+        return address
+    try:
+        await resolve_and_check_async(
+            address,
+            allow_private=True,
+            allowed_private_subnets=camera_allowed_subnets(),
+        )
+    except socket.gaierror:
         return address
     return address

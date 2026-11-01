@@ -9,7 +9,7 @@
    -------------------------------------------------------------------------- */
 
 /* Overlay the select control in the top-left of the thumbnail. The wrapper is
-   positioned in screens/frames.css (.frame-tile-thumb-wrap { position: relative }). */
+   positioned in screens/frames.css (.frame-tile { position: relative }). */
 .frame-tile-select {
   position: absolute;
   top: var(--sp-2);
@@ -37,7 +37,7 @@
 }
 
 .frame-tile-select:hover .frame-select-indicator,
-.frame-tile-thumb-wrap:hover .frame-select-indicator,
+.frame-tile:hover .frame-select-indicator,
 .frame-tile-select:focus-within .frame-select-indicator {
   opacity: 1;
 }

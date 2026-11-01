@@ -8,21 +8,39 @@ restore, permanent delete, upload, and capture-timestamp correction.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.concurrency import run_in_threadpool
 
 from ..capture import CaptureSupervisor
 from ..config import Settings
 from ..db.models import Frame, Project
-from ..db.session import get_session
-from ..runtime import get_context
+from ..db.session import DbSessionDep
+from ..executors import run_in
+from ..logging import redact_text
+from ..runtime import AppContext, get_context
 from ..security import Principal, require_operator_or_admin_principal
-from ..storage import frames as frame_service
+from ..security.sessions import reauthorize_after_body
+from ..services import frames as frame_service
+from ..services._base import Actor, Result
+from ..services.errors import NotFoundError, ValidationError
+from ..storage import frames as frame_storage
+from ..storage.frames import ImportResult
+from ..web.multipart import (
+    BodyTooLargeError,
+    InsufficientSpoolSpaceError,
+    MultipartError,
+    TooManyFilesError,
+    UploadSpool,
+    stream_body_to_file,
+    stream_multipart,
+    upload_spool,
+)
 
 router = APIRouter(prefix="/frames", tags=["frames"])
 
@@ -32,11 +50,6 @@ router = APIRouter(prefix="/frames", tags=["frames"])
 admin_router = APIRouter(prefix="/projects", tags=["frames"])
 
 _MAX_LIMIT = 500
-
-# Magic-byte prefixes for the only image formats accepted on upload; mirrors the
-# dimension reader's detection so an invalid body is rejected before any work.
-_JPEG_MAGIC = b"\xff\xd8"
-_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 class FrameOut(BaseModel):
@@ -115,23 +128,8 @@ def _to_out(frame: Frame, predominant: tuple[int, int] | None) -> FrameOut:
         capture_status=frame.capture_status,
         origin=frame.origin,
         lifecycle_state=frame.lifecycle_state,
-        dimension_mismatch=frame_service.dimension_mismatch(frame, predominant),
+        dimension_mismatch=frame_storage.dimension_mismatch(frame, predominant),
     )
-
-
-def _get_frame_in_project(session: Session, project_id: int, frame_id: int) -> Frame:
-    """Return a frame that belongs to ``project_id`` or raise a 404.
-
-    A frame addressed through the wrong project's path is treated as not found,
-    so one project's URL can never mutate another's frame.
-    """
-    frame = session.get(Frame, frame_id)
-    if frame is None or frame.project_id != project_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"frame {frame_id} not found in project {project_id}",
-        )
-    return frame
 
 
 def _supervisor() -> CaptureSupervisor:
@@ -147,7 +145,7 @@ def _supervisor() -> CaptureSupervisor:
 
 @router.get("", response_model=list[FrameOut])
 def list_frames(
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     project_id: Annotated[int, Query(description="project to list frames for")],
     limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -163,14 +161,14 @@ def list_frames(
     predominant frame dimensions, evaluated once over all active frames so the
     flag is consistent across pages.
     """
-    frames = frame_service.list_frames(
+    frames = frame_storage.list_frames(
         session,
         project_id,
         limit=limit,
         offset=offset,
         include_deleted=include_deleted,
     )
-    predominant = frame_service.predominant_dimensions(session, project_id)
+    predominant = frame_storage.predominant_dimensions(session, project_id)
     return [_to_out(frame, predominant) for frame in frames]
 
 
@@ -203,7 +201,9 @@ def capture_status(
         last_error_at=(
             state.last_error_at.isoformat() if state.last_error_at is not None else None
         ),
-        last_error=state.last_error,
+        last_error=(
+            redact_text(state.last_error) if state.last_error is not None else None
+        ),
         frames_captured=state.frames_captured,
     )
 
@@ -211,7 +211,7 @@ def capture_status(
 def _frame_out_in_project(session: Session, project_id: int, frame: Frame) -> FrameOut:
     """Serialize a frame after a mutation, with a freshly computed mismatch flag."""
     session.flush()
-    predominant = frame_service.predominant_dimensions(session, project_id)
+    predominant = frame_storage.predominant_dimensions(session, project_id)
     return _to_out(frame, predominant)
 
 
@@ -219,26 +219,28 @@ def _frame_out_in_project(session: Session, project_id: int, frame: Frame) -> Fr
 def soft_delete_frame(
     project_id: int,
     frame_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> FrameOut:
     """Soft-delete a frame: flip its lifecycle flag, keep its file on disk."""
-    _get_frame_in_project(session, project_id, frame_id)
-    frame = frame_service.soft_delete(session, frame_id, principal.user_id)
-    return _frame_out_in_project(session, project_id, frame)
+    result = frame_service.soft_delete_frame(
+        session, Actor.of(principal), project_id, frame_id
+    )
+    return _frame_out_in_project(session, project_id, result.value)
 
 
 @admin_router.post("/{project_id}/frames/{frame_id}/restore")
 def restore_frame(
     project_id: int,
     frame_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> FrameOut:
     """Restore a soft-deleted frame to the active set."""
-    _get_frame_in_project(session, project_id, frame_id)
-    frame = frame_service.restore(session, frame_id, principal.user_id)
-    return _frame_out_in_project(session, project_id, frame)
+    result = frame_service.restore_frame(
+        session, Actor.of(principal), project_id, frame_id
+    )
+    return _frame_out_in_project(session, project_id, result.value)
 
 
 @admin_router.post(
@@ -248,21 +250,16 @@ def restore_frame(
 def permanent_delete_frame(
     project_id: int,
     frame_id: int,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
     confirm: Annotated[bool, Query(description="must be true to delete")] = False,
 ) -> None:
     """Irreversibly delete a frame's row and file. Requires ``confirm=true``."""
-    if not confirm:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="permanent deletion requires confirm=true",
-        )
-    _get_frame_in_project(session, project_id, frame_id)
-    frame_service.permanent_delete(
+    frame_service.permanent_delete_frame(
         session,
+        Actor.of(principal),
+        project_id,
         frame_id,
-        principal.user_id,
         confirm=confirm,
         settings=get_context().settings,
     )
@@ -273,15 +270,14 @@ def edit_frame(
     project_id: int,
     frame_id: int,
     payload: TimestampUpdate,
-    session: Annotated[Session, Depends(get_session)],
+    session: DbSessionDep,
     principal: Annotated[Principal, Depends(require_operator_or_admin_principal)],
 ) -> FrameOut:
     """Correct a frame's capture timestamp; any other field yields a 422."""
-    _get_frame_in_project(session, project_id, frame_id)
-    frame = frame_service.edit_capture_timestamp(
-        session, frame_id, payload.capture_timestamp, principal.user_id
+    result = frame_service.edit_frame_timestamp(
+        session, Actor.of(principal), project_id, frame_id, payload.capture_timestamp
     )
-    return _frame_out_in_project(session, project_id, frame)
+    return _frame_out_in_project(session, project_id, result.value)
 
 
 @admin_router.post("/{project_id}/frames/upload")
@@ -303,135 +299,143 @@ async def upload_frame(
     valid JPEG or PNG, verified by magic bytes; an optional ``format`` query must
     agree with the bytes. The frame is written through the shared atomic writer
     with ``origin="uploaded"`` and the supplied capture time, then audited.
+
+    The body is streamed to a spool file and refused with ``413`` the moment it
+    passes ``capture.max_image_bytes`` (or ``507`` when the disk is short), so it
+    is never buffered on the event loop. The write runs on the jobs executor.
     """
-    image_bytes = await request.body()
-    if not _looks_like_image(image_bytes):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="request body is not a valid JPEG or PNG image",
-        )
     context = get_context()
+    settings = context.settings
     try:
-        frame = await _run_upload(
-            context.session_factory,
-            context.settings,
+        async with upload_spool(
+            settings.paths.data_dir,
+            expected_bytes=_declared_length(request),
+            low_watermark_bytes=settings.storage.low_watermark_bytes,
+        ) as spool:
+            image_path = spool.path / "image"
+            await stream_body_to_file(
+                request,
+                image_path,
+                max_bytes=settings.capture.max_image_bytes,
+                low_watermark_bytes=settings.storage.low_watermark_bytes,
+            )
+            # A revoke, disable or demotion can land while the body streams in.
+            actor = await run_in_threadpool(_reauthorize, context, request, principal)
+            # The worker owns the spool from here and removes it. The service
+            # validates the bytes (an invalid body is a 422) and maps a missing
+            # project to a 404; both surface as an AppError the handler renders.
+            result = await run_in(
+                context.jobs_executor,
+                _upload_from_spool,
+                context.session_factory,
+                settings,
+                actor,
+                project_id,
+                spool,
+                image_format,
+                capture_timestamp,
+            )
+    except BodyTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Request body exceeds the configured size limit.",
+        ) from exc
+    except InsufficientSpoolSpaceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=str(exc)
+        ) from exc
+    return await run_in_threadpool(
+        _uploaded_frame_out, context.session_factory, project_id, result.value
+    )
+
+
+def _declared_length(request: Request) -> int:
+    """The request's ``Content-Length`` as an int, or 0 when absent or invalid."""
+    raw = request.headers.get("content-length", "").strip()
+    return int(raw) if raw.isascii() and raw.isdigit() else 0
+
+
+def _reauthorize(context: AppContext, request: Request, principal: Principal) -> Actor:
+    """Re-check a cookie caller's access after the body, return the actor.
+
+    Synchronous, for a threadpool hop. A bearer-token caller has no session to
+    re-check and keeps the principal the dependency resolved; a cookie caller's
+    live user row decides (:func:`~..security.sessions.reauthorize_after_body`).
+    """
+    with context.session_factory() as session:
+        user = reauthorize_after_body(
+            request,
+            session,
+            settings=context.settings.session,
+            allowed_roles=_WRITE_ROLES,
+        )
+    return Actor.of(principal if user is None else user)
+
+
+def _upload_from_spool(
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    actor: Actor,
+    project_id: int,
+    spool: UploadSpool,
+    image_format: str | None,
+    capture_timestamp: datetime,
+) -> Result[Frame]:
+    """Read the spooled image and upload it; always removes the spool.
+
+    Synchronous, for the jobs executor. Peak memory is the one image
+    (``capture.max_image_bytes`` at most).
+    """
+    spool.claim_or_raise()
+    try:
+        image_bytes = (spool.path / "image").read_bytes()
+        return frame_service.upload_frame(
+            session_factory,
+            settings,
+            actor,
             project_id,
             image_bytes,
             image_format,
             capture_timestamp,
-            principal.user_id,
         )
-    except frame_service.InvalidImageError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except ValueError as exc:
-        # Raised by the writer when the project does not exist.
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
-        ) from exc
-    with context.session_factory() as session:
+    finally:
+        spool.finish()
+
+
+def _uploaded_frame_out(
+    session_factory: sessionmaker[Session], project_id: int, frame: Frame
+) -> FrameOut:
+    """Serialize a just-uploaded frame in a short session of its own.
+
+    Synchronous: the upload route awaits it through the threadpool so the
+    predominant-dimensions query never runs on the event loop (#49).
+    """
+    with session_factory() as session:
         return _frame_out_in_project(session, project_id, frame)
 
 
-def _looks_like_image(data: bytes) -> bool:
-    """Return whether ``data`` begins with a JPEG or PNG magic-byte signature."""
-    return data.startswith(_JPEG_MAGIC) or data.startswith(_PNG_MAGIC)
+def _require_project(session_factory: sessionmaker[Session], project_id: int) -> None:
+    """Raise :class:`NotFoundError` when ``project_id`` names no project.
+
+    Synchronous: the import route awaits it through the threadpool so the
+    existence check never queries on the event loop (#49).
+    """
+    with session_factory() as session:
+        if session.get(Project, project_id) is None:
+            raise NotFoundError(f"project {project_id} does not exist")
 
 
-async def _run_upload(
-    session_factory: sessionmaker[Session],
-    settings: Settings,
-    project_id: int,
-    image_bytes: bytes,
-    image_format: str | None,
-    capture_timestamp: datetime,
-    actor_user_id: int,
-) -> Frame:
-    """Run the synchronous upload service off the event loop."""
-    return await asyncio.to_thread(
-        frame_service.upload_frame,
-        session_factory,
-        settings,
-        project_id,
-        image_bytes,
-        image_format,
-        capture_timestamp,
-        actor_user_id,
-    )
-
-
-# Upper bound on the whole multipart request body for a batch import. The body is
-# read fully into memory to parse it, so an absurd Content-Length is rejected up
-# front; the per-file count cap is enforced separately by the storage importer.
+# Upper bound on the whole multipart request body for a batch import: a cheap
+# up-front reject on ``Content-Length``. The streaming reader enforces the real
+# caps (this, the per-file size and the file count) on the bytes received.
 _MAX_IMPORT_REQUEST_BYTES = 512 * 1024 * 1024
 
+# Optional text field naming the IANA zone the images' naive Exif times were
+# taken in (#67 R10). Unknown names are a 422 from the service layer.
+_EXIF_TIMEZONE_FIELD = "exif_timezone"
 
-def _parse_multipart_files(
-    body: bytes, content_type: str, field: str
-) -> list[tuple[str, bytes]]:
-    """Extract ``(filename, bytes)`` for every ``field`` part of a multipart body.
-
-    A small multipart/form-data reader: the API does not depend on a full
-    multipart parser (the optional dependency is intentionally absent), so this
-    decodes the one upload body it needs. Only parts whose Content-Disposition
-    name equals ``field`` and that carry a filename and non-empty bytes are
-    returned; any other part is ignored. Returns an empty list when the boundary
-    is missing or no matching part is present.
-    """
-    boundary = _multipart_boundary(content_type)
-    if boundary is None:
-        return []
-    delimiter = b"--" + boundary
-    files: list[tuple[str, bytes]] = []
-    for segment in body.split(delimiter):
-        if not segment or segment in (b"--\r\n", b"--", b"\r\n"):
-            continue
-        segment = segment[2:] if segment.startswith(b"\r\n") else segment
-        header_blob, sep, content = segment.partition(b"\r\n\r\n")
-        if not sep:
-            continue
-        disposition = _part_disposition(header_blob)
-        if _disposition_param(disposition, "name") != field:
-            continue
-        filename = _disposition_param(disposition, "filename")
-        if not filename:
-            continue
-        if content.endswith(b"\r\n"):
-            content = content[:-2]
-        if not content:
-            continue
-        files.append((filename, content))
-    return files
-
-
-def _multipart_boundary(content_type: str) -> bytes | None:
-    """Return the boundary token from a multipart Content-Type, or ``None``."""
-    if not content_type.startswith("multipart/form-data"):
-        return None
-    for part in content_type.split(";"):
-        key, _, value = part.strip().partition("=")
-        if key.strip().lower() == "boundary":
-            return value.strip().strip('"').encode("latin-1")
-    return None
-
-
-def _part_disposition(header_blob: bytes) -> str:
-    """Return a multipart part's ``Content-Disposition`` header value (or "")."""
-    for line in header_blob.split(b"\r\n"):
-        key, _, value = line.partition(b":")
-        if key.decode("latin-1").strip().lower() == "content-disposition":
-            return value.decode("latin-1").strip()
-    return ""
-
-
-def _disposition_param(disposition: str, param: str) -> str | None:
-    """Return a ``Content-Disposition`` parameter value (e.g. ``name``), or None."""
-    for piece in disposition.split(";"):
-        key, _, value = piece.strip().partition("=")
-        if key.strip().lower() == param:
-            return value.strip().strip('"')
-    return None
+# Roles the write endpoints admit (the operator-or-admin gate).
+_WRITE_ROLES = ("operator", "admin")
 
 
 @admin_router.post("/{project_id}/frames/import", response_model=ImportResultOut)
@@ -445,22 +449,20 @@ async def import_frames(
     The files are sent as a ``multipart/form-data`` body with one or more
     ``files`` parts (the field name is ``files``, repeated per file). Each file's
     bytes are validated and its Exif capture time read; a file with no readable
-    time falls back to now (naive UTC) and is flagged inferred. The project is
-    then re-sequenced chronologically. Skip-not-raise: a file that is not a
-    readable supported image is reported in ``skipped`` with a reason and the rest
-    still import.
+    time falls back to now (naive UTC) and is flagged inferred. A time without a
+    UTC offset of its own is read in the optional ``exif_timezone`` text field (an
+    IANA name; unknown names are a 422), else in the project's schedule timezone.
+    The project is then re-sequenced chronologically. Skip-not-raise: a file that
+    is not a readable supported image is reported in ``skipped`` with a reason and
+    the rest still import.
 
     Operator-or-admin gated (bearer token). An absurd request body is rejected
     with a 413 before it is read; a batch exceeding the per-request file cap is a
     422 -- both distinct from the per-file skips, which are a normal 200 result.
     """
     context = get_context()
-    with context.session_factory() as session:
-        if session.get(Project, project_id) is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"project {project_id} does not exist",
-            )
+    settings = context.settings
+    await run_in_threadpool(_require_project, context.session_factory, project_id)
 
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -474,37 +476,105 @@ async def import_frames(
                 detail="import request body is too large",
             )
 
-    body = await request.body()
-    files = _parse_multipart_files(
-        body, request.headers.get("content-type", ""), "files"
-    )
-    if not files:
+    try:
+        async with upload_spool(
+            settings.paths.data_dir,
+            expected_bytes=_declared_length(request),
+            low_watermark_bytes=settings.storage.low_watermark_bytes,
+        ) as spool:
+            form = await stream_multipart(
+                request,
+                spool_dir=spool.path,
+                file_field="files",
+                text_fields=frozenset({"csrf_token", _EXIF_TIMEZONE_FIELD}),
+                max_file_bytes=settings.capture.max_image_bytes,
+                max_total_bytes=min(
+                    _MAX_IMPORT_REQUEST_BYTES, settings.server.max_request_body_bytes
+                ),
+                max_files=frame_storage.MAX_IMPORT_BATCH,
+                low_watermark_bytes=settings.storage.low_watermark_bytes,
+            )
+            files = [(part.filename, part.path) for part in form.files if part.path]
+            if not files:
+                raise ValidationError(
+                    "no files provided (send one or more 'files' parts)"
+                )
+            # A revoke, disable or demotion can land while the body streams in.
+            actor = await run_in_threadpool(_reauthorize, context, request, principal)
+            fallback = datetime.now(UTC).replace(tzinfo=None)
+            result = await run_in(
+                context.jobs_executor,
+                _import_from_spool,
+                context.session_factory,
+                settings,
+                actor,
+                project_id,
+                spool,
+                files,
+                fallback,
+                form.fields.get(_EXIF_TIMEZONE_FIELD),
+            )
+    except BodyTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Request body exceeds the configured size limit.",
+        ) from exc
+    except (TooManyFilesError, frame_service.ImportBatchTooLargeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="no files provided (send one or more 'files' parts)",
-        )
+            detail=(
+                f"import batch exceeds the maximum of "
+                f"{frame_storage.MAX_IMPORT_BATCH} files"
+            ),
+        ) from exc
+    except MultipartError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except InsufficientSpoolSpaceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=str(exc)
+        ) from exc
 
-    fallback = datetime.now(UTC).replace(tzinfo=None)
+    import_result = result.value
+    return ImportResultOut(
+        imported_count=import_result.imported_count,
+        skipped_count=import_result.skipped_count,
+        skipped=[
+            ImportSkippedOut(filename=item.name, reason=item.reason)
+            for item in import_result.skipped
+        ],
+    )
+
+
+def _import_from_spool(
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    actor: Actor,
+    project_id: int,
+    spool: UploadSpool,
+    files: list[tuple[str, Path]],
+    fallback: datetime,
+    exif_timezone: str | None = None,
+) -> Result[ImportResult]:
+    """Import the spooled files; always removes the spool directory.
+
+    Synchronous, for the jobs executor. The worker owns the spool from the moment
+    it starts (``claim``), so a client that disconnects mid-import neither loses
+    the import nor leaves files behind. A job that never starts (the request was
+    cancelled while it was queued, or the executor shut down) is cleaned up by
+    the request instead.
+    """
+    spool.claim_or_raise()
     try:
-        result = await asyncio.to_thread(
-            frame_service.import_frames,
-            context.session_factory,
-            context.settings,
+        return frame_service.import_frames(
+            session_factory,
+            settings,
+            actor,
             project_id,
             files,
             fallback,
-            principal.user_id,
+            exif_timezone,
         )
-    except frame_service.ImportBatchTooLargeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-
-    return ImportResultOut(
-        imported_count=result.imported_count,
-        skipped_count=result.skipped_count,
-        skipped=[
-            ImportSkippedOut(filename=item.name, reason=item.reason)
-            for item in result.skipped
-        ],
-    )
+    finally:
+        spool.finish()

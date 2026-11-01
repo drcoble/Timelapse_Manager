@@ -203,7 +203,7 @@
           <button type="button"
                   class="btn btn-ghost btn-sm"
                   aria-label="Remove this event trigger"
-                  onclick="tlmEventTriggerRemoveRow(this);">
+                  data-action="trigger-remove">
             &times; Remove
           </button>
         </div>
@@ -218,7 +218,7 @@
   <div style="margin-top:var(--sp-3);">
     <button type="button"
             class="btn btn-secondary btn-sm"
-            onclick="tlmEventTriggerAddRow();">
+            data-action="trigger-add">
       &#43; Add event trigger
     </button>
   </div>
@@ -227,7 +227,7 @@
 </fieldset>
 
 {# ── Hidden template row — only needed in normal mode ────────────────────────
-   Cloned by tlmEventTriggerAddRow(). All name attributes present so the server
+   Cloned by the `trigger-add` action (static/js/project-forms.js). All name attributes present so the server
    receives them in the POST. trigger_id is blank (new row). trigger_enabled
    value is stamped by JS as "new:<index>" at clone time, counted among new rows
    only (not total rows) so the first added row is always "new:0" regardless of
@@ -295,7 +295,7 @@
       <button type="button"
               class="btn btn-ghost btn-sm"
               aria-label="Remove this event trigger"
-              onclick="tlmEventTriggerRemoveRow(this);">
+              data-action="trigger-remove">
         &times; Remove
       </button>
     </div>
@@ -303,101 +303,3 @@
   </div>
 </template>
 {% endif %}
-
-{# ── Inline controller ─────────────────────────────────────────────────────────
-   Same IIFE pattern as _exact_time_fieldset.html: functions exposed on window
-   so inline onclick= handlers can reach them.
-
-   tlmEventTriggerAddRow():
-     - Counts only existing new-row checkboxes (value starts with "new:") —
-       NOT total rows — to determine the "new:<index>" stamp. This ensures the
-       first row added to a project that already has saved triggers is "new:0",
-       which is what the server's zero-based among-new indexing expects.
-     - Clones #event-trigger-row-template, stamps the checkbox value, assigns
-       unique id/for pairs to labelled inputs, appends to #event-trigger-rows,
-       hides the empty-state paragraph.
-
-   tlmEventTriggerRemoveRow(buttonEl):
-     - Removes the nearest .event-trigger-row ancestor.
-     - Renumbers all remaining new-row checkbox values ("new:0", "new:1", …)
-       contiguously, leaving existing-row checkboxes (numeric DB ids) untouched.
-     - Shows the empty-state paragraph if no rows remain.
-#}
-<script>
-(function () {
-
-  /* ── Add row ─────────────────────────────────────────────────────────── */
-  function tlmEventTriggerAddRow() {
-    var container = document.getElementById('event-trigger-rows');
-    var template  = document.getElementById('event-trigger-row-template');
-    var emptyMsg  = document.getElementById('event-trigger-empty-state');
-    if (!container || !template) return;
-
-    /* Count only new-row checkboxes (value="new:…") — not total rows — so
-       the first added row on an existing project with saved triggers is
-       "new:0" rather than "new:<N>" where N is the count of existing rows. */
-    var newRows = container.querySelectorAll(
-      'input[name="trigger_enabled"][value^="new:"]'
-    );
-    var newIdx = newRows.length;
-
-    /* Clone the template content (DocumentFragment → first element child). */
-    var fragment = template.content.cloneNode(true);
-    var row      = fragment.querySelector('.event-trigger-row');
-
-    /* Stamp the checkbox value with "new:<index>". */
-    var chk = row.querySelector('input[name="trigger_enabled"]');
-    if (chk) { chk.value = 'new:' + newIdx; }
-
-    /* Assign unique id/for pairs so labels are correctly associated. */
-    var uid        = 'trigger-row-new-' + newIdx;
-    var topicSelect  = row.querySelector('select[name="trigger_topic"]');
-    var cooldownInput = row.querySelector('input[name="trigger_cooldown"]');
-
-    if (topicSelect)   { topicSelect.id   = uid + '-topic';    }
-    if (cooldownInput) { cooldownInput.id = uid + '-cooldown'; }
-
-    /* Update for= on labels to match the new ids. */
-    row.querySelectorAll('label.form-label').forEach(function (lbl) {
-      var ctrl = lbl.closest('.form-group').querySelector('[id]');
-      if (ctrl) { lbl.setAttribute('for', ctrl.id); }
-    });
-
-    container.appendChild(fragment);
-
-    /* Hide the empty-state message once we have at least one row. */
-    if (emptyMsg) { emptyMsg.hidden = true; }
-  }
-
-  /* ── Remove row ──────────────────────────────────────────────────────── */
-  function tlmEventTriggerRemoveRow(buttonEl) {
-    var row       = buttonEl.closest('.event-trigger-row');
-    var container = document.getElementById('event-trigger-rows');
-    var emptyMsg  = document.getElementById('event-trigger-empty-state');
-    if (!row || !container) return;
-
-    container.removeChild(row);
-
-    /* Renumber checkbox values for all remaining new-row entries so indices
-       stay contiguous and predictable for the server. Existing rows (whose
-       checkbox value is a numeric DB id) are left untouched. */
-    var newRowIdx = 0;
-    container.querySelectorAll('.event-trigger-row').forEach(function (r) {
-      var chk = r.querySelector('input[name="trigger_enabled"]');
-      if (chk && chk.value.indexOf('new:') === 0) {
-        chk.value = 'new:' + newRowIdx;
-        newRowIdx++;
-      }
-    });
-
-    /* Show the empty-state message when no rows remain. */
-    var remaining = container.querySelectorAll('.event-trigger-row');
-    if (emptyMsg && remaining.length === 0) { emptyMsg.hidden = false; }
-  }
-
-  /* Expose on window so inline onclick= handlers can reach them. */
-  window.tlmEventTriggerAddRow    = tlmEventTriggerAddRow;
-  window.tlmEventTriggerRemoveRow = tlmEventTriggerRemoveRow;
-
-}());
-</script>

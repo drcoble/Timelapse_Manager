@@ -108,6 +108,14 @@ class TestVerifyToken:
     def test_case_sensitive(self) -> None:
         assert verify_token("ABC123", "abc123") is False
 
+    def test_non_ascii_received_returns_false_not_typeerror(self) -> None:
+        # compare_digest raises TypeError on a non-ASCII str (#115).
+        assert verify_token("abc12\u00e9", "abc123") is False
+        assert verify_token("\u00e9" * 6, "abc123") is False
+
+    def test_lone_surrogate_received_returns_false(self) -> None:
+        assert verify_token("abc12\ud800", "abc123") is False
+
 
 # ---------------------------------------------------------------------------
 # require_local_token dependency (via the live API)

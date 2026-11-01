@@ -3,118 +3,89 @@
   Context: frame — {id, sequence_index, capture_timestamp, thumbnail_url, lifecycle_state}
            project — {id}
            current_user — {username, role}
-           csrf_token — str
 
   lifecycle_state: active | soft_deleted
+
+  Written compactly on purpose (#198): a grid batch is 60 of these, and the
+  indentation, repeated attributes and duplicate labels were most of its weight.
+  The batch is held to 60,000 bytes by tests/web/test_frames_batch_weight.py.
+  htmx's default swap style is innerHTML, and the grid (#frame-grid in frames.html)
+  sets hx-target (the drawer body, the thumbnail's target) and hx-push-url="false"
+  once, so a tile spells out a target only where it differs: Remove and Restore. The
+  drawer title comes from the drawer fragment, not from the tile. The thumbnail is
+  decorative (alt=""): its link is named by aria-label. The checkbox carries no
+  frame id: selection.js reads it from the tile's id ("frame-tile-<id>"), and the
+  empty indicator span needs no aria-hidden.
+
+  The whole card opens the drawer (#315) with no markup of its own: the thumbnail
+  link is a stretched link, its ::after covers the tile (css/screens/frames.css),
+  so a click on the number, timestamp, project label or a badge is a click on the
+  real anchor. Ctrl/Cmd/middle-click, Enter and the no-JS href all behave as they
+  do on the thumbnail. The select control and Remove/Restore sit above it.
 #}
-<div class="frame-tile {% if frame.lifecycle_state == 'soft_deleted' %}soft-deleted{% endif %}"
-     id="frame-tile-{{ frame.id }}"
-     {% if oob_tile | default(false) %}hx-swap-oob="outerHTML"{% endif %}
-     {# Capture time as epoch seconds (UTC) for the scroll-position cursor on the
-        interactive ribbon; the ribbon's data-start/data-end share this unit.
-        Omitted for a frame with no recorded capture time. #}
-     {% if frame.capture_epoch is not none %}data-timestamp="{{ frame.capture_epoch }}"{% endif %}
-     role="gridcell">
-
-  {# Thumb wrap: positions the drawer-opener anchor and (for operators) the
-     selection control over the same corner. The select control is a sibling of
-     the anchor, never nested in it — the anchor opens the drawer, the control
-     toggles selection, and selection.js keeps a click on one from triggering the
-     other. #}
-  <div class="frame-tile-thumb-wrap">
-    {% if can_operate %}
-    <label class="frame-tile-select" title="Select frame {{ frame.sequence_index }}">
-      <input type="checkbox" class="frame-select-cb visually-hidden"
-             data-frame-id="{{ frame.id }}"
-             aria-label="Select frame {{ frame.sequence_index }}">
-      <span class="frame-select-indicator" aria-hidden="true"></span>
-    </label>
-    {% endif %}
-
-    {# The thumbnail is the drawer opener: with JS it loads the frame-detail
-       fragment into the persistent drawer; the href is the no-JS fallback to the
-       full-page detail. #}
-    <a class="frame-thumb thumb-grid"
-       href="/projects/{{ frame.project_id }}/frames/{{ frame.id }}"
-       data-drawer-open="#drawer-main"
-       hx-get="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/drawer"
-       hx-target="#drawer-main .drawer-body"
-       hx-swap="innerHTML"
-       hx-push-url="false"
-       data-drawer-title="Frame #{{ frame.sequence_index }}"
-       aria-label="Open details for frame {{ frame.sequence_index }}">
-      {% if frame.thumbnail_url %}
-        <img src="{{ frame.thumbnail_url }}"
-             alt="Frame {{ frame.sequence_index }}, captured {{ frame.capture_timestamp_raw | localdt if frame.capture_timestamp_raw else (frame.capture_timestamp or '') }}"
-             loading="lazy">
-      {% else %}
-        <div class="frame-thumb-label">
-          <span class="frame-thumb-icon" aria-hidden="true">&#128196;</span>
-          <span>#{{ frame.sequence_index }}</span>
-        </div>
-      {% endif %}
-    </a>
-  </div>
-
-  <div class="frame-tile-meta">
-    <div>#{{ frame.sequence_index }}</div>
-    {# Project label appears only in the cross-project "All Projects" grid, where
-       project_name is populated; a single-project grid leaves it blank. #}
-    {% if frame.project_name %}
-      <div class="frame-tile-project" title="{{ frame.project_name }}">{{ frame.project_name }}</div>
-    {% endif %}
-    <div>{{ frame.capture_timestamp_raw | localdt if frame.capture_timestamp_raw else (frame.capture_timestamp or '—') }}</div>
-    {% if frame.lifecycle_state == 'soft_deleted' %}
-      <div style="color:var(--color-error);font-size:0.7rem;">deleted</div>
-    {% endif %}
-    {# Excluded-from-render marker. Distinct from the soft-deleted state above: an
-       excluded frame stays fully visible here but is skipped when the video is
-       rendered. The two are independent, so both markers can show at once. #}
-    {% if frame.excluded_at %}
-      <div class="badge-excluded" title="Skipped when the video is rendered">Excluded</div>
-    {% endif %}
-    {# Info: read-only, shown for all users; HTMX-enhanced with plain-link fallback #}
-    <a href="/projects/{{ frame.project_id }}/frames/{{ frame.id }}"
-       class="btn btn-xs btn-ghost"
-       hx-get="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/metadata"
-       hx-target="#frame-meta-panel"
-       hx-swap="innerHTML"
-       hx-push-url="false"
-       aria-label="View scene metadata for frame {{ frame.sequence_index }}"
-       title="Scene metadata">&#9432; Info</a>
-  </div>
-
-  {% if can_operate %}
-  {# In the cross-project grid (project_name set) the mutation re-render must keep
-     this tile's project label, so signal all_projects to the handler. #}
-  {% set ap_q = '?all_projects=1' if frame.project_name else '' %}
-  <div class="frame-tile-actions">
-    {% if frame.lifecycle_state == 'soft_deleted' %}
-      <form method="post"
-            action="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/restore{{ ap_q }}"
-            style="margin:0;"
-            hx-post="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/restore{{ ap_q }}"
-            hx-target="#frame-tile-{{ frame.id }}"
-            hx-swap="outerHTML">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="btn btn-xs btn-ghost" title="Restore frame">
-          &#8617; Restore
-        </button>
-      </form>
-    {% else %}
-      <form method="post"
-            action="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/soft-delete{{ ap_q }}"
-            style="margin:0;"
-            hx-post="/projects/{{ frame.project_id }}/frames/{{ frame.id }}/soft-delete{{ ap_q }}"
-            hx-target="#frame-tile-{{ frame.id }}"
-            hx-swap="outerHTML">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="btn btn-xs btn-ghost" title="Remove frame from render sequence">
-          &#128465; Remove
-        </button>
-      </form>
-    {% endif %}
-  </div>
-  {% endif %}
-
+{%- set base = '/projects/' ~ frame.project_id ~ '/frames/' ~ frame.id -%}
+{%- set taken = frame.capture_timestamp_raw | localdt if frame.capture_timestamp_raw else (frame.capture_timestamp or '') -%}
+{#- The markup below is written one element per line; the line breaks are
+    dropped from the output (replace('\n', '')), about 13 bytes a tile. -#}
+{%- set tile_markup -%}
+<div class="frame-tile{% if frame.lifecycle_state == 'soft_deleted' %} soft-deleted{% endif %}" id="frame-tile-{{ frame.id }}"
+{%- if oob_tile | default(false) %} hx-swap-oob="outerHTML"{% endif -%}
+{#- Capture time as epoch seconds (UTC) for the scroll-position cursor on the
+    interactive ribbon; the ribbon's data-start/data-end share this unit.
+    Omitted for a frame with no recorded capture time. #}
+{%- if frame.capture_epoch is not none %} data-timestamp="{{ frame.capture_epoch }}"{% endif %} role="gridcell">
+{#- Thumb wrap: positions the drawer-opener anchor and (for operators) the
+    selection control over the same corner. The select control is a sibling of
+    the anchor, never nested in it: the anchor opens the drawer, the control
+    toggles selection, and selection.js keeps a click on one from triggering the
+    other. #}
+<div class="frame-tile-thumb-wrap">
+{%- if can_operate %}
+<label class="frame-tile-select"><input type="checkbox" class="frame-select-cb visually-hidden" aria-label="Select frame {{ frame.sequence_index }}"><span class="frame-select-indicator"></span></label>
+{%- endif %}
+{#- The thumbnail link is the drawer opener for the whole card (stretched by
+    CSS): with JS it loads the frame-detail fragment into the persistent drawer;
+    the href is the no-JS fallback to the full-page detail. #}
+<a class="frame-thumb" href="{{ base }}" data-drawer-open="#drawer-main" hx-get="{{ base }}/drawer" aria-label="Frame {{ frame.sequence_index }}">
+{%- if frame.thumbnail_url %}<img src="{{ frame.thumbnail_url }}" alt="" loading="lazy">
+{%- else %}<div class="frame-thumb-label"><span class="frame-thumb-icon" aria-hidden="true">&#128196;</span><span>#{{ frame.sequence_index }}</span></div>
+{%- endif -%}
+</a>
 </div>
+<div class="frame-tile-meta">
+<div>#{{ frame.sequence_index }}</div>
+{#- Project label appears only in the cross-project "All Projects" grid, where
+    project_name is populated; a single-project grid leaves it blank. #}
+{%- if frame.project_name %}
+<div class="frame-tile-project" title="{{ frame.project_name }}">{{ frame.project_name }}</div>
+{%- endif %}
+<div>{{ taken or '—' }}</div>
+{%- if frame.lifecycle_state == 'soft_deleted' %}
+<div style="color:var(--color-error);font-size:0.7rem;">deleted</div>
+{%- endif %}
+{#- Excluded-from-render marker. Distinct from the soft-deleted state above: an
+    excluded frame stays fully visible here but is skipped when the video is
+    rendered. The two are independent, so both markers can show at once. #}
+{%- if frame.excluded_at %}
+<div class="badge-excluded" title="Skipped when the video is rendered">Excluded</div>
+{%- endif %}
+</div>
+{%- if can_operate %}
+{#- In the cross-project grid (project_name set) the mutation re-render must keep
+    this tile's project label, so signal all_projects to the handler. #}
+{%- set ap_q = '?all_projects=1' if frame.project_name else '' %}
+{#- Plain buttons, not per-tile <form>s: a form + hidden csrf_token per tile
+    was ~150 bytes x 60 tiles of markup. htmx sends the CSRF header from
+    csrf.js (the page's meta tag). The no-JS path is the thumbnail link to the
+    frame detail page, which has its own forms. #}
+<div class="frame-tile-actions">
+{%- if frame.lifecycle_state == 'soft_deleted' %}
+<button type="button" class="btn btn-xs btn-ghost" hx-post="{{ base }}/restore{{ ap_q }}" hx-target="closest .frame-tile" hx-swap="outerHTML">&#8617; Restore</button>
+{%- else %}
+<button type="button" class="btn btn-xs btn-ghost" hx-post="{{ base }}/soft-delete{{ ap_q }}" hx-target="closest .frame-tile" hx-swap="outerHTML">&#128465; Remove</button>
+{%- endif %}
+</div>
+{%- endif %}
+</div>
+{%- endset -%}
+{{- tile_markup | replace("\n", "") -}}

@@ -1,6 +1,6 @@
 [project]
 name = "timelapse-manager"
-version = "0.1.0"
+version = "0.2.0"
 description = "Capture stills from network IP cameras and assemble timelapse videos."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,12 +9,12 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Drew Coble" }]
 # Camera/ONVIF support is intentionally lean: WS-Discovery runs over the stdlib
 # `socket` module, ONVIF SOAP requests reuse the existing `httpx` client, and
-# all XML is parsed with the stdlib `xml.etree`. No heavyweight ONVIF/WSDL
-# client (e.g. onvif-zeep, wsdiscovery) is added, keeping the install small and
-# friendly to low-power hardware. RTSP frame grabs shell out to a bundled
-# ffmpeg binary rather than pulling in a native decoder.
+# all XML is parsed with the stdlib `xml.etree` behind `defusedxml`. No
+# heavyweight ONVIF/WSDL client (e.g. onvif-zeep, wsdiscovery) is added, keeping
+# the install small and friendly to low-power hardware. RTSP frame grabs shell
+# out to a bundled ffmpeg binary rather than pulling in a native decoder.
 dependencies = [
-    "fastapi>=0.115,<1.0",
+    "fastapi>=0.121,<1.0",
     "uvicorn[standard]>=0.34,<1.0",
     "jinja2>=3.1,<4.0",
     "pydantic>=2.9,<3.0",
@@ -34,7 +34,7 @@ dependencies = [
     # `keyring` stores the encryption key in the host OS secret store (macOS
     # Keychain, Windows Credential Manager, Linux Secret Service) with a
     # restricted-permission key file as the headless/Docker fallback.
-    "cryptography>=46.0.5,<47.0",
+    "cryptography>=49.0,<51.0",
     "keyring>=25.0,<26.0",
     # Timezone database for zoneinfo on Windows (stdlib zoneinfo uses the OS
     # tz database on macOS/Linux but needs this package on Windows).
@@ -46,6 +46,11 @@ dependencies = [
     # mock server (MOCK_SYNC) so the connector is unit-testable without a live
     # directory.
     "ldap3>=2.9,<3.0",
+    # Camera XML (SOAP, WS-Discovery, VAPIX) is untrusted. defusedxml wraps the
+    # stdlib parser to refuse DTDs and entity declarations, so a hostile device
+    # cannot use entity expansion (billion laughs) or external entities. It is
+    # pure Python with no further dependencies.
+    "defusedxml>=0.7.1,<1.0",
 ]
 
 [dependency-groups]
@@ -76,6 +81,8 @@ dev = [
     # wedging the whole job (the Gitea Actions runner does not enforce the
     # workflow-level timeout-minutes).
     "pytest-timeout>=2.3,<3.0",
+    # Type stubs for defusedxml (it ships none), for the strict mypy run.
+    "types-defusedxml>=0.7,<1.0",
 ]
 
 [project.scripts]
@@ -141,6 +148,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Per-test ceiling (pytest-timeout): a hung test fails by name instead of
+# stalling its xdist worker until the CI step budget kills the whole run.
+timeout = 300
 markers = [
     "ui: marks tests that require a real browser via Playwright (auto-skipped when browsers are not installed; run with -m ui)",
 ]

@@ -22,7 +22,7 @@ services:
       dockerfile: docker/Dockerfile
       platforms:
         - linux/amd64
-    image: timelapse-manager:latest
+    image: ghcr.io/drcoble/timelapse_manager:latest
     # Map the container HTTP port to the host. Change the host side to relocate.
     ports:
       - "8080:8080"

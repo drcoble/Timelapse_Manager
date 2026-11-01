@@ -1,0 +1,17 @@
+# Timelapse Manager configuration (shipped by the .deb/.rpm as a conffile).
+#
+# Edit this file freely: a package upgrade keeps your changes. It carries the
+# defaults the systemd unit already sets through TLM_CONFIG / TLM_PATHS__DATA_DIR /
+# TLM_DATABASE__URL, so the command-line tool, which has none of those in an
+# admin's shell, finds the service's data directory, token and database too.
+# Without it `sudo timelapse-manager setup-code` would look under the calling
+# account's ~/.local/share instead.
+#
+# Runtime overrides (ports, bind address, log level) belong in
+# /etc/timelapse-manager/timelapse-manager.env as TLM_* lines, which win over
+# this file; see docs/configuration.md for every setting.
+paths:
+  data_dir: /var/lib/timelapse-manager
+
+database:
+  url: sqlite:////var/lib/timelapse-manager/timelapse.db

@@ -122,10 +122,11 @@
         </form>
         {% endif %}
 
-        <form method="post" action="/users/{{ user.id }}/delete" style="margin:0;"
-              onsubmit="return confirm('Permanently remove this user? This cannot be undone.');">
+        <form method="post" action="/users/{{ user.id }}/delete" style="margin:0;">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button type="submit" role="menuitem" class="danger">Delete</button>
+          <button type="submit" role="menuitem" class="danger"
+                  data-action="confirm-click"
+                  data-confirm="Permanently remove this user? This cannot be undone.">Delete</button>
         </form>
       </div>
     </div>

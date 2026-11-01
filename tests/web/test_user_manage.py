@@ -8,6 +8,7 @@ demoting themselves into lockout).
 
 from __future__ import annotations
 
+import httpx
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of
@@ -388,3 +389,63 @@ class TestUserEditApply:
         )
         assert resp.status_code == 403
         assert _user_role("csrf-user") == "viewer"
+
+
+def _post_create(client: TestClient, **fields: str) -> httpx.Response:
+    """POST the create-user form with the given fields plus a valid CSRF token."""
+    csrf = csrf_of(client, "/users")
+    return client.post(
+        "/users",
+        data={"csrf_token": csrf, **fields},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+
+
+class TestCreateUserStatusMapping:
+    """The create adapter maps service errors to the pre-service HTTP statuses.
+
+    Every input problem stays a bare 400 (the create form is a normal redirecting
+    submit, not an HTMX swap); a duplicate username surfaces as a 409.
+    """
+
+    def test_short_password_is_400(self, admin_client: TestClient) -> None:
+        resp = _post_create(
+            admin_client,
+            username="shorty",
+            password="short",
+            password_confirm="short",
+            role="viewer",
+        )
+        assert resp.status_code == 400
+
+    def test_invalid_role_is_400(self, admin_client: TestClient) -> None:
+        resp = _post_create(
+            admin_client,
+            username="wizard",
+            password="ValidPass12345!",
+            password_confirm="ValidPass12345!",
+            role="superuser",
+        )
+        assert resp.status_code == 400
+
+    def test_password_mismatch_is_400(self, admin_client: TestClient) -> None:
+        resp = _post_create(
+            admin_client,
+            username="mismatch",
+            password="ValidPass12345!",
+            password_confirm="ValidPass99999!",
+            role="viewer",
+        )
+        assert resp.status_code == 400
+
+    def test_duplicate_username_is_409(self, admin_client: TestClient) -> None:
+        _create_user(admin_client, username="taken", role="viewer")
+        resp = _post_create(
+            admin_client,
+            username="taken",
+            password="ValidPass12345!",
+            password_confirm="ValidPass12345!",
+            role="viewer",
+        )
+        assert resp.status_code == 409

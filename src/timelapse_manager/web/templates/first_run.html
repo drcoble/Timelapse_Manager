@@ -6,17 +6,12 @@
   <meta name="csrf-token" content="{{ csrf_token }}">
   <title>Initial Setup — Timelapse Manager</title>
   {# No-flash theme: apply the localStorage preference before the stylesheet. #}
-  <script>
-    (function () {
-      try {
-        var pref = localStorage.getItem('theme');
-        if (pref === 'light' || pref === 'dark') {
-          document.documentElement.setAttribute('data-theme', pref);
-        }
-      } catch (e) {}
-    })();
-  </script>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="{{ static_url('js/theme-init.js') }}"></script>
+  {# Start the UI font download in parallel with the stylesheet. The href must be
+     byte-identical to the URL inside the CSS bundle (both come from static_url),
+     and crossorigin is required for a font preload to be reused. #}
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="{{ static_url('fonts/Geist-Variable.woff2') }}">
+  <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
 </head>
 {# First-run setup page has no app shell — runs before any user exists #}
 <body>
@@ -63,6 +58,33 @@
 
         <div class="form-stack">
 
+          {# One-time code proving the person setting up can read the server's
+             data directory (#67 S11). Never echoed back into the form. #}
+          <div class="form-group">
+            <label class="form-label" for="setup_code">
+              Setup code<span class="required" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="setup_code"
+              type="text"
+              name="setup_code"
+              class="form-control"
+              autocomplete="one-time-code"
+              autocapitalize="off"
+              spellcheck="false"
+              maxlength="64"
+              required
+              aria-required="true"
+              aria-describedby="setup-code-hint"
+              autofocus
+            >
+            <span class="form-hint" id="setup-code-hint">
+              Shown by <code>timelapse-manager setup-code</code> on the server, or
+              read from the <code>setup-code</code> file in the service's data
+              directory (the service log names the full path).
+            </span>
+          </div>
+
           <div class="form-group">
             <label class="form-label" for="username">
               Admin username<span class="required" aria-hidden="true">*</span>
@@ -76,7 +98,6 @@
               autocomplete="username"
               required
               aria-required="true"
-              autofocus
               value="{{ form_values.username | default('') }}"
             >
             <span class="form-hint">Choose a username for the administrator account.</span>

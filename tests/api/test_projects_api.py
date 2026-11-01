@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from timelapse_manager.config.settings import Settings
 from timelapse_manager.db.engine import create_db_engine
@@ -102,6 +103,54 @@ class TestCreateProject:
             mock_supervisor.notify_reconcile.assert_called_once_with()
         finally:
             ctx.capture_supervisor = previous
+
+    def test_create_commits_before_running_reconcile_effect(
+        self,
+        migrated_client: TestClient,
+        cam_auth_token: str,
+        settings_no_autostart: Settings,
+    ) -> None:
+        # The reconcile effect must fire only AFTER the row is committed: the
+        # supervisor reconciles on another thread in a fresh session and would not
+        # see an uncommitted row. Assert visibility from inside the notify seam --
+        # a separate connection that only sees committed data.
+        camera_id = _seed_camera(settings_no_autostart, protocol="vapix")
+        seen: dict[str, bool] = {}
+
+        def _assert_row_committed() -> None:
+            engine = create_db_engine(settings_no_autostart.database.url)
+            factory = create_session_factory(engine)
+            try:
+                with session_scope(factory) as session:
+                    row = session.execute(
+                        select(Project).where(Project.name == "Ordering Lapse")
+                    ).scalar_one_or_none()
+                    seen["visible"] = row is not None
+            finally:
+                engine.dispose()
+
+        ctx = get_context()
+        previous = ctx.capture_supervisor
+        mock_supervisor = MagicMock()
+        mock_supervisor.notify_reconcile.side_effect = _assert_row_committed
+        ctx.capture_supervisor = mock_supervisor
+        try:
+            resp = migrated_client.post(
+                API,
+                json={
+                    "name": "Ordering Lapse",
+                    "camera_id": camera_id,
+                    "capture_interval_seconds": 60,
+                },
+                headers=_auth(cam_auth_token),
+            )
+            assert resp.status_code == 201, resp.text
+        finally:
+            ctx.capture_supervisor = previous
+        mock_supervisor.notify_reconcile.assert_called_once_with()
+        # The fresh cross-connection session saw the row, proving commit happened
+        # before the effect ran.
+        assert seen.get("visible") is True
 
     def test_duplicate_name_returns_409(
         self,
@@ -843,3 +892,106 @@ class TestPauseResume:
     def test_pause_requires_auth(self, migrated_client: TestClient) -> None:
         resp = migrated_client.post(f"{API}/1/pause")
         assert resp.status_code == 401
+
+
+class TestStoragePathPolicyApi:
+    """PATCH enforces the storage_path policy (422, #67 S5); a clone copies no path."""
+
+    def _stored(self, settings: Settings, project_id: int) -> str | None:
+        engine = create_db_engine(settings.database.url)
+        try:
+            with session_scope(create_session_factory(engine)) as db:
+                proj = db.get(Project, project_id)
+                assert proj is not None
+                return proj.storage_path
+        finally:
+            engine.dispose()
+
+    def _set_raw(self, settings: Settings, project_id: int, value: str) -> None:
+        engine = create_db_engine(settings.database.url)
+        try:
+            with session_scope(create_session_factory(engine)) as db:
+                proj = db.get(Project, project_id)
+                assert proj is not None
+                proj.storage_path = value
+        finally:
+            engine.dispose()
+
+    def test_patch_into_data_dir_is_422(
+        self,
+        migrated_client: TestClient,
+        cam_auth_token: str,
+        settings_no_autostart: Settings,
+    ) -> None:
+        camera_id = _seed_camera(settings_no_autostart, protocol="vapix")
+        project_id = _create_project(
+            migrated_client, cam_auth_token, name="SP Data", camera_id=camera_id
+        )
+        planted = f"{settings_no_autostart.paths.data_dir}/planted"
+        resp = migrated_client.patch(
+            f"{API}/{project_id}",
+            json={"storage_path": planted},
+            headers=_auth(cam_auth_token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert self._stored(settings_no_autostart, project_id) is None
+
+    def test_patch_with_newline_is_422(
+        self,
+        migrated_client: TestClient,
+        cam_auth_token: str,
+        settings_no_autostart: Settings,
+    ) -> None:
+        camera_id = _seed_camera(settings_no_autostart, protocol="vapix")
+        project_id = _create_project(
+            migrated_client, cam_auth_token, name="SP NL", camera_id=camera_id
+        )
+        resp = migrated_client.patch(
+            f"{API}/{project_id}",
+            json={"storage_path": "/srv/x\nfile http://internal/"},
+            headers=_auth(cam_auth_token),
+        )
+        assert resp.status_code == 422, resp.text
+
+    def test_patch_repeating_a_legacy_value_is_accepted_unchanged(
+        self,
+        migrated_client: TestClient,
+        cam_auth_token: str,
+        settings_no_autostart: Settings,
+    ) -> None:
+        camera_id = _seed_camera(settings_no_autostart, protocol="vapix")
+        project_id = _create_project(
+            migrated_client, cam_auth_token, name="SP Legacy", camera_id=camera_id
+        )
+        legacy = f"{settings_no_autostart.paths.data_dir}/old-frames"
+        self._set_raw(settings_no_autostart, project_id, legacy)
+        resp = migrated_client.patch(
+            f"{API}/{project_id}",
+            json={"storage_path": legacy, "capture_interval_seconds": 120},
+            headers=_auth(cam_auth_token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert self._stored(settings_no_autostart, project_id) == legacy
+
+    def test_clone_of_project_in_data_dir_gets_the_default_layout(
+        self,
+        migrated_client: TestClient,
+        cam_auth_token: str,
+        settings_no_autostart: Settings,
+    ) -> None:
+        camera_id = _seed_camera(settings_no_autostart, protocol="vapix")
+        project_id = _create_project(
+            migrated_client, cam_auth_token, name="SP Clone", camera_id=camera_id
+        )
+        legacy = f"{settings_no_autostart.paths.data_dir}/old-frames"
+        self._set_raw(settings_no_autostart, project_id, legacy)
+        resp = migrated_client.post(
+            f"{API}/{project_id}/clone",
+            json={"name": "SP Clone copy"},
+            headers=_auth(cam_auth_token),
+        )
+        # The clone does not copy a storage path (#171), so the source's
+        # policy-breaking path is irrelevant to it.
+        assert resp.status_code == 201, resp.text
+        assert self._stored(settings_no_autostart, resp.json()["id"]) is None
+        assert self._stored(settings_no_autostart, project_id) == legacy

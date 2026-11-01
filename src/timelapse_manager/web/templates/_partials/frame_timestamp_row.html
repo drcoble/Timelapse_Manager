@@ -2,13 +2,14 @@
   Partial: frame_timestamp_row.html
   The capture-timestamp row inside the frame drawer. Rendered in display mode
   by default; an inline "Edit" reveals a datetime-local input + Save/Cancel.
-  Save does an hx-patch back to the frame and the server returns this same
+  The input reads and shows the time in the viewer's zone, like the jump boxes
+  and milestone times (#124); the server stores it as UTC. Save does an hx-patch back to the frame and the server returns this same
   partial (in display mode), swapped via outerHTML on #frame-timestamp-row, so
   the row settles back to display after a save. Cancel is a pure DOM toggle.
 
   Context:
     project_id    — int
-    frame         — _FrameView {id, capture_timestamp_raw, capture_timestamp_input}
+    frame         — _FrameView {id, capture_timestamp_raw}
     can_operate   — bool (only operators see the Edit affordance)
     csrf_token    — str
 #}
@@ -25,7 +26,7 @@
     {% if can_operate %}
       <button type="button" class="btn btn-xs btn-ghost"
               data-ts-edit
-              onclick="var r=this.closest('#frame-timestamp-row');r.querySelector('[data-ts-form]').hidden=false;this.hidden=true;"
+              data-action="ts-edit"
               aria-label="Edit capture timestamp">Edit</button>
     {% endif %}
   </div>
@@ -37,12 +38,13 @@
         hx-swap="outerHTML">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="datetime-local" name="capture_timestamp"
-           value="{{ frame.capture_timestamp_input }}"
-           aria-label="Capture timestamp">
+           value="{{ frame.capture_timestamp_raw | localdt('%Y-%m-%dT%H:%M') }}"
+           aria-label="Capture timestamp ({{ viewer_timezone | tz_label(frame.capture_timestamp_raw) }})"
+           aria-describedby="frame-ts-zone-hint">
+    <span class="form-hint" id="frame-ts-zone-hint">{{ viewer_timezone or 'UTC' }}</span>
     <button type="submit" class="btn btn-xs btn-primary">Save</button>
     <button type="button" class="btn btn-xs btn-ghost"
-            onclick="var r=this.closest('#frame-timestamp-row');this.closest('[data-ts-form]').hidden=true;r.querySelector('[data-ts-edit]').hidden=false;"
-            >Cancel</button>
+            data-action="ts-cancel">Cancel</button>
   </form>
   {% endif %}
 </div>

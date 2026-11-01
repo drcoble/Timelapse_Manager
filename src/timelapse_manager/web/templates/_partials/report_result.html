@@ -1,0 +1,78 @@
+{#
+  Partial: report_result.html -- shown after a report is filed (#8).
+
+  Replaces #report-form-container in the drawer, and is the body of the
+  full-page result (report_filed.html).
+
+  Context:
+    filed    -- FiledReport: report_key, saved, pending_destinations,
+                anonymized, github_issue_url (#21)
+    page_url -- where the reporter came from
+    in_page  -- true on the full page (renders a "Back" link)
+#}
+<div id="report-form-container" role="status">
+  {% if filed.saved %}
+  <div class="alert success">
+    <div class="alert-body">
+      Report <strong class="mono">{{ filed.report_key }}</strong> was saved.
+      Quote this id when you talk to the maintainers.
+    </div>
+  </div>
+  {% else %}
+  <div class="alert warning">
+    <div class="alert-body">
+      Report <strong class="mono">{{ filed.report_key }}</strong> was recorded, but the
+      diagnostic snapshot could not be saved. An administrator can see it under
+      Settings &rsaquo; Problem reports.
+    </div>
+  </div>
+  {% endif %}
+
+  {% if filed.github_issue_url %}
+  <div class="alert info" style="margin-top:var(--sp-4);" id="report-github-handoff">
+    <div class="alert-body">
+      <p style="margin:0 0 var(--sp-2);">
+        <strong>The GitHub issue is public.</strong> Open it, read the text, and
+        submit it from your own GitHub account only if nothing private is left.
+        Nothing is posted until you do.
+      </p>
+      <p style="margin:0;">
+        To include the diagnostic zip, download it below and drag it into the
+        issue's text box (GitHub cannot fetch it from here). If you attach it,
+        this zip is what becomes public: its anonymized log, events, settings
+        and diagnostics. Check it first: anonymizing is best effort and cannot
+        see inside free text such as a camera's own error messages.
+      </p>
+    </div>
+  </div>
+  {% endif %}
+
+  <dl class="about-list" style="margin-top:var(--sp-4);">
+    <dt>Saved on this server</dt>
+    <dd>{{ "Yes" if filed.saved else "No" }}</dd>
+    {% if filed.anonymized %}
+    <dt>Anonymized</dt>
+    <dd>Yes</dd>
+    {% endif %}
+    {% for destination in filed.pending_destinations %}
+    <dt>{{ {"email": "Email", "webhook": "Webhook", "gitea": "Issue tracker"}[destination] }}</dt>
+    <dd>Sending now</dd>
+    {% endfor %}
+  </dl>
+
+  <div style="display:flex;gap:var(--sp-3);margin-top:var(--sp-4);flex-wrap:wrap;">
+    {% if filed.github_issue_url %}
+    <a href="{{ filed.github_issue_url }}" class="btn btn-primary"
+       target="_blank" rel="noopener noreferrer">Open on GitHub</a>
+    {% endif %}
+    {% if filed.anonymized and filed.saved %}
+    <a href="/report/{{ filed.report_key }}/download" class="btn btn-secondary"
+       download>Download anonymized zip</a>
+    {% endif %}
+    {% if in_page %}
+    <a href="{{ page_url }}" class="btn btn-secondary">Back</a>
+    {% else %}
+    <button type="button" class="btn btn-secondary" data-drawer-close>Close</button>
+    {% endif %}
+  </div>
+</div>

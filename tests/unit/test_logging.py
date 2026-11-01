@@ -5,6 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from collections.abc import Iterator
+
+import pytest
 
 from timelapse_manager.config.settings import (
     LoggingSettings,
@@ -15,6 +18,29 @@ from timelapse_manager.logging import JsonFormatter, configure_logging
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_logger_disabled_flags() -> Iterator[None]:
+    """Undo ``disable_existing_loggers`` side effects so they cannot leak (#126).
+
+    The dictConfig tests below set ``disabled`` on every logger that exists, in
+    the whole process. Alembic's ``env.py`` keeps ``disabled`` on the migration
+    logger as it finds it, so a later test on the same xdist worker lost the
+    migration's warnings (``test_migration_031``).
+    """
+    manager = logging.getLogger().manager
+    before = {
+        name: logger.disabled
+        for name, logger in manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+    }
+    try:
+        yield
+    finally:
+        for name, logger in list(manager.loggerDict.items()):
+            if isinstance(logger, logging.Logger):
+                logger.disabled = before.get(name, False)
 
 
 def _make_settings(level: str = "DEBUG", fmt: str = "json") -> Settings:
@@ -311,3 +337,48 @@ class TestStartupBanner:
         assert mock_logger.info.called, "Expected configure_logging to call logger.info"
         call_args = mock_logger.info.call_args
         assert "Timelapse Manager starting" in call_args[0][0]
+
+
+class TestServerLoggersSurviveMigrations:
+    """Request tracebacks must reach the log after the in-process migration (#37).
+
+    The service runs Alembic before it serves. Alembic's ``env.py`` used to call
+    ``fileConfig`` with its default ``disable_existing_loggers=True``, which
+    disabled ``uvicorn.error`` (created when the service imports uvicorn), so a
+    request that ended ``500`` logged nothing but its access line.
+    """
+
+    def test_apply_migrations_leaves_uvicorn_error_enabled(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        import uvicorn  # noqa: F401 - creates the uvicorn loggers, as the service does
+
+        from timelapse_manager.config.settings import DatabaseSettings
+        from timelapse_manager.db.migrate import apply_migrations
+
+        server_logger = logging.getLogger("uvicorn.error")
+        server_logger.disabled = False
+        root = logging.getLogger()
+        original_level = root.level
+        original_handlers = root.handlers[:]
+        settings = _make_settings().model_copy(
+            update={"database": DatabaseSettings(url=f"sqlite:///{tmp_path / 'm.db'}")}
+        )
+        try:
+            apply_migrations(settings)
+            assert server_logger.disabled is False
+        finally:
+            root.setLevel(original_level)
+            root.handlers[:] = original_handlers
+
+    def test_configure_logging_reenables_server_loggers(self) -> None:
+        root = logging.getLogger()
+        original_level = root.level
+        original_handlers = root.handlers[:]
+        names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+        for name in names:
+            logging.getLogger(name).disabled = True
+        try:
+            configure_logging(_make_settings(level="INFO", fmt="text"))
+            assert [logging.getLogger(n).disabled for n in names] == [False] * 3
+        finally:
+            root.setLevel(original_level)
+            root.handlers[:] = original_handlers

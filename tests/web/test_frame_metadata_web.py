@@ -1,10 +1,8 @@
-"""Web tests for the frame metadata endpoints (F4).
+"""Web tests for the frame metadata views (F4, #315).
 
 Covers:
-- GET /projects/{pid}/frames/{fid}/metadata — the HTMX fragment endpoint:
-  - With a full scene-metadata envelope: groups and rows render.
-  - Null/absent metadata: the "No scene metadata" placeholder renders.
-  - Frame belongs to a different project: 404 (anti-IDOR guard).
+- GET /projects/{pid}/frames/{fid}/drawer — the drawer fragment carries the scene
+  metadata the removed Info panel showed (#315); the /metadata route is gone.
 - GET /projects/{pid}/frames/{fid} — the full-page no-JS fallback:
   - Renders the frame_detail.html page with the same metadata partial.
   - 404 for a frame in a different project.
@@ -91,79 +89,58 @@ def _seed_frame(
         return frame.id
 
 
-# ---------------------------------------------------------------------------
-# F4 — GET /projects/{pid}/frames/{fid}/metadata (HTMX fragment)
+# #315 — the drawer fragment carries the scene metadata (the removed Info panel)
 # ---------------------------------------------------------------------------
 
+_HX = {"HX-Request": "true"}
 
-class TestFrameMetadataFragment:
+
+class TestFrameDrawerSceneMetadata:
     def test_full_envelope_renders_groups(self, admin_client: TestClient) -> None:
-        """A frame with a full scene-metadata envelope renders its groups and rows."""
+        """The drawer shows the scene groups and rows, open, with the schema version."""
         project_id, _ = _seed_project(name="Meta Full")
         frame_id = _seed_frame(project_id, seq=1, scene_metadata=_FULL_ENVELOPE)
-        resp = admin_client.get(f"/projects/{project_id}/frames/{frame_id}/metadata")
+        resp = admin_client.get(
+            f"/projects/{project_id}/frames/{frame_id}/drawer", headers=_HX
+        )
         assert resp.status_code == 200
         html = resp.text
-        # Partial renders "Scene metadata — Frame #1".
-        assert "Scene metadata" in html
-        assert "Frame #1" in html
-        # Groups: Capture, Appearance, Exposure.
+        assert '<details class="frame-drawer-scene" open>' in html
         assert "Capture" in html
         assert "Appearance" in html
-        # Row labels from the Capture group.
         assert "Resolution" in html
         assert "Source" in html
-        # schema_version is rendered.
         assert "schema v1" in html
-        # No "No scene metadata" placeholder.
-        assert "No scene metadata recorded" not in html
-        # In the HTMX panel the close button is present (it clears the panel).
-        assert "Close metadata panel" in html
 
-    def test_null_metadata_renders_placeholder(self, admin_client: TestClient) -> None:
-        """A frame with no scene metadata renders the 'No scene metadata' notice."""
-        project_id, _ = _seed_project(name="Meta Null")
-        frame_id = _seed_frame(project_id, seq=1, scene_metadata=None)
-        resp = admin_client.get(f"/projects/{project_id}/frames/{frame_id}/metadata")
-        assert resp.status_code == 200
-        html = resp.text
-        assert "No scene metadata recorded for this frame" in html
-        # No group titles should appear.
-        assert "Capture" not in html
-
-    def test_empty_envelope_renders_placeholder(self, admin_client: TestClient) -> None:
-        """An empty dict scene_metadata renders the 'No scene metadata' notice."""
-        project_id, _ = _seed_project(name="Meta Empty")
-        frame_id = _seed_frame(project_id, seq=1, scene_metadata={})
-        resp = admin_client.get(f"/projects/{project_id}/frames/{frame_id}/metadata")
-        assert resp.status_code == 200
-        assert "No scene metadata recorded for this frame" in resp.text
-
-    def test_frame_in_different_project_returns_404(
+    def test_null_metadata_renders_collapsed_none(
         self, admin_client: TestClient
     ) -> None:
-        """Requesting a frame from the wrong project returns 404 (anti-IDOR guard)."""
-        project_a_id, _ = _seed_project(name="Meta IDOR A")
-        project_b_id, _ = _seed_project(name="Meta IDOR B")
-        # Frame lives in project B.
-        frame_id = _seed_frame(project_b_id, seq=1)
-        # Request it via project A's URL.
-        resp = admin_client.get(f"/projects/{project_a_id}/frames/{frame_id}/metadata")
-        assert resp.status_code == 404
+        """No scene metadata: the disclosure says (none) and stays collapsed."""
+        project_id, _ = _seed_project(name="Meta Null")
+        frame_id = _seed_frame(project_id, seq=1, scene_metadata=None)
+        resp = admin_client.get(
+            f"/projects/{project_id}/frames/{frame_id}/drawer", headers=_HX
+        )
+        assert resp.status_code == 200
+        assert '<details class="frame-drawer-scene">' in resp.text
+        assert "Scene metadata (none)" in resp.text
 
-    def test_nonexistent_frame_returns_404(self, admin_client: TestClient) -> None:
-        """A frame id that does not exist returns 404."""
-        project_id, _ = _seed_project(name="Meta Missing")
-        resp = admin_client.get(f"/projects/{project_id}/frames/999999/metadata")
-        assert resp.status_code == 404
-
-    def test_viewer_can_access_metadata(self, viewer_client: TestClient) -> None:
-        """Metadata endpoint is open to all authenticated roles (CurrentUser)."""
+    def test_viewer_can_open_the_drawer(self, viewer_client: TestClient) -> None:
+        """Viewing a frame is a read: any authenticated role."""
         project_id, _ = _seed_project(name="Meta Viewer")
         frame_id = _seed_frame(project_id, seq=1, scene_metadata=_FULL_ENVELOPE)
-        resp = viewer_client.get(f"/projects/{project_id}/frames/{frame_id}/metadata")
+        resp = viewer_client.get(
+            f"/projects/{project_id}/frames/{frame_id}/drawer", headers=_HX
+        )
         assert resp.status_code == 200
         assert "Scene metadata" in resp.text
+
+    def test_metadata_fragment_route_is_gone(self, admin_client: TestClient) -> None:
+        """The Info button's /metadata fragment endpoint was removed with it."""
+        project_id, _ = _seed_project(name="Meta Gone")
+        frame_id = _seed_frame(project_id, seq=1, scene_metadata=_FULL_ENVELOPE)
+        resp = admin_client.get(f"/projects/{project_id}/frames/{frame_id}/metadata")
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

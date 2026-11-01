@@ -125,3 +125,85 @@ class TestSentinelCannotAuthenticate:
         with session_scope(factory) as db:
             result = authenticate_user(db, "no-such-user", "anything", settings=s)
             assert result is None
+
+
+class TestUnknownUsernameTimingEqualization:
+    """The unknown-username path must run Argon2 verification too.
+
+    A username that does not exist used to return before any Argon2 work, while
+    a known username paid the cost of a full verify. That timing gap lets an
+    unauthenticated attacker enumerate valid usernames. The unknown-username
+    path now runs a verify against a throwaway decoy hash so its cost matches
+    the wrong-password path; these tests assert that equalising verify actually
+    runs and that login still fails.
+    """
+
+    def test_unknown_username_invokes_argon2_verify(
+        self,
+        factory: sessionmaker,  # type: ignore[type-arg]
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A missing username drives the Argon2 hasher's verify (timing decoy)."""
+        import argon2
+
+        calls: list[tuple[str, str]] = []
+        original_verify = argon2.PasswordHasher.verify
+
+        def spy(self: argon2.PasswordHasher, hashed: str, password: str) -> bool:
+            calls.append((hashed, password))
+            return original_verify(self, hashed, password)
+
+        monkeypatch.setattr(argon2.PasswordHasher, "verify", spy)
+
+        s = _fast_auth_settings()
+        with session_scope(factory) as db:
+            result = authenticate_user(db, "ghost-account", "irrelevant", settings=s)
+
+        assert result is None, "login must still fail for an unknown username"
+        assert calls, (
+            "Argon2 verify must run on the unknown-username path so its timing"
+            " matches the wrong-password path"
+        )
+
+    def test_decoy_verify_cannot_authenticate(
+        self,
+        factory: sessionmaker,  # type: ignore[type-arg]
+    ) -> None:
+        """The decoy verify never admits a user, whatever password is supplied."""
+        s = _fast_auth_settings()
+        with session_scope(factory) as db:
+            for attempt in ("", "irrelevant", "ghost-account", "AdminP@ssw0rd1"):
+                assert (
+                    authenticate_user(db, "ghost-account", attempt, settings=s) is None
+                )
+
+    def test_null_hash_account_invokes_argon2_verify(
+        self,
+        factory: sessionmaker,  # type: ignore[type-arg]
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The enabled NULL-hash sentinel must not be the uniquely fast path.
+
+        The sentinel is an enabled local account with no password hash, so it
+        falls past the unknown-username branch. Without equalisation here it
+        would short-circuit before any Argon2 work and stand out by timing; the
+        decoy verify must run for it too.
+        """
+        import argon2
+
+        calls: list[tuple[str, str]] = []
+        original_verify = argon2.PasswordHasher.verify
+
+        def spy(self: argon2.PasswordHasher, hashed: str, password: str) -> bool:
+            calls.append((hashed, password))
+            return original_verify(self, hashed, password)
+
+        monkeypatch.setattr(argon2.PasswordHasher, "verify", spy)
+
+        s = _fast_auth_settings()
+        with session_scope(factory) as db:
+            ensure_sentinel_admin(db)
+            result = authenticate_user(db, "system", "irrelevant", settings=s)
+
+        assert result is None, "the password-less sentinel must never authenticate"
+        assert calls, "Argon2 verify must run on the NULL-hash account path"

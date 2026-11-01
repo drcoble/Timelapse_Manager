@@ -61,11 +61,15 @@
       {% endwith %}
     </div>
 
-    {# PTZ preset / position picker. Server-rendered for the saved camera. #}
+    {# PTZ preset / position picker. Server-rendered for the saved camera. The
+       conflict warning sits inside the container, so choosing another camera
+       swaps it out with the picker (#69 CAM-R4). It is the shared picker
+       partial, and the request names this project so it is not listed as its
+       own conflict (#167). #}
     <div
       id="ptz-preset-container"
       aria-live="polite"
-      hx-get="/cameras/ptz-presets"
+      hx-get="/cameras/ptz-presets?project_id={{ project.id }}"
       hx-trigger="change from:#camera_id"
       hx-include="[name='camera_id']"
       hx-swap="innerHTML"
@@ -77,7 +81,7 @@
               ptz_pan = ptz_pan,
               ptz_tilt = ptz_tilt,
               ptz_zoom = ptz_zoom %}
-        {% include "_partials/ptz_preset_select.html" %}
+        {% include "_partials/ptz_preset_picker.html" %}
       {% endwith %}
     </div>
 
@@ -92,7 +96,7 @@
         <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
           <input type="radio" name="capture_mode" value="interval"
                  {% if not _is_solar_mode %}checked{% endif %}
-                 onchange="tlmCaptureModeChange(this);"
+                 data-action="capture-mode"
                  style="accent-color:var(--color-accent);margin-top:3px;">
           <span>
             <strong>Continuous (interval)</strong>
@@ -102,7 +106,7 @@
         <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
           <input type="radio" name="capture_mode" value="solar"
                  {% if _is_solar_mode %}checked{% endif %}
-                 onchange="tlmCaptureModeChange(this);"
+                 data-action="capture-mode"
                  style="accent-color:var(--color-accent);margin-top:3px;">
           <span>
             <strong>Solar / scheduled times only</strong>
@@ -261,14 +265,16 @@
                 hx-trigger="change, load"
                 hx-target="#render-combo-warning"
                 hx-swap="innerHTML"
-                hx-include="[name^='render_']"
+                hx-include="#render_encoder,#render_container"
               >
                 <option value="libx264"{% if project.render_settings.encoder == 'libx264' %} selected{% endif %}>H.264 (libx264)</option>
                 <option value="libx265"{% if project.render_settings.encoder == 'libx265' %} selected{% endif %}>H.265 (libx265)</option>
                 <option value="libsvtav1"{% if project.render_settings.encoder == 'libsvtav1' %} selected{% endif %}>AV1 (libsvtav1)</option>
                 <option value="libvpx-vp9"{% if project.render_settings.encoder == 'libvpx-vp9' %} selected{% endif %}>VP9 (libvpx-vp9)</option>
               </select>
-              <span class="form-hint">The video codec.</span>
+              <span class="form-hint">The video codec. H.264 plays in every
+                browser; the others play only in browsers that support them,
+                and the rest download the file.</span>
             </div>
 
             <div class="form-group">
@@ -281,7 +287,7 @@
                 hx-trigger="change"
                 hx-target="#render-combo-warning"
                 hx-swap="innerHTML"
-                hx-include="[name^='render_']"
+                hx-include="#render_encoder,#render_container"
               >
                 <option value="mp4"{% if project.render_settings.container == 'mp4' %} selected{% endif %}>MP4 (mp4)</option>
                 <option value="mkv"{% if project.render_settings.container == 'mkv' %} selected{% endif %}>MKV (mkv)</option>
@@ -305,12 +311,24 @@
                 step="1"
                 value="{{ project.render_settings.fps }}"
                 aria-describedby="render-fps-hint"
+                {% if project.render_settings.fps_auto %}disabled{% endif %}
               >
+              <label class="form-label" for="render_fps_auto" style="display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-2);">
+                <input
+                  id="render_fps_auto"
+                  type="checkbox"
+                  name="render_fps_auto"
+                  data-action="fps-auto-toggle"
+                  data-fps-input="render_fps"
+                  {% if project.render_settings.fps_auto %}checked{% endif %}
+                >
+                Auto (suggested)
+              </label>
               {% if project.fps_suggestions %}
                 <div style="display:flex;gap:var(--sp-2);flex-wrap:wrap;margin-top:var(--sp-2);">
                   {% for fps in project.fps_suggestions %}
                     <button type="button" class="btn btn-sm btn-secondary"
-                            onclick="tlmSetRenderFps({{ fps }});">
+                            data-action="set-render-fps" data-fps="{{ fps }}">
                       {{ fps }} fps
                     </button>
                   {% endfor %}
@@ -319,7 +337,8 @@
               <span class="form-hint" id="render-fps-hint">
                 Playback frame rate of the timelapse. The suggestions above are
                 sensible rates for this project's capture interval; any whole
-                number from 1 to 240 is allowed.
+                number from 1 to 240 is allowed. Auto works out the rate from
+                the captured frames each time a scheduled render starts.
               </span>
             </div>
 
@@ -336,14 +355,6 @@
             </div>
           </div>
         </fieldset>
-
-        {# Suggestion chips set the frame-rate input to a sensible rate. #}
-        <script>
-          function tlmSetRenderFps(value) {
-            var input = document.getElementById('render_fps');
-            if (input) { input.value = value; }
-          }
-        </script>
 
         <div class="form-group">
           <label class="form-label" for="archive_schedule">Archive schedule (JSON)</label>
@@ -440,53 +451,4 @@
     </div>
 
   </div>
-
-  {# Capture-mode toggle: show/hide interval + schedule-window fields vs the
-     solar/exact-time anchors, and disable the (required) interval input when it
-     is hidden so it neither validates nor submits in solar mode. Mirrors the
-     inline-script pattern used by the fieldsets above. #}
-  <script>
-  (function () {
-    function tlmCaptureModeSync() {
-      var checked = document.querySelector('input[name="capture_mode"]:checked');
-      var solar = !!(checked && checked.value === 'solar');
-      document.querySelectorAll('.interval-only-field').forEach(function (el) {
-        el.hidden = solar;
-      });
-      var intervalInput = document.getElementById('capture_interval_value');
-      if (intervalInput) { intervalInput.disabled = solar; }
-      var unit = document.querySelector('select[name="capture_interval_unit"]');
-      if (unit) { unit.disabled = solar; }
-    }
-    function tlmCaptureModeChange() {
-      tlmCaptureModeSync();
-      var checked = document.querySelector('input[name="capture_mode"]:checked');
-      if (checked && checked.value === 'solar') {
-        // A solar project needs at least one capture time; seed one if empty so
-        // the operator starts from a valid, ready-to-edit row. Default it to a
-        // solar-noon anchor (the headline use case) when the camera has a
-        // location; otherwise leave the fieldset's clock default.
-        var rows = document.querySelectorAll('#exact-time-rows .exact-time-row');
-        if (rows.length === 0 && typeof window.tlmExactTimeAddRow === 'function') {
-          window.tlmExactTimeAddRow();
-          var added = document.querySelectorAll('#exact-time-rows .exact-time-row');
-          var newRow = added[added.length - 1];
-          var kind = newRow && newRow.querySelector('select[name="anchor_kind"]');
-          var solarOpt = kind && kind.querySelector('option[value="solar_noon"]');
-          if (kind && solarOpt && !solarOpt.disabled) {
-            kind.value = 'solar_noon';
-            if (typeof window.tlmExactTimeKindChange === 'function') {
-              window.tlmExactTimeKindChange(kind);  // hide the clock time field
-            }
-          }
-        }
-      }
-    }
-    window.tlmCaptureModeChange = tlmCaptureModeChange;
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', tlmCaptureModeSync);
-    }
-    tlmCaptureModeSync();  // also run now (covers HTMX-swapped fragment loads)
-  }());
-  </script>
 </form>

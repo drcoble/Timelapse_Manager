@@ -1,0 +1,20 @@
+{# The render form's frame-rate suggestion (#301). data-suggested-fps is read by
+   static/js/project-forms.js, which pre-fills the field unless the user typed. #}
+<div data-suggested-fps="{{ suggestion.fps if suggestion.fps is not none else '' }}">
+  {% if suggestion.fps is not none %}
+  <span class="form-hint" id="trigger-fps-suggestion-label">{{ suggestion_label }}</span>
+  <button type="button" class="btn btn-sm btn-secondary"
+          data-action="use-suggested-fps" data-fps-input="trigger-render-fps"
+          data-fps="{{ suggestion.fps }}">Use suggested</button>
+  {% if few_frames %}
+  <p class="form-hint" style="margin-top:var(--sp-1);">
+    Only {{ suggestion.frame_count }} frame{{ '' if suggestion.frame_count == 1 else 's' }}
+    so far, so the video will be short.
+  </p>
+  {% endif %}
+  {% else %}
+  <span class="form-hint" id="trigger-fps-suggestion-label">
+    No suggestion yet: it needs at least two captured frames.
+  </span>
+  {% endif %}
+</div>

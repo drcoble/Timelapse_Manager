@@ -40,9 +40,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import CursorResult, func, update
+from sqlalchemy import ColumnElement, CursorResult, bindparam, func, select, update
 
 from ..db.models import Event
+from ..db.models.event import OPEN_ALERT_INDEX_LEVELS
 from .events import _levels_at_or_above
 
 if TYPE_CHECKING:
@@ -73,6 +74,12 @@ _REASON_KEY = "reason"
 RESOLVE_TO_RAISE_REASONS: dict[str, frozenset[str]] = {
     "disk_recovered": frozenset({"low_disk"}),
     "camera_recovered": frozenset({"camera_offline"}),
+    # An exact-time anchor that captured again after a day that ended in a
+    # final failure (#69, CAM-R1).
+    "anchor_recovered": frozenset({"anchor_failed"}),
+    # A camera's event listeners subscribed again after ``events_unavailable``
+    # (#69 CAM-R7).
+    "events_available": frozenset({"events_unavailable"}),
 }
 
 
@@ -124,6 +131,36 @@ def _to_active_alert(event: Event) -> ActiveAlert:
     )
 
 
+def _open_alert_criteria(levels: list[str]) -> list[ColumnElement[bool]]:
+    """Return the WHERE terms for uncleared events at one of ``levels``.
+
+    When ``levels`` is within the alert levels (the threshold or a higher
+    floor), the terms repeat the partial predicate of ``ix_event_open_alerts``
+    (migration 033) with the level list rendered as literals: SQLite uses a
+    partial index only when it can prove the query implies the index's WHERE,
+    and it cannot see through bound parameters. A higher floor adds its own
+    level set on top, which only narrows the result. A floor below the
+    threshold cannot use the index and keeps the plain filter.
+    """
+    criteria: list[ColumnElement[bool]] = [Event.alert_cleared_at.is_(None)]
+    if not set(levels) <= set(OPEN_ALERT_INDEX_LEVELS):
+        criteria.append(Event.level.in_(levels))
+        return criteria
+    criteria.append(
+        Event.level.in_(
+            bindparam(
+                "open_alert_levels",
+                list(OPEN_ALERT_INDEX_LEVELS),
+                expanding=True,
+                literal_execute=True,
+            )
+        )
+    )
+    if set(levels) != set(OPEN_ALERT_INDEX_LEVELS):
+        criteria.append(Event.level.in_(levels))
+    return criteria
+
+
 def get_active_alerts(
     session: Session,
     *,
@@ -150,19 +187,27 @@ def get_active_alerts(
         ignoring ``limit``/``offset``.
     """
     floor = level_floor if level_floor is not None else ALERT_LEVEL_THRESHOLD
-    query = session.query(Event).filter(
-        Event.alert_cleared_at.is_(None),
-        Event.level.in_(_levels_at_or_above(floor)),
-    )
+    criteria = _open_alert_criteria(_levels_at_or_above(floor))
     if scope is not None:
-        query = query.filter(Event.scope == scope)
+        criteria.append(Event.scope == scope)
     if scope_id is not None:
-        query = query.filter(Event.scope_id == scope_id)
-    total = query.count()
+        criteria.append(Event.scope_id == scope_id)
+    # A direct COUNT, not ``Query.count()``, which wraps the query in a
+    # sub-select.
+    total = int(
+        session.execute(
+            select(func.count()).select_from(Event).where(*criteria)
+        ).scalar_one()
+    )
     rows = (
-        query.order_by(Event.timestamp.desc(), Event.id.desc())
-        .limit(max(1, limit))
-        .offset(max(0, offset))
+        session.execute(
+            select(Event)
+            .where(*criteria)
+            .order_by(Event.timestamp.desc(), Event.id.desc())
+            .limit(max(1, limit))
+            .offset(max(0, offset))
+        )
+        .scalars()
         .all()
     )
     return [_to_active_alert(row) for row in rows], total
@@ -237,6 +282,7 @@ def auto_clear_for_event(
     scope: str,
     scope_id: int | None,
     reason: str | None,
+    resolve_event_id: int | None = None,
 ) -> int:
     """Auto-clear active alerts matching a resolve signal, by scope + scope_id.
 
@@ -252,6 +298,13 @@ def auto_clear_for_event(
     it works for both event write paths (``log_event`` and the supervisor's
     untyped ``_write_event``). A later recurrence of the condition simply logs a
     fresh event (re-raising the alert); a cleared alert is never un-cleared.
+
+    ``resolve_event_id`` is the id of the resolving event. When it is given, only
+    alerts raised *before* it (a lower event id) are cleared (#134). Without the
+    bound, the sequence offline, recovered, offline, all committed before the
+    dispatcher reads "recovered", would clear the second offline alert too and
+    leave a down camera with no alert. The dispatcher always passes it; ``None``
+    (no bound) is kept for direct callers that clear "now".
 
     :returns: the number of alerts auto-cleared (``0`` when ``reason`` is not a
         resolve signal or nothing matched).
@@ -283,6 +336,8 @@ def auto_clear_for_event(
         stmt = stmt.where(Event.scope_id.is_(None))
     else:
         stmt = stmt.where(Event.scope_id == scope_id)
+    if resolve_event_id is not None:
+        stmt = stmt.where(Event.id < resolve_event_id)
     result = cast("CursorResult[Any]", session.execute(stmt))
     cleared = int(result.rowcount or 0)
     if cleared:

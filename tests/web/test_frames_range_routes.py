@@ -165,6 +165,45 @@ class TestRangeMaterialize:
         assert resp.status_code == 200
         assert resp.json() == {"frame_ids": sorted(timed)}
 
+    def test_over_cap_range_is_413_and_nothing_resolved(
+        self, operator_client: TestClient
+    ) -> None:
+        """A range larger than ``frames.max_range_ids`` is refused (#67 P9)."""
+        pid = _seed_project(name="Range Cap")
+        for i in range(4):
+            _seed_frame(pid, seq=i)
+        get_context().settings.frames.max_range_ids = 3
+        csrf = csrf_of(operator_client, "/frames")
+        resp = operator_client.post(
+            "/frames/range/materialize",
+            data={"descriptor": json.dumps(_descriptor(pid)), "csrf_token": csrf},
+            headers=_FORM,
+        )
+        assert resp.status_code == 413
+        assert "Range too large; narrow the selection" in resp.text
+        # The count route still reports the number the UI shows.
+        counted = operator_client.post(
+            "/frames/range/count",
+            data={"descriptor": json.dumps(_descriptor(pid)), "csrf_token": csrf},
+            headers=_FORM,
+        )
+        assert counted.json() == {"count": 4}
+
+    def test_range_exactly_at_the_cap_is_allowed(
+        self, operator_client: TestClient
+    ) -> None:
+        pid = _seed_project(name="Range At Cap")
+        ids = [_seed_frame(pid, seq=i) for i in range(3)]
+        get_context().settings.frames.max_range_ids = 3
+        csrf = csrf_of(operator_client, "/frames")
+        resp = operator_client.post(
+            "/frames/range/materialize",
+            data={"descriptor": json.dumps(_descriptor(pid)), "csrf_token": csrf},
+            headers=_FORM,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"frame_ids": sorted(ids)}
+
 
 class TestDescriptorBulk:
     def test_descriptor_bulk_applies_to_all_in_range(

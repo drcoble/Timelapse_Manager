@@ -1,0 +1,175 @@
+{#
+  Partial: report_form.html -- the "Report a problem" form (#8).
+
+  Shared by the drawer (/drawers/report) and the full page (/report). The root
+  carries id="report-form-container"; the HTMX submit swaps it (outerHTML) for
+  either this form again with an inline error, or the result fragment.
+
+  Context:
+    values           -- dict: title, description, area, project_id, camera_id,
+                        when (datetime-local, viewer's zone), include_snapshot,
+                        page_url
+    project_name     -- the related project's name, or None
+    areas            -- {value: label}
+    snapshot_summary -- plain-language lines describing the snapshot
+    own_reports      -- the reporter's recent Report rows
+    max_upload_mb    -- the upload cap, for the hint
+    form_error       -- an inline error message, or None
+    in_drawer        -- render Cancel as a drawer-close button
+    github_enabled   -- every report is anonymized and offered as a public
+                        GitHub issue (#21); no screenshot, no anonymize box
+    github_repo      -- owner/name of the public repository
+
+  No-JS path: a real multipart POST to /report with a csrf_token part (the
+  CSRF middleware reads it); the response is a full page.
+#}
+<div id="report-form-container">
+<form method="post"
+      action="/report"
+      enctype="multipart/form-data"
+      novalidate
+      hx-post="/report"
+      hx-encoding="multipart/form-data"
+      data-htmx-timeout="none"
+      hx-target="#report-form-container"
+      hx-swap="outerHTML"
+      hx-disabled-elt="[data-report-submit]">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="page_url" value="{{ values.page_url }}">
+  {# Tells the submit route where the form lives, so a re-rendered form keeps
+     the right Cancel and the result the right Close/Back. #}
+  {% if in_drawer %}<input type="hidden" name="in_drawer" value="1">{% endif %}
+  {% if values.project_id %}<input type="hidden" name="project_id" value="{{ values.project_id }}">{% endif %}
+  {% if values.camera_id %}<input type="hidden" name="camera_id" value="{{ values.camera_id }}">{% endif %}
+
+  <div class="form-stack">
+
+    {% if form_error %}
+    <div class="alert error" role="alert">
+      <div class="alert-body">{{ form_error }}</div>
+    </div>
+    {% endif %}
+
+    <div class="form-group">
+      <label class="form-label" for="report-title">
+        Title<span class="required" aria-hidden="true">*</span>
+      </label>
+      <input type="text" id="report-title" name="title" class="form-control"
+             maxlength="200" required autocomplete="off"
+             value="{{ values.title }}"
+             placeholder="e.g. Roof camera stopped capturing at noon">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="report-description">What happened, and what you expected</label>
+      <textarea id="report-description" name="description" class="form-control"
+                rows="6">{{ values.description }}</textarea>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="report-when">When</label>
+        <input type="datetime-local" id="report-when" name="when"
+               class="form-control mono" value="{{ values.when }}"
+               aria-describedby="report-when-hint">
+        <span class="form-hint" id="report-when-hint">Within the last 24 hours, in your time zone.</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="report-area">Area</label>
+        <select id="report-area" name="area" class="form-control">
+          {% for value, label in areas.items() %}
+          <option value="{{ value }}" {% if value == values.area %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    {% if values.project_id %}
+    <div class="form-group">
+      <span class="form-label">Related project</span>
+      <span>{{ project_name or "Project" }} <span class="mono">#{{ values.project_id }}</span>
+        {% if values.camera_id %}&middot; camera <span class="mono">#{{ values.camera_id }}</span>{% endif %}</span>
+    </div>
+    {% endif %}
+
+    {% if github_enabled %}
+    {# Every report is anonymized and offered as a public GitHub issue (#21).
+       The server enforces this; there is nothing to tick. #}
+    <div class="alert info" id="report-github-notice">
+      <div class="alert-body">
+        This report will be <strong>anonymized</strong> and prepared as a
+        <strong>public issue</strong> on
+        <span class="mono">github.com/{{ github_repo }}</span>. User, project and
+        camera names, host names, addresses and paths are replaced with
+        placeholders such as <span class="mono">camera-1</span>, and the copy kept
+        on this server is the anonymized one. After you send it you can review
+        the issue text and submit it from your own GitHub account.
+        Screenshots are not included because they cannot be anonymized; you can
+        add one on GitHub after checking it.
+      </div>
+    </div>
+    {% else %}
+    <div class="form-group">
+      <label class="form-label" for="report-attachment">Screenshot (optional)</label>
+      <input type="file" id="report-attachment" name="attachment" class="form-control"
+             accept="image/png,image/jpeg,image/webp,image/gif"
+             aria-describedby="report-attachment-hint">
+      <span class="form-hint" id="report-attachment-hint">PNG, JPEG, WebP or GIF, up to {{ max_upload_mb }} MB. Left out if you anonymize the report.</span>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" style="display:flex;align-items:center;gap:var(--sp-2);">
+        <input type="checkbox" name="anonymize" value="on"
+               aria-describedby="report-anonymize-hint"
+               {% if values.anonymize %}checked{% endif %}>
+        Anonymize private data
+      </label>
+      <span class="form-hint" id="report-anonymize-hint">
+        Replaces user, project and camera names, host names, addresses and paths
+        with placeholders, and leaves the screenshot out. The copy kept on this
+        server is then the anonymized one, and you can download it afterwards.
+      </span>
+    </div>
+    {% endif %}
+
+    <div class="form-group">
+      <label class="form-label" style="display:flex;align-items:center;gap:var(--sp-2);">
+        <input type="checkbox" name="include_snapshot" value="on"
+               {% if values.include_snapshot %}checked{% endif %}>
+        Include a diagnostic snapshot
+      </label>
+      <details>
+        <summary class="form-hint">What the snapshot contains</summary>
+        <ul class="form-hint" style="margin:var(--sp-2) 0 0;padding-left:var(--sp-5);">
+          {% for line in snapshot_summary %}<li>{{ line }}</li>{% endfor %}
+        </ul>
+        <p class="form-hint" style="margin-top:var(--sp-2);">
+          Passwords, tokens, keys, cookies and camera credentials are removed, and
+          no frames or images are included except the screenshot you attach.
+        </p>
+      </details>
+    </div>
+
+    <div style="display:flex;gap:var(--sp-3);">
+      <button type="submit" class="btn btn-primary" data-report-submit>Send report</button>
+      {% if in_drawer %}
+      <button type="button" class="btn btn-ghost" data-drawer-close>Cancel</button>
+      {% else %}
+      <a href="{{ values.page_url or '/' }}" class="btn btn-ghost">Cancel</a>
+      {% endif %}
+    </div>
+
+    {% if own_reports %}
+    <div class="form-group">
+      <span class="form-label">Your recent reports</span>
+      <ul class="form-hint" style="margin:0;padding-left:var(--sp-5);">
+        {% for report in own_reports %}
+        <li><span class="mono">{{ report.report_key }}</span> &middot; {{ report.title }} &middot; {{ report.created_at | localdt }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+  </div>
+</form>
+</div>

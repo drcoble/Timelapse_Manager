@@ -15,6 +15,7 @@ from fastapi.responses import (
 )
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
+from starlette.concurrency import run_in_threadpool
 
 from ...db.models import Camera, Event, Frame, Project, RenderJob, User
 from ...render import settings as render_settings
@@ -45,14 +46,21 @@ from ._shared import (
     _parse_ptz_fields,
     _parse_render_settings_field,
     _resolve_stream_label,
+    _settings,
     capture_mode_of,
+    exact_time_anchors_from_rows,
 )
+from ._values import load_camera_with_facts
 from ._viewmodels import (
     _camera_view,
+    _export_view,
     _fmt_bytes,
+    _latest_render_view,
     _project_view,
     _project_views,
+    _ProjectView,
     _render_view,
+    dashboard_poll_version,
 )
 from .milestones import milestone_views
 
@@ -60,15 +68,42 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Request and response header of the dashboard grid poll (#70 F-P1). poll.js
+# echoes the last version it got; an unchanged grid is answered 204, which
+# htmx does not swap.
+POLL_VERSION_HEADER = "X-TLM-Poll-Version"
+
+
+def _grid_version(views: list[_ProjectView], user: User) -> str:
+    """Return the poll version of the dashboard grid for these active views."""
+    return dashboard_poll_version(
+        views,
+        role=getattr(user, "role", None),
+        viewer_timezone=getattr(user, "viewer_timezone", None),
+    )
+
 
 @router.get("/", response_class=HTMLResponse)
 @router.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, db: DbDep, user: CurrentUser) -> Response:
-    """Render the dashboard: project status cards for every project."""
+    """Render the dashboard: project status cards for every project.
+
+    ``grid_version`` seeds the grid poller with the version of the active
+    cards it renders, so the first poll after load is already a 204 when
+    nothing changed.
+    """
+    projects = _project_views(db)
+    active = [p for p in projects if p.lifecycle_state == "active"]
     return templates.TemplateResponse(
         request,
         "dashboard.html",
-        deps.base_context(request, db, user, projects=_project_views(db)),
+        deps.base_context(
+            request,
+            db,
+            user,
+            projects=projects,
+            grid_version=_grid_version(active, user),
+        ),
     )
 
 
@@ -80,8 +115,18 @@ def partial_projects(request: Request, db: DbDep, user: CurrentUser) -> Response
     class survives the swap, matching the dashboard's inner content. Only active
     projects are shown, mirroring the dashboard's polled region. The grid is
     assembled from the per-card template so card markup stays single-sourced.
+
+    The response carries ``X-TLM-Poll-Version``, a digest of the cards' view
+    values. A poll that sends back the current version gets an empty 204, so an
+    unchanged dashboard costs no render, no transfer and no swap (#70 F-P1).
     """
-    active = [p for p in _project_views(db) if p.lifecycle_state == "active"]
+    active = _project_views(db, lifecycle_state="active")
+    version = _grid_version(active, user)
+    if request.headers.get(POLL_VERSION_HEADER) == version:
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={POLL_VERSION_HEADER: version},
+        )
     if not active:
         body = (
             '<div class="empty-state">'
@@ -96,7 +141,7 @@ def partial_projects(request: Request, db: DbDep, user: CurrentUser) -> Response
             card.render({**context, "project": project}) for project in active
         )
         body = f'<div class="project-grid">{cards}</div>'
-    return HTMLResponse(body)
+    return HTMLResponse(body, headers={POLL_VERSION_HEADER: version})
 
 
 @router.get("/partials/projects/{project_id}/status", response_class=HTMLResponse)
@@ -242,31 +287,80 @@ def partial_project_ribbon(
 
 
 @router.get("/projects/preflight", response_class=HTMLResponse)
-def project_preflight(
-    request: Request,
-    db: DbDep,
-    user: OperatorUser,
-    capture_interval_value: str = "",
-    capture_interval_unit: str = "seconds",
-) -> Response:
+def project_preflight(request: Request, db: DbDep, user: OperatorUser) -> Response:
     """Storage pre-flight: estimate a new project's daily growth vs free disk.
 
-    Lazy-loaded as the operator sets the capture interval in the create form, so
-    they see the storage impact before committing. Registered before
-    ``/projects/{project_id}`` so the literal path wins. Returns an empty body
-    until a valid interval is entered.
+    Lazy-loaded as the operator edits the create form, so they see the storage
+    impact before committing. The form's capture mode, interval, camera,
+    capture schedule, exact-time anchor rows and campaign bounds arrive as query
+    parameters and are parsed by the same helpers the create handler uses; the
+    captures per day come from
+    :func:`~timelapse_manager.capture.cadence.captures_per_day`, so an
+    anchor-only (solar / scheduled-times) project gets an estimate too (#22,
+    D13). A read-only computation, so it uses GET (no CSRF token in the query
+    string). Registered before ``/projects/{project_id}`` so the literal path
+    wins.
+
+    Returns an empty body while the form plans no capture (no valid interval
+    and no enabled anchor that fires) or a schedule/anchor field is invalid --
+    the create handler reports those on submit. A solar anchor on a camera
+    without coordinates is kept and counts 0, as the runner would fire it.
     """
-    seconds, _err = parse_interval_to_seconds(
-        capture_interval_value, capture_interval_unit
+    from ...capture import cadence
+
+    params = request.query_params
+    interval_seconds: int | None = None
+    if capture_mode_of(params) == "interval":
+        interval_seconds, _err = parse_interval_to_seconds(
+            params.get("capture_interval_value", ""),
+            params.get("capture_interval_unit", "seconds"),
+        )
+
+    camera: Camera | None = None
+    camera_id = (params.get("camera_id") or "").strip()
+    if camera_id.isdigit():
+        camera = db.get(Camera, int(camera_id))
+
+    schedule: dict[str, Any] | None = None
+    if params.get("capture_schedule_preset") is not None:
+        capture_days = params.getlist("capture_days")
+        schedule, err = _build_schedule_from_form(params, capture_days)
+        if err:
+            return HTMLResponse("")
+    anchors, err = exact_time_anchors_from_rows(
+        ids=params.getlist("anchor_id"),
+        kinds=params.getlist("anchor_kind"),
+        times=params.getlist("anchor_time"),
+        offsets=params.getlist("anchor_offset"),
+        enabled_values=set(params.getlist("anchor_enabled")),
+        camera=camera,
+        reject_solar_without_geo=False,
     )
-    if seconds is None:
+    if err:
+        return HTMLResponse("")
+    # A half-typed bound is ignored rather than blanking the estimate; the create
+    # handler rejects it on submit.
+    start_date, _err = _parse_optional_datetime(params.get("start_date"), "Start date")
+    end_date, _err = _parse_optional_datetime(params.get("end_date"), "End date")
+
+    per_day = cadence.captures_per_day(
+        now=datetime.now(UTC),
+        interval_seconds=interval_seconds,
+        anchors_raw=anchors,
+        schedule_raw=schedule,
+        latitude=camera.geolocation_latitude if camera is not None else None,
+        longitude=camera.geolocation_longitude if camera is not None else None,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if per_day is None:
         return HTMLResponse("")
     settings = get_context().settings
     try:
         free = _default_free_bytes(paths.frames_root(settings))
     except Exception:  # noqa: BLE001
         free = 0
-    bytes_per_day = estimator.estimate_create_time_bytes_per_day(seconds)
+    bytes_per_day = estimator.estimate_create_time_bytes_per_day(per_day)
     level = estimator.preflight_level(bytes_per_day, free)
     days = int(free / bytes_per_day) if bytes_per_day > 0 else None
     return templates.TemplateResponse(
@@ -371,6 +465,18 @@ async def _new_project_form_error(
 ) -> Response:
     """Re-render the create-project form with an error toast and a 400 status.
 
+    The render reads the database, so it runs in the threadpool (#46).
+    """
+    return await run_in_threadpool(
+        _render_new_project_form_error, request, db, user, message
+    )
+
+
+def _render_new_project_form_error(
+    request: Request, db: DbSession, user: User, message: str
+) -> Response:
+    """Render the create-project form with an error toast and a 400 status.
+
     Preserves the submitted capture mode (read from the already-parsed, cached
     form) so an error re-render does not silently flip a solar / scheduled-times
     project back to continuous interval capture.
@@ -407,8 +513,11 @@ async def create_project(
     a duplicate name never surfaces as a 500. On success the project is committed
     and the running capture supervisor is notified so capture begins without a
     process restart, then the browser is redirected to the new project's page.
+
+    Form parsing and the camera probe are awaited on the event loop; every
+    Session use runs in the threadpool, and the supervisor is notified back on
+    the loop (#46).
     """
-    from sqlalchemy.exc import IntegrityError
 
     # Capture mode selects between continuous interval capture and "solar /
     # scheduled times only" (no recurring interval; captures fire solely from the
@@ -440,12 +549,14 @@ async def create_project(
             return await _new_project_form_error(request, db, user, err)
         assert capture_interval_seconds is not None  # err is None implies a value
 
-    camera = db.get(Camera, camera_id)
-    if camera is None:
+    camera, camera_facts = await run_in_threadpool(
+        load_camera_with_facts, db, camera_id
+    )
+    if camera is None or camera_facts is None:
         return await _new_project_form_error(
             request, db, user, "Selected camera not found."
         )
-    if camera.protocol is None:
+    if camera_facts.protocol is None:
         return await _new_project_form_error(
             request,
             db,
@@ -474,9 +585,7 @@ async def create_project(
 
     # Pre-check uniqueness for a friendly message; the UNIQUE constraint plus the
     # explicit flush below is the authoritative guard against a concurrent insert.
-    existing = db.execute(
-        select(Project.id).where(Project.name == name)
-    ).scalar_one_or_none()
+    existing = await run_in_threadpool(_project_named, db, name)
     if existing is not None:
         return await _new_project_form_error(
             request, db, user, f"A project named {name!r} already exists."
@@ -528,7 +637,7 @@ async def create_project(
     # no anchors rather than clearing them by accident.
     if form.get(EXACT_TIME_MARKER) is not None:
         exact_time_anchors, err = await _build_exact_time_anchors_from_form(
-            request, camera
+            request, camera_facts
         )
         if err:
             return await _new_project_form_error(request, db, user, err)
@@ -566,6 +675,36 @@ async def create_project(
         ptz_zoom=ptz_zoom,
         lifecycle_state="active",
     )
+    project_id = await run_in_threadpool(_insert_project, db, user, project)
+    if project_id is None:
+        return await _new_project_form_error(
+            request, db, user, f"A project named {name!r} already exists."
+        )
+
+    # Notified here on the event loop, after the helper's commit, never from the
+    # threadpool helper.
+    supervisor = get_context().capture_supervisor
+    if supervisor is not None:
+        supervisor.notify_reconcile()
+    return RedirectResponse(url=f"/projects/{project_id}", status_code=303)
+
+
+def _project_named(db: DbSession, name: str) -> int | None:
+    """Return the id of the project already named *name*, if any."""
+    return db.execute(
+        select(Project.id).where(Project.name == name)
+    ).scalar_one_or_none()
+
+
+def _insert_project(db: DbSession, user: User, project: Project) -> int | None:
+    """Insert *project*, audit it and commit (threadpool, #46).
+
+    Returns the new project's id, or ``None`` when the name lost the uniqueness
+    race against a concurrent create (the session is rolled back, ready for the
+    form re-render).
+    """
+    from sqlalchemy.exc import IntegrityError
+
     db.add(project)
     try:
         db.flush()
@@ -573,9 +712,7 @@ async def create_project(
         # Lost the uniqueness race against a concurrent create. Roll back so the
         # poisoned session can serve the form re-render, then report cleanly.
         db.rollback()
-        return await _new_project_form_error(
-            request, db, user, f"A project named {name!r} already exists."
-        )
+        return None
 
     _audit(
         db,
@@ -588,10 +725,7 @@ async def create_project(
     # session on another thread and would not see an uncommitted row.
     project_id = project.id
     db.commit()
-    supervisor = get_context().capture_supervisor
-    if supervisor is not None:
-        supervisor.notify_reconcile()
-    return RedirectResponse(url=f"/projects/{project_id}", status_code=303)
+    return project_id
 
 
 def _human_duration(seconds: float) -> str:
@@ -625,10 +759,22 @@ def project_detail(
     project = _get_project_or_404(db, project_id)
     project_view = _project_view(db, project)
     render_view = render_settings.render_settings_view(project.render_schedule)
+    # The Renders tab lists the last 10 renders; frame exports share the table
+    # but are listed (newest first) on the Frames tab instead.
     jobs = (
         db.execute(
             select(RenderJob)
-            .where(RenderJob.project_id == project_id)
+            .where(RenderJob.project_id == project_id, RenderJob.kind != "export")
+            .order_by(RenderJob.id.desc())
+            .limit(10)
+        )
+        .scalars()
+        .all()
+    )
+    exports = (
+        db.execute(
+            select(RenderJob)
+            .where(RenderJob.project_id == project_id, RenderJob.kind == "export")
             .order_by(RenderJob.id.desc())
             .limit(10)
         )
@@ -654,7 +800,11 @@ def project_detail(
             db,
             user,
             project=project_view,
+            # Kept off the shared project view: the dashboard polls that for
+            # every project and has no use for a render lookup per card.
+            latest_render=_latest_render_view(db, project, _settings()),
             renders=[_render_view(j) for j in jobs],
+            exports=[_export_view(j) for j in exports],
             milestones=milestone_views(db, project_id),
             recent_events=recent_events,
             render_view=render_view,

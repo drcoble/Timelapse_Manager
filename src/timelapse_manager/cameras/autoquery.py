@@ -37,8 +37,15 @@ from types import SimpleNamespace
 
 import httpx
 
-from .base import CameraAdapter, ValidationFailure
+from .base import (
+    CameraAdapter,
+    GeoLocation,
+    GeolocationAccessDenied,
+    ValidationFailure,
+)
+from .clients import contained_client
 from .geolocation import get_camera_geolocation
+from .http_auth import BasicPolicy, CameraAuthState
 from .http_jpeg import credentials_from
 from .onvif import OnvifAdapter
 from .probing import ProtocolCandidate, detect_protocols
@@ -78,7 +85,12 @@ class QueryResult:
     :param error_hostname: why no hostname was obtained (``"no_hostname"`` /
         ``"timeout"``), or None when a hostname was obtained.
     :param error_geo: why no location was obtained (``"no_location"`` /
-        ``"unreachable"``), or None when a location was obtained.
+        ``"access_denied"`` / ``"unreachable"``), or None when a location was
+        obtained. ``"access_denied"`` means the device refused the read for
+        this account; ``geo_required_role`` then names the role that can read it.
+    :param geo_required_role: the device role that can read the location
+        (e.g. ``"Administrator"``) when ``error_geo`` is ``"access_denied"``,
+        else None.
     :param auth_rejected: True when an authentication-capable protocol
         (vapix/onvif) rejected the credentials even though a connection-only
         protocol (rtsp/http) still responded. Without this, wrong credentials
@@ -96,6 +108,7 @@ class QueryResult:
     error_protocol: str | None = None
     error_hostname: str | None = None
     error_geo: str | None = None
+    geo_required_role: str | None = None
     auth_rejected: bool = False
 
 
@@ -122,6 +135,7 @@ def _build_metadata_adapter(
     credentials: tuple[str, str] | None,
     http_client: httpx.AsyncClient,
     timeout: float,
+    allow_basic_over_http: bool = False,
 ) -> CameraAdapter | None:
     """Construct the adapter used to read geolocation/hostname, or None.
 
@@ -131,71 +145,57 @@ def _build_metadata_adapter(
     only an address and credentials -- no persisted snapshot/stream URI -- and the
     metadata reads compose their own URLs from the address.
     """
+    state = (
+        CameraAuthState(BasicPolicy.for_camera(True)) if allow_basic_over_http else None
+    )
     if protocol == "vapix":
         return VapixAdapter(
-            http_client, address=address, credentials=credentials, timeout=timeout
+            http_client,
+            address=address,
+            credentials=credentials,
+            timeout=timeout,
+            auth_state=state,
         )
     if protocol == "onvif":
         return OnvifAdapter(
-            http_client, address=address, credentials=credentials, timeout=timeout
+            http_client,
+            address=address,
+            credentials=credentials,
+            timeout=timeout,
+            auth_state=state,
         )
     return None
 
 
-async def _auth_capable_failure_reasons(
-    *,
-    address: str,
-    credentials: tuple[str, str] | None,
-    http_client: httpx.AsyncClient,
-    timeout: float,
+def _auth_capable_failure_reasons(
+    candidates: list[ProtocolCandidate],
 ) -> set[ValidationFailure]:
-    """Re-validate the two auth-capable protocols and return their failure reasons.
+    """Return the classified failure reasons of the two auth-capable probes.
 
-    ``detect_protocols`` discards each probe's classified failure reason into a
-    free-text detail, so to recover clean codes we re-run ``vapix`` and ``onvif``
-    ``validate_connection`` (which never raises and carries a
-    :class:`ValidationFailure` reason). The best-effort protocols (rtsp/http) give
-    no auth/timeout signal worth classifying, so they are not consulted here.
+    The protocol probe already recorded why ``vapix`` and ``onvif`` failed on
+    each candidate, so nothing is sent to the camera again: a re-probe would
+    cost a camera given the wrong password a second failed login per protocol
+    and bring an Axis brute-force lockout closer (#69 CAM-P5). The best-effort
+    protocols (rtsp/http) give no auth/timeout signal worth classifying, so
+    they are not consulted here.
     """
-    vapix = VapixAdapter(
-        http_client, address=address, credentials=credentials, timeout=timeout
-    )
-    onvif = OnvifAdapter(
-        http_client, address=address, credentials=credentials, timeout=timeout
-    )
-    try:
-        results = await asyncio.gather(
-            vapix.validate_connection(),
-            onvif.validate_connection(),
-        )
-    finally:
-        await asyncio.gather(vapix.close(), onvif.close())
     return {
-        result.reason
-        for result in results
-        if not result.ok and result.reason is not None
+        candidate.reason
+        for candidate in candidates
+        if candidate.protocol in _METADATA_PROTOCOLS
+        and not candidate.ok
+        and candidate.reason is not None
     }
 
 
-async def _classify_protocol_error(
-    *,
-    address: str,
-    credentials: tuple[str, str] | None,
-    http_client: httpx.AsyncClient,
-    timeout: float,
-) -> str:
+def _classify_protocol_error(candidates: list[ProtocolCandidate]) -> str:
     """Classify *why* no protocol responded, into a granular error code.
 
     Reached only when nothing responded. Reduce the auth-capable protocols'
     failure reasons by specificity: an auth rejection is the most actionable
     signal, then a timeout, otherwise the address is treated as unreachable.
     """
-    reasons = await _auth_capable_failure_reasons(
-        address=address,
-        credentials=credentials,
-        http_client=http_client,
-        timeout=timeout,
-    )
+    reasons = _auth_capable_failure_reasons(candidates)
     if ValidationFailure.AUTH in reasons:
         return "auth_failed"
     if ValidationFailure.TIMEOUT in reasons:
@@ -206,37 +206,63 @@ async def _classify_protocol_error(
     return "unreachable"
 
 
-async def _read_metadata(
-    adapter: CameraAdapter,
-) -> tuple[float | None, float | None, str | None, str | None, str | None]:
+@dataclass
+class _Metadata:
+    """The device metadata one adapter yielded, with a reason for each gap."""
+
+    latitude: float | None
+    longitude: float | None
+    hostname: str | None
+    error_geo: str | None
+    error_hostname: str | None
+    geo_required_role: str | None
+
+
+async def _read_metadata(adapter: CameraAdapter) -> _Metadata:
     """Read geolocation and hostname from a metadata-capable adapter.
 
-    Each read is independent and best-effort: one failing never sinks the other.
-    Returns ``(lat, lon, hostname, error_geo, error_hostname)``.
+    Each read is independent and best-effort: one failing never sinks the other,
+    because both helpers below report their failure as a code instead of raising.
 
-    * ``get_camera_geolocation`` already swallows every failure into None, so a
-      missing location is reported as ``"no_location"`` (the camera was reachable
-      enough to probe but reported no usable position, or the lookup failed).
+    * A missing location is ``"no_location"`` (the camera was reachable enough to
+      probe but reported no usable position, or the lookup failed), or
+      ``"access_denied"`` when the device refused the read for this account.
     * ``get_device_hostname`` is best-effort by contract and returns None on any
       reachability/parse problem; we treat None as ``"no_hostname"``. A read that
       times out is reported as ``"timeout"`` so the UI can distinguish a slow
       camera from one that simply has no hostname configured.
     """
-    geo, (hostname, hostname_error) = await asyncio.gather(
-        get_camera_geolocation(adapter),
+    (geo, error_geo, required_role), (hostname, hostname_error) = await asyncio.gather(
+        _safe_geolocation(adapter),
         _safe_hostname(adapter),
     )
+    return _Metadata(
+        latitude=geo.latitude if geo is not None else None,
+        longitude=geo.longitude if geo is not None else None,
+        hostname=hostname,
+        error_geo=error_geo,
+        error_hostname=None if hostname is not None else hostname_error,
+        geo_required_role=required_role,
+    )
 
-    if geo is not None:
-        lat: float | None = geo.latitude
-        lon: float | None = geo.longitude
-        error_geo: str | None = None
-    else:
-        lat = lon = None
-        error_geo = "no_location"
 
-    error_hostname = None if hostname is not None else hostname_error
-    return lat, lon, hostname, error_geo, error_hostname
+async def _safe_geolocation(
+    adapter: CameraAdapter,
+) -> tuple[GeoLocation | None, str | None, str | None]:
+    """Read a location, never raising; returns ``(geo, error_code, role)``.
+
+    ``error_code`` is None when a location was read, ``"access_denied"`` when the
+    device refused this account (``role`` then names the role that can read it),
+    and ``"no_location"`` otherwise -- the resolver already folds every other
+    lookup failure into None.
+    """
+    try:
+        geo = await get_camera_geolocation(adapter)
+    except GeolocationAccessDenied as exc:
+        return None, "access_denied", exc.required_role
+    if geo is None:
+        return None, "no_location", None
+    return geo, None, None
 
 
 async def _safe_hostname(adapter: CameraAdapter) -> tuple[str | None, str]:
@@ -264,6 +290,7 @@ async def query_camera(
     default_credentials: tuple[str, str] | None = None,
     ffmpeg_binary: str = "ffmpeg",
     timeout: float = DEFAULT_TIMEOUT,
+    allow_basic_over_http: bool = False,
 ) -> QueryResult:
     """Probe an address for protocols, geolocation, and hostname in one call.
 
@@ -284,8 +311,17 @@ async def query_camera(
     :param default_credentials: the resolved global fallback pair, or None.
     :param ffmpeg_binary: ffmpeg used only by the ONVIF probe's stream path.
     :param timeout: the per-probe / per-read time budget.
+    :param allow_basic_over_http: the form's opt-in to HTTP Basic over plain
+        ``http://`` (#69 CAM-S1, OD-3), applied to the protocol probes and the
+        metadata reads exactly as capture applies a saved camera's flag.
     """
     resolved = _resolve_credentials(credentials, default_credentials)
+    if resolved is not None and resolved == default_credentials:
+        # The global default login is contained to the allowed private subnets
+        # at connect time (#268); the camera's own credentials are not.
+        own = credentials_from(SimpleNamespace(credentials=credentials))
+        if own is None:
+            http_client = contained_client(http_client)
 
     outcome = await detect_protocols(
         address,
@@ -293,6 +329,7 @@ async def query_camera(
         http_client,
         ffmpeg_binary=ffmpeg_binary,
         timeout=timeout,
+        allow_basic_over_http=allow_basic_over_http,
     )
     ok_count = sum(1 for candidate in outcome.candidates if candidate.ok)
 
@@ -305,12 +342,7 @@ async def query_camera(
     if ok_count == 0:
         # Nothing responded: classify the protocol failure and report the metadata
         # probes as unavailable (there is no reachable adapter to read them from).
-        result.error_protocol = await _classify_protocol_error(
-            address=address,
-            credentials=resolved,
-            http_client=http_client,
-            timeout=timeout,
-        )
+        result.error_protocol = _classify_protocol_error(outcome.candidates)
         result.error_hostname = "no_hostname"
         result.error_geo = "unreachable"
         return result
@@ -321,6 +353,7 @@ async def query_camera(
         credentials=resolved,
         http_client=http_client,
         timeout=timeout,
+        allow_basic_over_http=allow_basic_over_http,
     )
     if adapter is None:
         # A best-effort protocol (rtsp/http) responded but exposes no metadata
@@ -328,25 +361,20 @@ async def query_camera(
         # also means neither auth-capable protocol won, so check whether one was
         # rejected on authentication -- otherwise wrong credentials would be
         # silently masked by the open connection-only protocol.
-        reasons = await _auth_capable_failure_reasons(
-            address=address,
-            credentials=resolved,
-            http_client=http_client,
-            timeout=timeout,
-        )
+        reasons = _auth_capable_failure_reasons(outcome.candidates)
         result.auth_rejected = ValidationFailure.AUTH in reasons
         result.error_hostname = "no_hostname"
         result.error_geo = "no_location"
         return result
 
     try:
-        (
-            result.fetched_lat,
-            result.fetched_lon,
-            result.discovered_hostname,
-            result.error_geo,
-            result.error_hostname,
-        ) = await _read_metadata(adapter)
+        metadata = await _read_metadata(adapter)
     finally:
         await adapter.close()
+    result.fetched_lat = metadata.latitude
+    result.fetched_lon = metadata.longitude
+    result.discovered_hostname = metadata.hostname
+    result.error_geo = metadata.error_geo
+    result.error_hostname = metadata.error_hostname
+    result.geo_required_role = metadata.geo_required_role
     return result

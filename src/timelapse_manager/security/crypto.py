@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 # this prefix is treated as legacy plaintext on read.
 _PREFIX = "enc:v1:"
 
+# The text of :class:`CredentialDecryptError`: what failed and the likely cause,
+# with no secret or ciphertext in it.
+CREDENTIAL_DECRYPT_MESSAGE = (
+    "stored credential cannot be decrypted with the current key (key changed?)"
+)
+
 # The process-wide key provider, installed at startup (or in tests). ``None``
 # means no provider is installed yet -- a hard error if encryption is attempted,
 # never a silent fallback (which would persist key material as a side effect).
@@ -155,6 +161,44 @@ def decrypt_credentials(
     }
 
 
+class CredentialDecryptError(Exception):
+    """A stored credential cannot be decrypted with the current key (#69 CAM-R8).
+
+    Raised by the ``*_strict`` decrypt helpers in place of Fernet's bare
+    :class:`InvalidToken`, whose empty message left a capture failure with no
+    explanation. The usual cause is a changed or restored key file. It is a
+    *local* failure (``local`` is true): the server cannot read its own secret,
+    the camera did nothing wrong, so camera health does not count it.
+    """
+
+    local = True
+
+    def __init__(self, message: str = CREDENTIAL_DECRYPT_MESSAGE) -> None:
+        super().__init__(message)
+
+
+def decrypt_secret_strict(token: str) -> str:
+    """:func:`decrypt_secret`, raising :class:`CredentialDecryptError` on failure."""
+    try:
+        return decrypt_secret(token)
+    except InvalidToken:
+        raise CredentialDecryptError from None
+
+
+def decrypt_credentials_strict(
+    credentials: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """:func:`decrypt_credentials`, raising :class:`CredentialDecryptError`.
+
+    The message names the problem ("cannot be decrypted with the current key")
+    and never carries the ciphertext.
+    """
+    try:
+        return decrypt_credentials(credentials)
+    except InvalidToken:
+        raise CredentialDecryptError from None
+
+
 def _is_secret_field(key: str) -> bool:
     """Return True if a credential-document key names a secret to encrypt."""
     lowered = key.lower()
@@ -163,9 +207,13 @@ def _is_secret_field(key: str) -> bool:
 
 # Re-exported so callers can catch a decrypt failure without importing cryptography.
 __all__ = [
+    "CREDENTIAL_DECRYPT_MESSAGE",
+    "CredentialDecryptError",
     "InvalidToken",
     "decrypt_credentials",
+    "decrypt_credentials_strict",
     "decrypt_secret",
+    "decrypt_secret_strict",
     "encrypt_credentials",
     "encrypt_secret",
     "is_encrypted",

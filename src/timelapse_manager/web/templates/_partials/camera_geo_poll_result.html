@@ -1,20 +1,48 @@
 {#
   Partial: camera_geo_poll_result.html — inline result for the "Poll camera"
-  geolocation action.
+  geolocation action and the one-time "Read with admin account" lookup.
 
   Swapped into the camera form's #cam-{id}-geo-poll-result container by the
-  Poll camera button (hx-get="/cameras/{id}/geolocation").
+  Poll camera button (hx-get="/cameras/{id}/geolocation") and by the admin-read
+  button (hx-post="/cameras/{id}/geolocation/admin-read").
 
   Context:
-    fetched_lat — float | None   latitude reported by the camera
-    fetched_lon — float | None   longitude reported by the camera
-    error       — str | None     one of: "unreachable", "no_location"
+    camera_id     — int          the saved camera (builds the admin-read URL)
+    fetched_lat   — float | None latitude reported by the camera
+    fetched_lon   — float | None longitude reported by the camera
+    error         — str | None   one of:
+                      "unreachable", "no_location",
+                      "access_denied"      the camera refused this camera's own
+                                           account (role too low),
+                      "admin_denied"       the camera refused the one-time
+                                           administrator login too,
+                      "admin_missing"      the admin-read form had no username,
+                      "admin_throttled"    too many refused admin reads for
+                                           this device, camera or user,
+                      "admin_busy"         an admin read of this camera is
+                                           already running (no probe was made),
+                      "admin_unsupported"  not a VAPIX (Axis) camera
+    required_role — str | None   the device role that can read the location
+    admin_read    — bool         the result came from the admin-read lookup
 
   The "Use these values" button fills the surrounding form's latitude /
   longitude / geo_source inputs by name (this.closest('form').querySelector),
-  matching the pattern established by camera_detect_results.html. No camera id
-  or uid-scoped ids are needed here.
+  matching the pattern established by camera_detect_results.html.
+
+  The admin-read inputs are named geo_admin_* (never username/password) and are
+  detached from the camera form with a form="" attribute naming no form, so the
+  camera's Save never submits them and they can never become its saved
+  credentials. The button sends only those two fields (hx-params); the CSRF
+  token travels in the X-CSRF-Token header that csrf.js sets on every htmx
+  request from the page's csrf-token meta tag. The swap that renders the
+  result replaces the inputs, so the typed password does not linger; when
+  there is no swap (a 403, 404, timeout or abort), data-clear-on-done
+  (forms.js) still empties the password field. The button is
+  disabled while a read runs and a second click is dropped (hx-sync), and the
+  server answers "admin_busy" to a second read of the same camera from
+  elsewhere.
 #}
+{% set role = required_role or 'Administrator' %}
 {% if fetched_lat is not none and fetched_lon is not none %}
   <div class="alert success" role="status"
        style="display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;">
@@ -25,17 +53,7 @@
     <button type="button" class="btn btn-ghost"
             data-lat="{{ fetched_lat }}"
             data-lon="{{ fetched_lon }}"
-            onclick="(function(btn){
-              var form = btn.closest('form');
-              if (!form) { return; }
-              var lat = form.querySelector('[name=&quot;latitude&quot;]');
-              if (lat) { lat.value = btn.getAttribute('data-lat'); }
-              var lon = form.querySelector('[name=&quot;longitude&quot;]');
-              if (lon) { lon.value = btn.getAttribute('data-lon'); }
-              var src = form.querySelector('[name=&quot;geo_source&quot;]');
-              if (src) { src.value = 'camera'; }
-              btn.closest('.alert').remove();
-            })(this);">
+            data-action="geo-use-values">
       Use these values
     </button>
   </div>
@@ -45,6 +63,92 @@
   </div>
 {% elif error == 'no_location' %}
   <div class="alert info" role="status">
-    Camera did not report a location. Enter coordinates manually.
+    {% if admin_read %}
+      The administrator account was accepted, but the camera has no location
+      configured. Enter coordinates manually.
+    {% else %}
+      Camera did not report a location. Enter coordinates manually.
+    {% endif %}
   </div>
+{% elif error == 'admin_throttled' %}
+  <div class="alert error" role="status">
+    Too many refused administrator logins for this camera or this account. Wait
+    a few minutes and try again, or enter the coordinates manually.
+  </div>
+{% elif error == 'admin_unsupported' %}
+  <div class="alert info" role="status">
+    Read with admin account is available for VAPIX (Axis) cameras only. Enter
+    the coordinates manually.
+  </div>
+{% elif error in ('access_denied', 'admin_denied', 'admin_missing', 'admin_busy') %}
+  <div class="alert warning" role="status">
+    {% if error == 'admin_busy' %}
+      A location read with an administrator account is already running for
+      this camera. Wait for it to finish, then try again if needed.
+    {% elif error == 'admin_denied' %}
+      The camera refused the administrator login as well. Check the username
+      and password, and that the account is in the camera&rsquo;s
+      <strong>{{ role }}</strong> group.
+    {% elif error == 'admin_missing' %}
+      Enter the administrator username and password to read the location.
+    {% else %}
+      The camera refused to share its location with this account. Axis cameras
+      only reveal latitude/longitude to an <strong>{{ role }}</strong> account
+      (VAPIX geolocation API). Capture does not need that, so keep this
+      camera&rsquo;s operator account and either enter the coordinates manually,
+      or use <strong>Read with admin account</strong> once.
+    {% endif %}
+  </div>
+  {% if camera_id is defined and camera_id is not none %}
+    {% set aid = 'cam-' ~ camera_id ~ '-geo-admin' %}
+    <details class="form-advanced" style="margin-top:var(--sp-2);"
+             {{ 'open' if admin_read else '' }}>
+      <summary class="form-label" style="cursor:pointer;font-weight:600;">
+        Read with admin account
+      </summary>
+      <div class="form-stack" style="margin-top:var(--sp-2);">
+        <span class="form-hint" id="{{ aid }}-note">
+          Used once for this request only. The administrator username and
+          password are not saved, logged or shown again, and this
+          camera&rsquo;s own account is not changed.
+        </span>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="{{ aid }}-username">
+              Admin username
+            </label>
+            <input type="text" id="{{ aid }}-username" name="geo_admin_username"
+                   form="{{ aid }}-detached" class="form-control"
+                   autocomplete="off" aria-describedby="{{ aid }}-note">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="{{ aid }}-password">
+              Admin password
+            </label>
+            <input type="password" id="{{ aid }}-password"
+                   name="geo_admin_password" form="{{ aid }}-detached"
+                   class="form-control" autocomplete="new-password"
+                   aria-describedby="{{ aid }}-note">
+          </div>
+        </div>
+        <div>
+          <button type="button" class="btn btn-ghost"
+                  hx-post="/cameras/{{ camera_id }}/geolocation/admin-read"
+                  hx-request='{"timeout":45000}'
+                  hx-include="#{{ aid }}-username, #{{ aid }}-password"
+                  hx-params="geo_admin_username,geo_admin_password"
+                  hx-target="#cam-{{ camera_id }}-geo-poll-result"
+                  hx-swap="innerHTML"
+                  hx-disabled-elt="this"
+                  hx-sync="this:drop"
+                  hx-indicator="#{{ aid }}-spinner"
+                  data-clear-on-done="#{{ aid }}-password">
+            <span id="{{ aid }}-spinner" class="spinner htmx-indicator"
+                  aria-hidden="true"></span>
+            Read location
+          </button>
+        </div>
+      </div>
+    </details>
+  {% endif %}
 {% endif %}

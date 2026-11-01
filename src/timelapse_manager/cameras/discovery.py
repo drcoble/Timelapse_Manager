@@ -10,12 +10,14 @@ Two complementary mechanisms:
   WS-Discovery probe to each host, with bounded concurrency. This works across
   subnets where multicast does not.
 
-Both run the blocking-socket work in a worker thread (via
-:func:`asyncio.to_thread`) so they fit the asyncio capture engine without
-holding the event loop. Every host address flows through
-:func:`~.host_resolution.resolve_camera_host` at the top, the single seam where
-a later phase can enforce an allow-list. Discovery never raises for ordinary
-network errors; it logs and returns what it found.
+Both run on asyncio datagram endpoints on the event loop: no worker thread is
+held while a probe waits, so a /24 scan occupies no executor threads however
+slowly the segment answers (#69 CAM-P3). A protocol object per endpoint enforces
+the overall deadline, the reply caps and the source binding. Every host address
+flows through :func:`~.host_resolution.resolve_camera_host_async` where a name
+must be checked, the single seam where a later phase can enforce an allow-list.
+Discovery never raises for ordinary network errors; it logs and returns what it
+found.
 """
 
 from __future__ import annotations
@@ -24,17 +26,19 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
-from xml.etree import ElementTree as ET
 
 import httpx
 
 from ..security.ssrf import SsrfError, assert_address_allowed
 from . import _onvif_soap as soap
+from ._bounded import safe_fromstring
 from .base import DiscoveredCamera
-from .host_resolution import resolve_camera_host
+from .host_resolution import resolve_camera_host_async
 from .onvif import OnvifAdapter
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,93 @@ logger = logging.getLogger(__name__)
 WS_DISCOVERY_ADDRESS = "239.255.255.250"
 WS_DISCOVERY_PORT = 3702
 _RECV_BUFFER = 65535
+# Bounds on one multicast discovery round. Any host on the segment can answer a
+# multicast probe, so a hostile or broken one must not be able to hold the
+# round open (the overall deadline) or grow its memory without limit (the caps).
+_MAX_MULTICAST_REPLIES = 256
+_MAX_MULTICAST_BYTES = 1024 * 1024
+
+# Seam for tests: the clock that stamps a round, never the global
+# ``time.monotonic`` that asyncio itself uses.
+_monotonic = time.monotonic
+
+
+def _udp_socket(family: int = socket.AF_INET) -> socket.socket:
+    """Open the non-blocking UDP socket a discovery probe is sent and read on.
+
+    :param family: ``AF_INET`` (multicast and IPv4 hosts) or ``AF_INET6`` (a
+        range scan of IPv6 hosts).
+    """
+    sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setblocking(False)
+    return sock
+
+
+class _ReplyCollector(asyncio.DatagramProtocol):
+    """Collects WS-Discovery replies on one datagram endpoint, within bounds.
+
+    ``accept`` filters by source address (the unicast probe takes only the
+    probed host's); ``max_replies``/``max_bytes`` end the round when reached
+    (:attr:`done` is then set). The collector never decodes a datagram, so a
+    hostile payload costs only the memory the caps allow.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_replies: int,
+        max_bytes: int,
+        accept: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.replies: list[tuple[bytes, str]] = []
+        self.done = asyncio.Event()
+        self.capped = False
+        self._max_replies = max_replies
+        self._max_bytes = max_bytes
+        self._accept = accept
+        self._total_bytes = 0
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        """Keep one reply unless the round is over or the source is refused."""
+        if self.done.is_set() or not data:
+            return
+        source = str(addr[0])
+        if self._accept is not None and not self._accept(source):
+            logger.debug("discovery ignoring a datagram from %s", source)
+            return
+        if (
+            len(self.replies) >= self._max_replies
+            or self._total_bytes + len(data) > self._max_bytes
+        ):
+            logger.warning(
+                "ws-discovery stopped early: reply cap reached (%d replies, %d bytes)",
+                len(self.replies),
+                self._total_bytes,
+            )
+            self.capped = True
+            self.done.set()
+            return
+        self.replies.append((data, source))
+        self._total_bytes += len(data)
+        if self._max_replies == 1:
+            self.done.set()
+
+    def error_received(self, exc: Exception) -> None:
+        """An ICMP error (unreachable host) ends nothing; the deadline decides."""
+        logger.debug("discovery datagram error: %s", exc)
+
+
+def _same_ip(left: str, right: str) -> bool:
+    """Return whether two strings name the same IP address.
+
+    Compared as :mod:`ipaddress` values so spelling differences (an IPv6 address
+    in another case or compression) still match. A value that is not a literal
+    IP (a hostname) never matches.
+    """
+    try:
+        return ipaddress.ip_address(left) == ipaddress.ip_address(right)
+    except ValueError:
+        return False
 
 
 def _probe_message() -> bytes:
@@ -66,23 +157,53 @@ def _probe_message() -> bytes:
     return body.encode("utf-8")
 
 
-def _parse_probe_match(data: bytes) -> DiscoveredCamera | None:
+def _parse_probe_match(
+    data: bytes, source_ip: str | None = None
+) -> DiscoveredCamera | None:
     """Turn a WS-Discovery ProbeMatch payload into a DiscoveredCamera, or None.
 
     The device service address (XAddrs) gives us the host; the scopes hint at
     the vendor. The actual snapshot/stream URIs are resolved lazily later by the
     ONVIF adapter, so they are left None here.
+
+    :param data: the raw ProbeMatch datagram.
+    :param source_ip: the address the datagram came from, when the caller
+        cannot otherwise trust the advertised host (multicast). The reply is
+        then kept only if one of its XAddrs names that same IP, and that entry
+        is used, so a host cannot advertise somebody else's address. ``None``
+        keeps the first XAddrs entry; the range scan passes ``None`` because it
+        overrides the host with the probed address anyway.
+
+    The datagram can come from any host on the segment, so it is parsed with
+    :func:`._bounded.safe_fromstring`: a reply larger than one receive buffer,
+    malformed, or carrying a DTD (entity tricks) is dropped (#67-S24).
     """
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError:
+    root = safe_fromstring(data, max_bytes=_RECV_BUFFER)
+    if root is None:
         return None
     xaddrs = soap.find_text(root, ".//d:XAddrs")
     if not xaddrs:
         return None
-    # XAddrs may list several space-separated URLs; take the first reachable.
-    first = xaddrs.split()[0]
-    host = urlparse(first).hostname
+    # XAddrs may list several space-separated URLs (often an IPv6 and an IPv4
+    # one). Without a source, take the first; with one, the entry naming it.
+    hosts = [_xaddr_host(entry) for entry in xaddrs.split()]
+    if source_ip is None:
+        host = hosts[0]
+    else:
+        host = next(
+            (
+                candidate
+                for candidate in hosts
+                if candidate and _same_ip(candidate, source_ip)
+            ),
+            None,
+        )
+        if host is None:
+            logger.debug(
+                "discovery dropping reply from %s advertising another host",
+                source_ip,
+            )
+            return None
     if not host:
         return None
     scopes = soap.find_text(root, ".//d:Scopes") or ""
@@ -96,6 +217,19 @@ def _parse_probe_match(data: bytes) -> DiscoveredCamera | None:
     )
 
 
+def _xaddr_host(entry: str) -> str | None:
+    """Return the host of one XAddrs URL, or None when it does not parse.
+
+    ``urlparse`` raises ``ValueError`` on a malformed bracketed host (for
+    example ``http://[bad/x``). The datagram is untrusted, so one bad entry must
+    make only that entry unusable, never abort the whole discovery round.
+    """
+    try:
+        return urlparse(entry).hostname
+    except ValueError:
+        return None
+
+
 def _vendor_from_scopes(scopes: str) -> str | None:
     """Extract a vendor/hardware name from WS-Discovery scope URIs, if present."""
     for scope in scopes.split():
@@ -107,47 +241,93 @@ def _vendor_from_scopes(scopes: str) -> str | None:
     return None
 
 
-def _collect_multicast_replies(
-    timeout_seconds: float, interface: str | None
-) -> list[bytes]:
-    """Send a multicast Probe and collect raw ProbeMatch datagrams."""
-    replies: list[bytes] = []
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+async def _run_round(
+    sock: socket.socket,
+    collector: _ReplyCollector,
+    target: tuple[str, int],
+    timeout_seconds: float,
+) -> None:
+    """Send one Probe from ``sock`` and wait for the round to end.
+
+    The round ends at an overall deadline ``timeout_seconds`` after the probe,
+    however often replies keep arriving, or earlier when the collector's caps
+    are reached. The endpoint is always closed.
+    """
+    loop = asyncio.get_running_loop()
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        bind_host = interface or ""
-        sock.bind((bind_host, 0))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.settimeout(timeout_seconds)
-        sock.sendto(_probe_message(), (WS_DISCOVERY_ADDRESS, WS_DISCOVERY_PORT))
-        loop_deadline = timeout_seconds
-        sock.settimeout(loop_deadline)
-        while True:
-            try:
-                data, _addr = sock.recvfrom(_RECV_BUFFER)
-            except TimeoutError:
-                break
-            if data:
-                replies.append(data)
+        transport, _protocol = await loop.create_datagram_endpoint(
+            lambda: collector, sock=sock
+        )
+    except BaseException:
+        sock.close()
+        raise
+    try:
+        transport.sendto(_probe_message(), target)
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await collector.done.wait()
+        except TimeoutError:
+            pass
+    finally:
+        transport.close()
+
+
+async def _collect_multicast_replies(
+    timeout_seconds: float, interface: str | None
+) -> list[tuple[bytes, str]]:
+    """Send a multicast Probe and collect raw ProbeMatch datagrams.
+
+    The round ends at an overall deadline ``timeout_seconds`` after the probe,
+    however often replies keep arriving, and after at most
+    :data:`_MAX_MULTICAST_REPLIES` replies or :data:`_MAX_MULTICAST_BYTES` bytes
+    in total, whichever comes first. The socket options are the ones the
+    blocking implementation used (reuse, bound to ``interface``, multicast TTL
+    2).
+
+    :returns: ``(datagram, source_ip)`` pairs, so the caller can bind each
+        reply's advertised address to the host that actually sent it.
+    """
+    collector = _ReplyCollector(
+        max_replies=_MAX_MULTICAST_REPLIES, max_bytes=_MAX_MULTICAST_BYTES
+    )
+    try:
+        sock = _udp_socket()
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((interface or "", 0))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        except BaseException:
+            sock.close()
+            raise
+        await _run_round(
+            sock, collector, (WS_DISCOVERY_ADDRESS, WS_DISCOVERY_PORT), timeout_seconds
+        )
     except OSError as exc:
         logger.warning("ws-discovery multicast failed: %s", exc)
-    finally:
-        sock.close()
-    return replies
+    return collector.replies
 
 
-def _unicast_probe(host: str, timeout_seconds: float) -> bytes | None:
-    """Send a single unicast WS-Discovery probe to one host, return reply/None."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+async def _unicast_probe(host: str, timeout_seconds: float) -> bytes | None:
+    """Send a single unicast WS-Discovery probe to one host, return reply/None.
+
+    Only a datagram from the probed host is accepted. Anything else arriving on
+    the socket (another host answering, or spoofing an answer) is ignored and
+    the wait continues until the deadline ``timeout_seconds`` after the send.
+    ``host`` is an IP literal (IPv4 or IPv6), so no name is resolved here.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    collector = _ReplyCollector(
+        max_replies=1,
+        max_bytes=_RECV_BUFFER,
+        accept=lambda source: _same_ip(source, host),
+    )
     try:
-        sock.settimeout(timeout_seconds)
-        sock.sendto(_probe_message(), (host, WS_DISCOVERY_PORT))
-        data, _addr = sock.recvfrom(_RECV_BUFFER)
-        return data
-    except (TimeoutError, OSError):
+        await _run_round(
+            _udp_socket(family), collector, (host, WS_DISCOVERY_PORT), timeout_seconds
+        )
+    except OSError:
         return None
-    finally:
-        sock.close()
+    return collector.replies[0][0] if collector.replies else None
 
 
 class InvalidScanRange(ValueError):
@@ -270,18 +450,18 @@ async def discover_onvif(
 
     ssrf = get_context().settings.ssrf
     if interface is not None:
-        interface = resolve_camera_host(interface)
+        interface = await resolve_camera_host_async(interface)
     try:
-        replies = await asyncio.to_thread(
-            _collect_multicast_replies, timeout_seconds, interface
-        )
+        replies = await _collect_multicast_replies(timeout_seconds, interface)
     except OSError as exc:
         logger.warning("ws-discovery failed: %s", exc)
         return []
 
     discovered: dict[str, DiscoveredCamera] = {}
-    for data in replies:
-        camera = _parse_probe_match(data)
+    for data, source_ip in replies:
+        # Bind the advertised address to the sender: a host on the segment may
+        # not announce another device's (or a denied) address as its own.
+        camera = _parse_probe_match(data, source_ip)
         if camera is None:
             continue
         # A device may advertise a denied address (e.g. 127.0.0.1) in its
@@ -371,7 +551,7 @@ async def scan_range(
 
     async def probe(host: str) -> DiscoveredCamera | None:
         async with semaphore:
-            data = await asyncio.to_thread(_unicast_probe, host, per_host_timeout)
+            data = await _unicast_probe(host, per_host_timeout)
         if data is None:
             return None
         camera = _parse_probe_match(data)
@@ -387,7 +567,6 @@ async def scan_range(
 
 async def resolve_discovered_uris(
     cameras: list[DiscoveredCamera],
-    credentials: tuple[str, str] | None,
     http_client: httpx.AsyncClient,
     *,
     ffmpeg_binary: str = "ffmpeg",
@@ -398,22 +577,26 @@ async def resolve_discovered_uris(
 
     Discovery only finds devices; the snapshot/stream URIs of an ONVIF camera
     live behind its media service and must be resolved over SOAP with the right
-    credentials. For each ``"onvif"`` camera still missing a snapshot and/or
+    credentials. Enrichment sends **none** (#67-S3, CAM-S4): a scan reaches every
+    host in an operator-typed range, and neither the saved default login nor any
+    other credential belongs on a device the operator has not chosen. A camera
+    that allows anonymous ``GetSnapshotUri`` still yields its URIs; the rest are
+    left for Detect, with typed credentials, on the add form. For each
+    ``"onvif"`` camera still missing a snapshot and/or
     stream URI this re-validates the address through the SSRF chokepoint (defence
     in depth -- a device that advertised an allowed host could still be denied on
-    re-check), builds an :class:`~.onvif.OnvifAdapter` with the supplied
-    ``credentials`` and the shared ``http_client``, and time-boxes a URI
+    re-check), builds an :class:`~.onvif.OnvifAdapter` with the shared
+    ``http_client`` and no credentials, and time-boxes a URI
     resolution. A resolved URI fills only a field that was ``None`` -- an
     operator-confirmed value is never overwritten.
 
     Like :func:`~.probing.detect_protocols` this is pure: it opens no HTTP client
     of its own, touches no database, and does not resolve the default credential
-    itself -- the caller resolves the effective credential and passes the shared
-    client. A camera that fails, times out, or is denied is returned unchanged
-    (its URIs stay ``None``); one camera never raises for, or blocks, the others.
+    itself -- the caller passes the shared client. A camera that fails, times
+    out, or is denied is returned unchanged (its URIs stay ``None``); one camera
+    never raises for, or blocks, the others.
 
     :param cameras: the discovered cameras to enrich, mutated in place.
-    :param credentials: the ``(username, password)`` to resolve with, or None.
     :param http_client: the shared async HTTP client the adapters borrow.
     :param ffmpeg_binary: ffmpeg used only on the ONVIF adapter's stream path.
     :param timeout: per-camera resolution budget.
@@ -430,14 +613,14 @@ async def resolve_discovered_uris(
         # Defence in depth: a discovery-advertised address that passed the
         # discovery-time check is re-validated here before any fetch is issued.
         try:
-            resolve_camera_host(camera.address)
+            await resolve_camera_host_async(camera.address)
         except SsrfError:
             logger.debug("skipping enrichment for denied address %s", camera.address)
             return
         adapter = OnvifAdapter(
             http_client,
             address=camera.address,
-            credentials=credentials,
+            credentials=None,
             timeout=timeout,
             ffmpeg_binary=ffmpeg_binary,
         )

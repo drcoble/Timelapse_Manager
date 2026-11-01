@@ -1,114 +1,101 @@
 # Verifying Releases
 
 Every Timelapse Manager release is accompanied by integrity and provenance
-material that lets you confirm you received exactly what was built and signed.
-This document describes what is published and how to verify it.
+material that lets you confirm you received exactly what was built. This
+document describes what is published and how to verify it.
 
 ---
 
-## What is published
+## Where releases are published
 
-Each [GitHub release](https://github.com/drcoble/Timelapse_Manager/releases)
-includes:
+Each release is a [GitHub Release](https://github.com/drcoble/Timelapse_Manager/releases)
+of `drcoble/Timelapse_Manager`. Its assets download from:
+
+```
+https://github.com/drcoble/Timelapse_Manager/releases/download/v<version>/<file>
+```
+
+The Docker image is published to `ghcr.io/drcoble/timelapse_manager`. No account
+or token is needed to download any of it. `SHA256SUMS` is uploaded **last**, so
+its presence means the upload is complete.
 
 | Asset | Purpose |
 |---|---|
 | `timelapse-manager-<version>-linux-amd64.tar.gz` | Self-contained bundle tarball |
-| `cyclonedx-bom.json` | CycloneDX SBOM (Python deps + bundled FFmpeg) |
-| `image-digest.txt` | The exact GHCR image digest pushed during the release |
-| `SHA256SUMS` | SHA-256 manifest over the tarball, SBOM, and digest file |
-| `SHA256SUMS.asc` | Detached GPG signature over `SHA256SUMS` |
-| `cosign.pub` | Public key for verifying the GHCR image signature |
-| `KEYS` | Project GPG public key (import before verifying `SHA256SUMS.asc`) |
+| `timelapse-manager_<version>-1_amd64.deb` | Debian package |
+| `timelapse-manager-<version>-1.x86_64.rpm` | RPM package (signed) |
+| `timelapse-manager-rpm-signing-key.asc` | Public key for the RPM signature, fingerprint `C0CA17A09723DA4E17C71D77A50138DBA443C270` |
+| `debian-13-timelapse-manager_<version>_amd64.tar.zst` and `.sha512` | Proxmox CT template and its checksum |
+| `cyclonedx-bom.json` | CycloneDX SBOM (Python deps + bundled FFmpeg + vendored assets) |
+| `sbom-image.cdx.json` | SBOM of the Docker image (OS packages and Python packages) |
+| `sbom-lxc.cdx.json` | SBOM of the CT template |
+| `image-digest.txt` | The digest of the published Docker image |
+| `SHA256SUMS` | SHA-256 manifest over every other file in the release, including the `.sha512` file and the signing key |
 
----
+`<version>` is the PEP 440 release version (`0.2.0`). The package files use the
+mapped package version, which differs from it only for pre-releases (`0.2.0~rc6`,
+see [package versions](./install-deb-rpm.md#package-versions-and-ordering)). The
+image is identified by its digest, which is listed inside the checksummed
+`image-digest.txt`.
 
-## Verifying the bundle tarball
+## Verifying the files
 
-### 1. Import the project GPG key
+Download `SHA256SUMS` and the files you intend to use, then check them:
 
 ```sh
-# Download and import the project public key from the release assets.
-curl -fsSL https://github.com/drcoble/Timelapse_Manager/releases/latest/download/KEYS \
-  | gpg --import
+ver=0.2.0
+base=https://github.com/drcoble/Timelapse_Manager/releases/download/v$ver
+curl -fsSLO "$base/SHA256SUMS"
+curl -fsSLO "$base/<file>"                                 # each file you need
+sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-Confirm the fingerprint matches the one published on the project's homepage
-or GitHub profile before trusting it.
+Every line for a file you downloaded should report `OK`. This detects a
+corrupted or incomplete download. `SHA256SUMS` is served from the same place as
+the files, so on its own it does not prove who published them; the RPM
+signature and a pull of the image by digest, below, are the stronger checks. The
+CT template also has a `.sha512` file for `sha512sum --check`.
 
-### 2. Verify the GPG signature over the manifest
+### The RPM signature
+
+The `.rpm` carries its own signature, made with the RPM signing key. Download
+`timelapse-manager-rpm-signing-key.asc` from the same release, confirm its
+fingerprint, import it and check the package:
 
 ```sh
-gpg --verify SHA256SUMS.asc SHA256SUMS
+gpg --show-keys --with-fingerprint timelapse-manager-rpm-signing-key.asc
+sudo rpm --import timelapse-manager-rpm-signing-key.asc
+rpm -K timelapse-manager-<version>-1.x86_64.rpm
 ```
 
-A `Good signature` result means the `SHA256SUMS` file was produced by the
-project's signing key and has not been modified.
+The fingerprint must be `C0CA17A09723DA4E17C71D77A50138DBA443C270`. See
+[Install from a package](./install-deb-rpm.md#enterprise-linux-dnf). The `.deb`
+is not separately signed; rely on `SHA256SUMS` for it.
 
-### 3. Verify each artifact against the manifest
+### The Docker image
 
-```sh
-sha256sum --check SHA256SUMS
-```
-
-All three lines should report `OK`. If any file has been tampered with,
-`sha256sum` will report a mismatch.
-
----
-
-## Verifying the Docker image
-
-### 1. Read the signed digest
-
-After verifying `SHA256SUMS` above, read the image digest from the signed
-manifest:
+`image-digest.txt` is covered by `SHA256SUMS`. After checking it, pull the image
+by its digest, so you run the build that was published and not a tag that could
+be moved:
 
 ```sh
+curl -fsSLO "$base/image-digest.txt"
 cat image-digest.txt
-# e.g. ghcr.io/drcoble/timelapse_manager@sha256:<digest>
-```
-
-Because `image-digest.txt` is covered by the verified `SHA256SUMS`, the
-digest value itself is authenticated.
-
-### 2. Verify the cosign signature
-
-```sh
-# Download the project cosign public key (also a release asset).
-curl -fsSLO https://github.com/drcoble/Timelapse_Manager/releases/latest/download/cosign.pub
-
-# Verify the image signature against the key.
-cosign verify --key cosign.pub \
-  ghcr.io/drcoble/timelapse_manager@sha256:<digest>
-```
-
-Install cosign from [sigstore/cosign](https://github.com/sigstore/cosign/releases)
-if it is not already present. A successful verification confirms that the image
-at that digest was signed by the holder of the project's cosign key.
-
-### 3. Pull by digest (recommended for production)
-
-```sh
 docker pull ghcr.io/drcoble/timelapse_manager@sha256:<digest>
 ```
 
-Pulling by digest instead of by tag guarantees you receive the exact image
-that was built, scanned, and signed during the release — not a tag that could
-be reassigned.
-
----
+Use the `sha256:` value from `image-digest.txt`. See
+[Install with Docker](./install-docker.md#pull-by-digest).
 
 ## Verification chain summary
 
 ```
-KEYS (GPG public key)
-  └─ verifies ──▶ SHA256SUMS.asc
-                    └─ authenticates ──▶ SHA256SUMS
-                                          ├─ covers ──▶ timelapse-manager-*-linux-amd64.tar.gz
-                                          ├─ covers ──▶ cyclonedx-bom.json
-                                          └─ covers ──▶ image-digest.txt
-                                                          └─ names ──▶ GHCR image@sha256:<digest>
-                                                                         └─ verified by ──▶ cosign.pub
+SHA256SUMS
+  ├─ covers ──▶ the tarball, .deb, .rpm, CT template, signing key, SBOMs
+  └─ covers ──▶ image-digest.txt
+                  └─ names ──▶ ghcr.io/drcoble/timelapse_manager@sha256:<digest>
+
+timelapse-manager-rpm-signing-key.asc ──▶ verifies ──▶ the .rpm signature (rpm -K)
 ```
 
 ---
@@ -120,3 +107,8 @@ all Python dependencies (from the locked `uv.lock`) plus the bundled static
 FFmpeg build. Its version, download URL, and SHA-256 are recorded in the SBOM
 component for FFmpeg. Feed it to any CycloneDX-compatible tool for licence
 analysis, vulnerability scanning, or supply-chain auditing.
+
+The SBOM also lists the bundled htmx and Geist fonts, which
+`web/static/vendor.json` records with their versions and SHA-256 values. The
+release build runs `uv sync --locked`, so update `uv.lock` (`uv lock`) in the
+same commit as any dependency change.

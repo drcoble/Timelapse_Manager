@@ -9,3 +9,15 @@ You may obtain a copy of the License at
 
 This product bundles FFmpeg (https://ffmpeg.org/), which is licensed
 separately under the LGPL/GPL; see FFmpeg's own license for its terms.
+
+This product bundles the following third-party web assets under
+src/timelapse_manager/web/static/; web/static/vendor.json records the version,
+upstream source and SHA-256 of each file.
+
+  htmx 1.9.12 (https://htmx.org/), by Big Sky Software. Licensed under the
+  Zero-Clause BSD licence (0BSD).
+
+  Geist and Geist Mono (https://github.com/vercel/geist-font), Copyright 2024
+  The Geist Project Authors. Licensed under the SIL Open Font License,
+  Version 1.1; the full licence text is in web/static/fonts/OFL.txt and
+  accompanies the fonts in every distribution.

@@ -57,7 +57,8 @@ API.
 **Status:** early development; all of the above is functional.
 
 **V1 packaging** ships **linux/amd64** only: a PyInstaller self-contained
-bundle (systemd install included) and a Docker image. macOS, Windows, and
+bundle (systemd install included), `.deb` and `.rpm` packages, a Docker image and
+a Proxmox CT template. macOS, Windows, and
 linux/arm64 build targets are defined in the release workflow but are deferred
 post-V1.
 
@@ -72,7 +73,9 @@ https://<host>:8443
 **First-run setup:** on a fresh installation there are no default credentials.
 Before the UI becomes usable, the application redirects every browser request
 to a setup page at `/first-run` where you create the initial administrator
-account. The admin password must be at least 12 characters. Setup completes
+account, using the one-time setup code printed by `timelapse-manager
+setup-code` (see [docs/web-ui.md](docs/web-ui.md)). The admin password must be
+at least 12 characters. Setup completes
 over HTTPS — the self-signed dev certificate is generated automatically on
 first start if no certificate is configured.
 
@@ -117,12 +120,23 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full developer guide.
 
 ## Installation & Deployment
 
-Three deployment paths are available. All V1 artifacts target **linux/amd64**.
+Four deployment paths are available. All V1 artifacts target **linux/amd64**,
+and each release is a
+[GitHub Release](https://github.com/drcoble/Timelapse_Manager/releases) with the
+packages attached (no account needed).
+
+| Method | Guide |
+|---|---|
+| Bundle tarball + systemd (`install.sh`) | [Bundle + systemd](#bundle--systemd) below |
+| `.deb` (Debian 13) / `.rpm` (EL9+) | [docs/install-deb-rpm.md](./docs/install-deb-rpm.md) |
+| Docker image | [docs/install-docker.md](./docs/install-docker.md) |
+| Proxmox CT template | [docs/install-proxmox-ct.md](./docs/install-proxmox-ct.md) |
 
 ### Bundle + systemd
 
-Download the tarball from the [GitHub releases page](https://github.com/drcoble/Timelapse_Manager/releases)
-and clone the repository alongside it. Run the installer as root from the
+Download the tarball from the GitHub Release
+(`https://github.com/drcoble/Timelapse_Manager/releases/download/v<version>/`)
+and clone the repository at the same tag alongside it. Run the installer as root from the
 extracted bundle directory:
 
 ```sh
@@ -148,24 +162,25 @@ To run the bundle directly without installing:
 # From the repository root
 docker compose -f docker/docker-compose.yml up -d
 
-# Or pull a released image directly
-docker pull ghcr.io/drcoble/timelapse_manager:v<version>
+# Or run a released image (see docs/install-docker.md)
+docker pull ghcr.io/drcoble/timelapse_manager:<version>
 ```
 
 The container image serves plain HTTP on port **8080**. TLS is expected to be
 terminated by a reverse proxy in front of the container; configure the proxy to
 forward `X-Forwarded-Proto: https`.
 
-### Verify release signatures
+### Verify releases
 
 ```sh
-gpg --verify SHA256SUMS.asc SHA256SUMS   # verify the manifest signature
-sha256sum --check SHA256SUMS             # verify each artifact
+sha256sum --check --ignore-missing SHA256SUMS   # each artifact you downloaded
 ```
+
+See [docs/verifying-releases.md](./docs/verifying-releases.md).
 
 See [docs/installation.md](./docs/installation.md) for the full deployment
 guide: bundle install, systemd setup, Docker compose, port and volume
-configuration, signature verification, and storage sizing.
+configuration, checksum verification, and storage sizing.
 
 See [docs/ffmpeg-refresh.md](./docs/ffmpeg-refresh.md) for the process to
 update the bundled FFmpeg when a security advisory is published.
@@ -174,8 +189,10 @@ update the bundled FFmpeg when a security advisory is published.
 
 Settings are loaded from (lowest to highest precedence): built-in defaults, an
 optional config file (YAML or JSON), environment variables (`TLM_*` prefix with
-`__` nesting), and explicit CLI flags. There is no default config file path; pass
-`--config PATH` or set `TLM_CONFIG=PATH`.
+`__` nesting), and explicit CLI flags. The service reads a config file only when
+`--config PATH` or `TLM_CONFIG=PATH` names one. The CLI, with neither, uses the
+first readable of `/etc/timelapse-manager/config.yml` and
+`$XDG_CONFIG_HOME/timelapse-manager/config.yml` (`~/.config/...` when unset).
 
 Key sections: `server` (ports, bind address, HTTP-to-HTTPS redirect), `tls`
 (certificate paths, auto-generate), `session` (cookie name, idle/absolute/
@@ -183,9 +200,10 @@ persistent timeouts, SameSite), `auth` (password minimum length, brute-force
 throttle, Argon2 cost), `database` (SQLite URL), `logging` (level, format,
 optional file sink), `paths` (data directory, frames root, token file),
 `capture` (autostart, timeout, default interval, backoff, frozen-frame
-detection, max idle sleep), `storage` (disk-space watermarks and probe interval
+detection, max idle sleep, RTSP grab timeout, quality and keyframe wait), `storage` (disk-space watermarks and probe interval
 for the capture pause gate), `render` (concurrency, default fps, output
-directory, webhook timeout, overlay font, scheduler interval), `monitoring`
+directory, webhook timeout, overlay font, scheduler interval, export slot and
+retention), `frames` (largest range a selection may materialise), `monitoring`
 (dispatcher autostart, poll interval, retry count and backoff, debounce window,
 send timeout).
 
@@ -214,6 +232,24 @@ timelapse-daemon --config cfg.yaml  # start with a custom config file
 `timelapse system info` connects to the service on `http://127.0.0.1:<http_port>`
 and authenticates using the local bearer token read from `paths.token_file`
 (default: `./data/.local-token`).
+
+Offline commands, run against the database and key store (a package install names
+the same CLI `timelapse-manager`):
+
+```sh
+timelapse-manager secrets status                  # key provider, fingerprint prefixes, counts, state
+timelapse-manager secrets rotate                  # new key, re-encrypt every stored secret (service stopped)
+timelapse-manager secrets reset --confirm         # key lost: delete stored passwords, record a new key (service stopped)
+timelapse-manager frames find-orphans [--project ID] [--min-age SECONDS]   # list frame files with no row; read-only
+```
+
+`secrets status` prints no key material and exits 0 only when the key matches the
+stored credentials. `secrets rotate` and `secrets reset` refuse while the service
+answers on loopback; `reset` also needs `--confirm`. `frames find-orphans` deletes
+nothing: it prints `<frame|temp> project=<id> size=<bytes> <path>` per file and a
+summary, skips files younger than 60 s unless `--min-age` says otherwise, and
+exits 0. See [docs/installation.md](./docs/installation.md#encryption-key-integrity)
+and [docs/storage.md](./docs/storage.md#frame-write-durability-and-orphan-files).
 
 ## Cameras & capture
 
@@ -308,8 +344,10 @@ based on per-project cadences. After a successful render, optional
 **post-render actions** can export the file to a directory, POST a webhook
 notification, or prune old non-archive renders.
 
-H.264/MP4 renders are flagged as browser-streamable and support HTTP `Range`
-requests for inline browser playback via the stream endpoint.
+Every finished render is served inline by the stream endpoint, with HTTP
+`Range` support and its real MIME type. Each viewer's browser decides whether
+it can play the codec (AV1, H.265, VP9 or H.264); renders it can't play are
+offered as a download.
 
 See [docs/rendering.md](./docs/rendering.md) for the full pipeline, all output
 settings, overlay configuration, chapters, the queue and scheduler, post-render
@@ -349,6 +387,13 @@ configurable debounce window.
 See [docs/monitoring.md](./docs/monitoring.md) for the full reference: event
 types, web views, channel setup, routing rules, webhook payload shape, SMTP
 configuration, the masked-password save rule, and delivery semantics.
+
+**Debugging a stalled process:** `SIGUSR1` logs every thread's stack and
+`SIGUSR2` logs every asyncio task. Neither stops the service. Optional
+admin-only routes under `/api/v1/system/debug/` cover the same data, and they
+also let you raise a logger to `DEBUG` for a limited time. The `SIGUSR2` dump
+also maps thread idents to names, which `SIGUSR1` does not print. See
+[docs/operations/debugging.md](./docs/operations/debugging.md) for the runbook.
 
 ## HTTP API
 
@@ -411,6 +456,10 @@ write-only and are never returned in responses.
 On failure, `reason` is one of `"auth"`, `"unreachable"`, `"timeout"`,
 `"unsupported_codec"`, or `"other"`. A device-reported geolocation (when the
 device supports it and no manual override exists) is persisted as a side-effect.
+Validate is bounded by the capture timeout plus 5 s, and
+`POST /api/v1/cameras/detect-protocol` by 20 s. Overrunning either returns 504.
+Detect takes an optional `camera_id` in the body: for an existing camera it
+uses that camera's certificate pin.
 
 **`POST /api/v1/cameras/{id}/capture`** — triggers an immediate single-frame
 capture. The frame must belong to a project (a project binds the camera to a
@@ -419,6 +468,11 @@ storage path), so a `project_id` is required:
 ```json
 {"project_id": 1}
 ```
+
+Captures one frame through the same path as scheduled captures: the project's
+stream and PTZ position, the capture timeout and the low-disk gate apply, and
+the frame is tagged `capture_reason: manual`. It does not wait for a busy
+camera.
 
 Response:
 ```json
@@ -433,6 +487,17 @@ Response:
   "captured_at": "2026-06-09T14:30:00.123456+00:00"
 }
 ```
+
+Errors:
+
+- 400: the project is not on this camera, or the camera configuration is
+  unusable;
+- 404: unknown camera or project;
+- 409: the project is at its frame cap;
+- 502: the camera failed;
+- 503: the camera is busy (retry) or a server-side failure occurred;
+- 504: the camera timed out;
+- 507: skipped, low disk.
 
 **`GET /api/v1/cameras/{id}/capture-status`** — returns the live capture state
 for every project backed by the camera:
@@ -493,7 +558,8 @@ admin-level bearer token and is therefore treated as the administrator.
 | `POST /api/v1/projects/{project_id}/frames/{frame_id}/restore` | `POST` | Admin | Restore a soft-deleted frame to active |
 | `POST /api/v1/projects/{project_id}/frames/{frame_id}/permanent-delete` | `POST` | Admin | Irreversibly remove row and file (requires `?confirm=true`) |
 | `PATCH /api/v1/projects/{project_id}/frames/{frame_id}` | `PATCH` | Admin | Correct a frame's capture timestamp |
-| `POST /api/v1/projects/{project_id}/frames/upload` | `POST` | Admin | Import a raw JPEG/PNG as an uploaded frame |
+| `POST /api/v1/projects/{project_id}/frames/upload` | `POST` | Operator or admin | Import a raw JPEG/PNG as an uploaded frame |
+| `POST /api/v1/projects/{project_id}/frames/import` | `POST` | Operator or admin | Import a batch of images (`multipart/form-data`, `files` parts, optional `exif_timezone`) |
 
 **`GET /api/v1/frames?project_id=1&limit=100&offset=0&include_deleted=false`**
 — returns up to 500 frames per page in capture order (oldest first). `limit`
@@ -542,8 +608,13 @@ capture state for a single project:
 Returns `"state": "idle"` with zero counts when the project has no running
 capture task.
 
+Uploads and imports are streamed to disk, not buffered: a file larger than
+`capture.max_image_bytes` is a `413` for the whole request, more than 200 files
+is `422`, a malformed multipart body is `400`, and `507` means free space would
+fall below `storage.low_watermark_bytes`.
+
 For the full frame management API (soft-delete, restore, permanent delete,
-upload, timestamp correction) see [docs/storage.md](./docs/storage.md).
+upload, import, timestamp correction) see [docs/storage.md](./docs/storage.md).
 
 ### Renders and milestones
 
@@ -555,6 +626,7 @@ UI; the JSON API uses a single admin-level token.)
 |---|---|---|---|
 | `/api/v1/projects/{project_id}/renders` | `POST` | Admin | Trigger a manual render (returns `201`) |
 | `/api/v1/projects/{project_id}/renders` | `GET` | Bearer | List a project's render jobs, newest first |
+| `/api/v1/projects/{project_id}/renders/suggested-fps` | `GET` | Bearer | Suggested render frame rate from the interval between the project's frames |
 | `/api/v1/renders/{id}` | `GET` | Bearer | Get a single render job's status |
 | `/api/v1/renders/{id}/cancel` | `POST` | Admin | Cancel a pending or in-flight render |
 | `/api/v1/renders/{id}/download` | `GET` | Bearer | Download the output file |
@@ -597,6 +669,13 @@ Private opt-in applies to camera fetches only. The webhook surface always uses
 the full deny-list with no private relaxation. Redirects are never followed on
 outbound requests.
 
+`ssrf.allowed_private_subnets` is also the only place the saved default camera
+login is sent: an inheriting camera gets it only when its address and URIs
+resolve inside the list, so with the default empty list no camera gets the
+default login. Camera connections dial only validated addresses and ignore
+`HTTP_PROXY`, `HTTPS_PROXY` and `NETRC`. An administrator can pin a camera to one
+exact TLS certificate (see [docs/web-ui.md](./docs/web-ui.md#certificate-pin)).
+
 ### Credential encryption at rest
 
 Camera passwords, SMTP passwords, and webhook URLs are encrypted before storage
@@ -615,6 +694,22 @@ secrets:
 
 Environment: `TLM_SECRETS__USE_OS_KEYSTORE`, `TLM_SECRETS__KEY_FILE`.
 
+The key's provider and a fingerprint are recorded in the database (`secrets_meta`),
+and the service checks them at every start. A missing or different key stops the
+service with exit status 78 (systemd does not restart it) instead of producing
+credentials nobody can decrypt. Back the key up with the database. Recovery
+(`timelapse-manager secrets status`, restore the key, or `secrets reset --confirm`)
+is in [docs/installation.md](./docs/installation.md#encryption-key-integrity).
+
+### Sessions and Content-Security-Policy
+
+Over HTTPS the session cookie is `__Host-tlm_session` (`Secure`, no `Domain`), so a
+sibling subdomain cannot plant it; the login and first-run forms carry a per-visit
+token; redirect targets go through one strict rule. Every response carries
+`script-src 'self'` (no inline scripts or handlers; htmx does not run script
+tags). See [docs/web-ui.md](./docs/web-ui.md#sessions) and
+[docs/web-ui.md](./docs/web-ui.md#content-security-policy).
+
 ### Log redaction
 
 Credential material is scrubbed from logs before any log sink writes it:
@@ -623,10 +718,13 @@ and query-string parameters with secret-sounding names (token, password,
 api_key, secret, sig, etc.) have their values masked. The `httpx` library
 logger is capped at `WARNING` to suppress URL-containing debug lines.
 
-### Security audit
+### Security notes
 
-See [`docs/security-audit.md`](./docs/security-audit.md) for the full
-security audit: verified controls, residual risks, and known gaps.
+The controls above are described in [docs/web-ui.md](./docs/web-ui.md) and
+[docs/installation.md](./docs/installation.md) (see *Upgrading to 0.2.0* for the
+settings that changed in 0.2.0). To report a vulnerability, use the repository's
+private vulnerability reporting (Security tab) if it is enabled, or contact the
+maintainer through the GitHub profile; please do not open a public issue.
 
 ## License
 

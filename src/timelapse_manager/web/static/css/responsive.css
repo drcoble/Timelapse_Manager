@@ -17,6 +17,46 @@
   .settings-sidenav { position: static; flex-direction: row; flex-wrap: wrap; }
 }
 
+/* Touch targets (#70 F-R10): a coarse pointer gets 44px hit areas on the small
+   controls that otherwise measure about 18-26px. */
+@media (pointer: coarse) {
+  .frame-tile-actions button,
+  .frame-tile-select,
+  .chip {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+  /* Every button-styled control, including the tile's btn-xs links, and the
+     header's icon buttons. */
+  .btn,
+  .alerts-toggle,
+  .drawer-close,
+  .form-control,
+  .user-menu,
+  .header-logo,
+  .status-banner-link,
+  .app-footer a {
+    min-block-size: 44px;
+  }
+  .status-banner-link,
+  .app-footer a {
+    display: inline-flex;
+    align-items: center;
+  }
+  .btn,
+  .header-logo,
+  .btn-icon,
+  .theme-toggle,
+  .alerts-toggle,
+  .drawer-close {
+    min-inline-size: 44px;
+  }
+  .frame-tile-select {
+    align-items: center;
+    justify-content: center;
+  }
+}
+
 @media (max-width: 600px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -78,4 +118,17 @@
 
   .page-header { flex-direction: column; }
   .page-actions { width: 100%; }
+
+  /* A wide table scrolls sideways inside its card; keep the Actions column
+     pinned at the right edge so the row menu stays reachable. The cell needs an
+     opaque background so the scrolled columns do not show through. */
+  .data-table th:last-child:has(> .visually-hidden),
+  .data-table td:last-child:has(> .row-actions-menu) {
+    position: sticky;
+    right: 0;
+    background: var(--color-surface);
+  }
+  .data-table tbody tr:hover td:last-child:has(> .row-actions-menu) {
+    background: var(--color-surface-2);
+  }
 }

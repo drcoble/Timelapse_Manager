@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import ValidationError
+from pydantic import PrivateAttr, ValidationError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from .settings import Settings
@@ -73,6 +73,12 @@ def _resolve_config_path(config_path: str | None) -> Path | None:
     if not candidate:
         return None
     return Path(candidate)
+
+
+def _absolute_config_path(config_path: str | None) -> Path | None:
+    """Return the config file path made absolute now (a later chdir cannot move it)."""
+    resolved = _resolve_config_path(config_path)
+    return None if resolved is None else Path(os.path.abspath(resolved))
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -146,8 +152,23 @@ def _resolve_file_data(config_path: str | None) -> dict[str, Any]:
     return {}
 
 
+def settings_config_file(settings: Settings) -> Path | None:
+    """Return the config file ``settings`` was loaded from, or ``None`` (#172).
+
+    The file named by an explicit ``--config`` / ``config_path`` argument or, when
+    none was given, by ``TLM_CONFIG``, whether or not it exists. ``None`` for a
+    :class:`Settings` that did not come from this loader.
+    """
+    value = getattr(settings, "_config_file", None)
+    return value if isinstance(value, Path) else None
+
+
 def _build_settings(
-    file_data: dict[str, Any], *, include_env: bool, overrides: dict[str, Any]
+    file_data: dict[str, Any],
+    *,
+    include_env: bool,
+    overrides: dict[str, Any],
+    config_file: Path | None = None,
 ) -> Settings:
     """Compose a :class:`Settings` from the chosen layers.
 
@@ -159,6 +180,9 @@ def _build_settings(
     """
 
     class _LoadedSettings(Settings):
+        # Where the file layer came from; read by :func:`settings_config_file`.
+        _config_file: Path | None = PrivateAttr(default=config_file)
+
         @classmethod
         def settings_customise_sources(
             cls,
@@ -224,7 +248,10 @@ def load_settings(config_path: str | None = None, **overrides: Any) -> Settings:
         fail validation; the message names the bad field path.
     """
     return _build_settings(
-        _resolve_file_data(config_path), include_env=True, overrides=overrides
+        _resolve_file_data(config_path),
+        include_env=True,
+        overrides=overrides,
+        config_file=_absolute_config_path(config_path),
     )
 
 
@@ -252,8 +279,13 @@ def load_settings_with_provenance(
       than risk falsely marking a field as environment-controlled.
     """
     file_data = _resolve_file_data(config_path)
-    with_env = _build_settings(file_data, include_env=True, overrides=overrides)
-    without_env = _build_settings(file_data, include_env=False, overrides=overrides)
+    config_file = _absolute_config_path(config_path)
+    with_env = _build_settings(
+        file_data, include_env=True, overrides=overrides, config_file=config_file
+    )
+    without_env = _build_settings(
+        file_data, include_env=False, overrides=overrides, config_file=config_file
+    )
 
     env_leaves = _leaf_paths(with_env)
     base_leaves = _leaf_paths(without_env)

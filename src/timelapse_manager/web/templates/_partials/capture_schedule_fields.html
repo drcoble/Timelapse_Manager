@@ -56,7 +56,7 @@
       <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
         <input type="radio" name="capture_schedule_preset" value="always"
                {% if _preset == 'always' %}checked{% endif %}
-               onchange="tlmSchedReveal('always');"
+               data-action="sched-reveal"
                style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
         <span>
           <span style="font-weight:500;">Always</span>
@@ -67,7 +67,7 @@
       <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
         <input type="radio" name="capture_schedule_preset" value="business"
                {% if _preset == 'business' %}checked{% endif %}
-               onchange="tlmSchedReveal('business');"
+               data-action="sched-reveal"
                style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
         <span>
           <span style="font-weight:500;">Business hours</span>
@@ -78,7 +78,7 @@
       <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
         <input type="radio" name="capture_schedule_preset" value="sun"
                {% if _preset == 'sun' %}checked{% endif %}
-               onchange="tlmSchedReveal('sun');"
+               data-action="sched-reveal"
                style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
         <span>
           <span style="font-weight:500;">Sunrise to sunset</span>
@@ -89,7 +89,7 @@
       <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
         <input type="radio" name="capture_schedule_preset" value="noon"
                {% if _preset == 'noon' %}checked{% endif %}
-               onchange="tlmSchedReveal('noon');"
+               data-action="sched-reveal"
                style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
         <span>
           <span style="font-weight:500;">Midday snapshot</span>
@@ -100,7 +100,7 @@
       <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
         <input type="radio" name="capture_schedule_preset" value="custom"
                {% if _preset == 'custom' %}checked{% endif %}
-               onchange="tlmSchedReveal('custom');"
+               data-action="sched-reveal"
                style="margin-top:3px;accent-color:var(--color-accent);flex-shrink:0;">
         <span>
           <span style="font-weight:500;">Custom</span>
@@ -252,20 +252,3 @@
   </div>{# /sched-custom-panel #}
 
 </fieldset>{# /capture schedule #}
-
-{# Inline controller — reveals/hides the sun and custom sub-panels
-   when a preset radio is selected. Falls back gracefully: without JS the
-   server-rendered `hidden` attribute on each panel already reflects the
-   correct initial state, and all fields POST regardless of visibility. #}
-<script>
-(function () {
-  function tlmSchedReveal(preset) {
-    var sunPanel    = document.getElementById('sched-sun-panel');
-    var customPanel = document.getElementById('sched-custom-panel');
-    if (sunPanel)    sunPanel.hidden    = (preset !== 'sun');
-    if (customPanel) customPanel.hidden = (preset !== 'custom');
-  }
-  /* Expose globally so the inline onchange= handlers can reach it. */
-  window.tlmSchedReveal = tlmSchedReveal;
-}());
-</script>

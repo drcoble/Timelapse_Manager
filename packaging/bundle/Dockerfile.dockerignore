@@ -1,0 +1,23 @@
+# Allowlist for the bundle build context (BuildKit reads this file in place of
+# the repository's .dockerignore for packaging/bundle/Dockerfile): only what
+# release.sh and the PyInstaller spec read. No .git, virtualenvs, databases,
+# keys, tokens or caches ever enter the build.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!NOTICE
+!ffmpeg-pin.json
+!timelapse-manager.spec
+!alembic.ini
+!alembic
+!src
+!packaging
+
+# Local build output and bytecode inside the re-included trees.
+packaging/build
+**/__pycache__
+**/*.pyc
+src/timelapse_manager/_build_info.py

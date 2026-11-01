@@ -1,0 +1,79 @@
+{#
+  Partial: renders_list.html (the global Renders page's list; #67 P5)
+  Context: renders_list — {renders, active, poll_url, next_before, has_any}
+           renders_part — "list" (default) | "older" | "more"
+           current_user, csrf_token, can_operate (base_context)
+
+  One template for the page and for GET /partials/renders/list, so the polled
+  element cannot drift between the first render and a poll.
+
+  "list": the polled #renders-list element.
+    - It polls every 10 s only while renders_list.active (a render is pending
+      or encoding). When nothing is active the server answers the poll with 286
+      and this element comes back without `every 10s`: htmx swaps in a fresh
+      element (outerHTML) and would otherwise start polling it again.
+    - `tlm:visible from:document` stays in both states: a tab switched back to
+      is refreshed once, which also picks up a render started elsewhere.
+    - poll_url refreshes the same window (since/before), so rows the page has
+      gathered stay put and a new render is added at the top.
+    - data-poll makes it a background poll (poll.js): passive for the idle
+      timeout and paused while the tab is hidden. Never add a `load` trigger:
+      each outerHTML swap inserts a new element, which would fire `load` again.
+    - hx-select="#renders-list" lets a full /renders response be swapped in as
+      well (the element is the fragment's root, so it also matches here).
+    - hx-disinherit="*" keeps the rows' own requests (the "Render #N" card
+      opener) from inheriting hx-select/hx-indicator.
+    - The element is rendered even when empty, so it stays pollable.
+  "older": the next older page of rows, then a fresh "Load more" ("more").
+  "more": the "Load more" link, or nothing at the start of the queue. It sits
+    below #renders-list (in #renders-older), outside the poll, and swaps itself
+    for the older page. Its href is the no-JS fallback (/renders?before=N).
+#}
+{% set part = renders_part | default('list') %}
+{% if part == 'list' %}
+<div class="job-list"
+     id="renders-list"
+     {% if renders_list.renders %}role="list"{% endif %}
+     style="padding:var(--sp-4);"
+     data-poll
+     hx-get="{{ renders_list.poll_url }}"
+     hx-trigger="{% if renders_list.active %}every 10s, {% endif %}tlm:visible from:document"
+     hx-swap="outerHTML"
+     hx-select="#renders-list"
+     hx-indicator="#render-refresh-indicator"
+     hx-disinherit="*">
+  {% for render in renders_list.renders %}
+    {% include '_partials/render_row.html' %}
+  {% else %}
+    {% if not renders_list.has_any %}
+      <div class="empty-state">
+        <div class="empty-state-icon" aria-hidden="true">&#9881;</div>
+        <div class="empty-state-title">No renders yet</div>
+        <div class="empty-state-desc">
+          {% if can_operate %}
+            Open a project and click "Render Now" to generate a timelapse video.
+          {% else %}
+            No timelapse videos have been rendered yet.
+          {% endif %}
+        </div>
+        {% if can_operate %}
+          <a href="/projects" class="btn btn-primary">Go to Projects</a>
+        {% endif %}
+      </div>
+    {% endif %}
+  {% endfor %}
+</div>
+{% elif part == 'older' %}
+{% for render in renders_list.renders %}
+  {% include '_partials/render_row.html' %}
+{% endfor %}
+{% with renders_part = 'more' %}{% include '_partials/renders_list.html' %}{% endwith %}
+{% elif part == 'more' and renders_list.next_before is not none %}
+<div id="renders-more" class="renders-more" style="padding-top:var(--sp-3);">
+  <a href="/renders?before={{ renders_list.next_before }}"
+     class="btn btn-secondary btn-sm"
+     hx-get="/partials/renders/list?before={{ renders_list.next_before }}"
+     hx-target="#renders-more"
+     hx-swap="outerHTML">Load more</a>
+</div>
+{% endif %}

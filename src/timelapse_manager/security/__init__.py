@@ -23,7 +23,10 @@ CSRF (:mod:`.csrf`)
     from the session's CSRF secret; ``verify_csrf`` is constant-time. The CSRF
     rule keys on **session-cookie presence** (see ``has_session_cookie``), not on
     an ``Authorization`` header: cookie-authenticated requests require CSRF,
-    bearer-token (CLI) requests are exempt.
+    bearer-token (CLI) requests are exempt. In the browser the token reaches the
+    server as the ``X-CSRF-Token`` header, which ``static/js/csrf.js`` adds to
+    every htmx request from the page's ``<meta name="csrf-token">`` (a plain
+    form carries it as a ``csrf_token`` field instead).
 
 Authorization (:mod:`.authz`)
     ``require_authenticated_session`` (``401`` if no live cookie session),

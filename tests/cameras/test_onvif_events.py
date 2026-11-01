@@ -55,7 +55,7 @@ _CREATE_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
   <s:Body>
     <tev:CreatePullPointSubscriptionResponse>
       <tev:SubscriptionReference>
-        <wsa5:Address>http://10.1.20.111/onvif/services</wsa5:Address>
+        <wsa5:Address>http://10.0.20.111/onvif/services</wsa5:Address>
         <wsa5:ReferenceParameters>
           <dom0:SubscriptionId xmlns:dom0="http://www.axis.com/2009/event">3</dom0:SubscriptionId>
         </wsa5:ReferenceParameters>
@@ -72,7 +72,7 @@ def test_parse_subscription_reference_address_and_refparams() -> None:
     assert result is not None
     address, ref_params = result
     # On this firmware the manager address is the bare services URL.
-    assert address == "http://10.1.20.111/onvif/services"
+    assert address == "http://10.0.20.111/onvif/services"
     # The SubscriptionId must round-trip with its namespace declared inline so it
     # stands alone in the outbound header.
     assert "SubscriptionId" in ref_params

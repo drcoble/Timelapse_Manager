@@ -4,12 +4,16 @@ SMTP: monkeypatched smtplib — sends, sets timeout, STARTTLS/SSL/login per
 security mode, ChannelSendError on transport failure, password never logged.
 
 Webhook: async context-manager stub — POSTs JSON payload, follow_redirects=False,
-calls validate_outbound_url, ChannelSendError on 5xx/transport failure.
+calls validate_outbound_url_async, ChannelSendError on 5xx/transport failure.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import smtplib
+import ssl
 from datetime import datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -149,6 +153,30 @@ class TestSMTPChannelSend:
             await ch.send(_msg())
         ssl_cls.assert_called_once()
 
+    async def test_tls_mode_passes_verifying_context_to_smtp_ssl(self) -> None:
+        """Implicit TLS must hand SMTP_SSL a context that verifies chain+host."""
+        mock_smtp = self._mock_smtp()
+        with patch("smtplib.SMTP_SSL", return_value=mock_smtp) as ssl_cls:
+            ch = SMTPChannel(_smtp_config(security="tls"), send_timeout_seconds=5.0)
+            await ch.send(_msg())
+        ctx = ssl_cls.call_args.kwargs["context"]
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    async def test_starttls_passes_verifying_context(self) -> None:
+        """STARTTLS must hand starttls() a context that verifies chain+host."""
+        mock_smtp = self._mock_smtp()
+        with patch("smtplib.SMTP", return_value=mock_smtp):
+            ch = SMTPChannel(
+                _smtp_config(security="starttls"), send_timeout_seconds=5.0
+            )
+            await ch.send(_msg())
+        ctx = mock_smtp.starttls.call_args.kwargs["context"]
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+
     async def test_login_called_when_credentials_provided(self) -> None:
         mock_smtp = self._mock_smtp()
         with patch("smtplib.SMTP", return_value=mock_smtp):
@@ -271,7 +299,7 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=make_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -300,7 +328,7 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=make_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -321,7 +349,7 @@ class TestWebhookChannelSend:
         assert captured_payload["scope_id"] == 3
 
     async def test_webhook_calls_validate_outbound_url(self) -> None:
-        """validate_outbound_url is called for every target URL (SSRF seam)."""
+        """validate_outbound_url_async is called for every target URL (SSRF seam)."""
         validated: list[str] = []
 
         async def recording_post(url: str, **kwargs: Any) -> MagicMock:
@@ -339,7 +367,7 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=make_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=recording_validate,
             ),
         ):
@@ -367,7 +395,7 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=capturing_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -395,7 +423,7 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=make_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -415,10 +443,118 @@ class TestWebhookChannelSend:
         with (
             patch("httpx.AsyncClient", side_effect=make_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
             ch = WebhookChannel(["https://h.example.com"], send_timeout_seconds=5.0)
             with pytest.raises(ChannelSendError):
                 await ch.send(_msg())
+
+
+# ---------------------------------------------------------------------------
+# Webhook channel — optional HMAC request signing
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookChannelSigning:
+    async def test_no_secret_omits_signature_header_and_uses_json(self) -> None:
+        """Without a signing secret the request is unchanged: json body, no header."""
+        captured: dict[str, Any] = {}
+
+        async def recording_post(url: str, **kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        def make_client(**kwargs: Any) -> _AsyncClientStub:
+            return _AsyncClientStub(post_fn=recording_post)
+
+        with (
+            patch("httpx.AsyncClient", side_effect=make_client),
+            patch(
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
+                side_effect=lambda u: u,
+            ),
+        ):
+            ch = WebhookChannel(["https://h.example.com"], send_timeout_seconds=5.0)
+            await ch.send(_msg())
+
+        # Unsigned path uses the json= encoder and sets no headers/content.
+        assert "json" in captured
+        assert "content" not in captured
+        headers = captured.get("headers") or {}
+        assert "X-Signature-256" not in headers
+
+    async def test_secret_adds_correct_signature_over_exact_bytes(self) -> None:
+        """The header must be the HMAC-SHA256 of the exact bytes POSTed."""
+        captured: dict[str, Any] = {}
+        secret = "shh-this-is-secret"
+
+        async def recording_post(url: str, **kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        def make_client(**kwargs: Any) -> _AsyncClientStub:
+            return _AsyncClientStub(post_fn=recording_post)
+
+        with (
+            patch("httpx.AsyncClient", side_effect=make_client),
+            patch(
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
+                side_effect=lambda u: u,
+            ),
+        ):
+            ch = WebhookChannel(
+                ["https://h.example.com"],
+                send_timeout_seconds=5.0,
+                signing_secret=secret,
+            )
+            await ch.send(_msg(message="signed body"))
+
+        # Signed path sends raw bytes via content= so the wire bytes are the
+        # signed bytes; the digest is recomputed over exactly what was sent.
+        sent_body = captured["content"]
+        assert isinstance(sent_body, bytes)
+        expected = hmac.new(
+            secret.encode("utf-8"), sent_body, hashlib.sha256
+        ).hexdigest()
+        headers = captured["headers"]
+        assert headers["X-Signature-256"] == f"sha256={expected}"
+        assert headers["Content-Type"] == "application/json"
+        # The bytes must still decode to the documented JSON payload.
+        assert json.loads(sent_body)["message"] == "signed body"
+
+    async def test_blank_secret_is_treated_as_unsigned(self) -> None:
+        """An empty-string secret must not enable signing (no header, json body)."""
+        captured: dict[str, Any] = {}
+
+        async def recording_post(url: str, **kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        def make_client(**kwargs: Any) -> _AsyncClientStub:
+            return _AsyncClientStub(post_fn=recording_post)
+
+        with (
+            patch("httpx.AsyncClient", side_effect=make_client),
+            patch(
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
+                side_effect=lambda u: u,
+            ),
+        ):
+            ch = WebhookChannel(
+                ["https://h.example.com"],
+                send_timeout_seconds=5.0,
+                signing_secret="",
+            )
+            await ch.send(_msg())
+
+        assert "json" in captured
+        headers = captured.get("headers") or {}
+        assert "X-Signature-256" not in headers

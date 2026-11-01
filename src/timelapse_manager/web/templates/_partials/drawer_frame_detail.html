@@ -95,7 +95,9 @@
     </div>
   </dl>
 
-  <details class="frame-drawer-scene">
+  {# Open when there is metadata: it is what the frame card's old Info button
+       showed, so opening a frame must not hide it behind a second click (#315). #}
+  <details class="frame-drawer-scene"{% if scene_groups %} open{% endif %}>
     <summary>&#9656; Scene metadata{% if not scene_groups %} (none){% endif %}</summary>
     {% if scene_groups %}
       {% for group in scene_groups %}

@@ -27,6 +27,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from timelapse_manager.db.migration_utils import suspend_foreign_keys
+
 # revision identifiers, used by Alembic.
 revision: str = "004_add_paused_lifecycle_state"
 down_revision: str | None = "003_session_auth_columns"
@@ -42,7 +44,13 @@ def _enum(*values: str) -> sa.Enum:
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("project") as batch_op:
+    # The portable enum widen rewrites ``project`` via batch_alter_table
+    # (create-copy-drop-rename); the implicit DROP of the old table cascades
+    # through the ON DELETE CASCADE foreign keys on
+    # ``frame``/``render_job``/``milestone`` and would silently delete those
+    # child rows. Suspend FK enforcement across the rebuild so child data
+    # survives.
+    with suspend_foreign_keys(op), op.batch_alter_table("project") as batch_op:
         batch_op.alter_column(
             "lifecycle_state",
             existing_type=_enum("active", "archived"),
@@ -54,14 +62,19 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Fold any paused rows back to active before tightening the CHECK, so the
     # table-copy's narrower constraint cannot reject existing data.
-    op.execute(
-        "UPDATE project SET lifecycle_state = 'active' "
-        "WHERE lifecycle_state = 'paused'"
-    )
-    with op.batch_alter_table("project") as batch_op:
-        batch_op.alter_column(
-            "lifecycle_state",
-            existing_type=_enum("active", "paused", "archived"),
-            type_=_enum("active", "archived"),
-            existing_nullable=False,
+    # As on the upgrade, the batch rebuild of ``project`` would cascade-delete
+    # child rows; suspend FK enforcement so they survive. The fold-back UPDATE
+    # runs *inside* the guard: issuing it first would open a transaction that
+    # makes the OFF pragma a no-op, so the cascade would still fire.
+    with suspend_foreign_keys(op):
+        op.execute(
+            "UPDATE project SET lifecycle_state = 'active' "
+            "WHERE lifecycle_state = 'paused'"
         )
+        with op.batch_alter_table("project") as batch_op:
+            batch_op.alter_column(
+                "lifecycle_state",
+                existing_type=_enum("active", "paused", "archived"),
+                type_=_enum("active", "archived"),
+                existing_nullable=False,
+            )

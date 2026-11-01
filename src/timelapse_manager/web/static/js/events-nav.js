@@ -8,17 +8,20 @@
  *  1. Level chips — a multi-select chip group (all pressed = all levels). chips.js
  *     toggles each chip's aria-pressed; this module reads the pressed set after a
  *     toggle, mirrors it into the filter form's hidden `level` input, and re-queries
- *     the list (GET /events -> #events-tbody). It also exposes the live selection
- *     to the date-jump form via window.eventsActiveLevels().
+ *     the list (GET /events/batch -> #events-tbody).
  *
- *  2. Date/time jump — the form's hx-get carries the live level selection (via the
- *     form's hx-vals js: hook calling eventsActiveLevels) and windows the list at
+ *  2. Date/time jump — the form's hx-get carries the live level selection (set
+ *     on the request in an htmx:configRequest listener) and windows the list at
  *     the chosen instant (?at=<iso>); the server swaps the batch into #events-tbody.
- *     No JS: the form is a plain GET with a hidden `level` mirror.
+ *     No JS: the form is a plain GET with a hidden `level` mirror. (Not an
+ *     hx-vals "js:" hook: htmx evaluates those with Function(), which the CSP's
+ *     script-src, without 'unsafe-eval', refuses -- the jump never fired, #34.)
  *
  *  3. New-events pill — polls /events/since on a ~30s cadence (with the active
  *     filters) and reveals a "N new events" pill only on a 0->N transition. Refresh
  *     reloads the list and the baseline resets from the new list's newest id.
+ *     The poll runs through tlmPoll (poll.js): passive, paused while the tab is
+ *     hidden, with backoff after errors.
  */
 (function () {
   "use strict";
@@ -47,8 +50,6 @@
     return pressed.join(",");
   }
 
-  // Exposed for the date-jump form's hx-vals js: hook.
-  window.eventsActiveLevels = activeLevels;
 
   function syncHiddenLevel() {
     var input = document.getElementById("events-level-input");
@@ -71,10 +72,13 @@
 
   // The list re-query URL built from the live filter state. Used for chip
   // re-filtering so the request reflects the final selection rather than racing
-  // the form's hidden-input serialization.
+  // the form's hidden-input serialization. It is the batch fragment route, like
+  // the Refresh button: /events answers a non-jump request with the whole page,
+  // which swapped into #events-tbody nested a second page (duplicate chips and
+  // ids, scripts run again so a later chip click toggled twice, #34).
   function listQueryUrl() {
     var filters = activeFilterQuery();
-    return "/events" + (filters ? "?" + filters : "");
+    return "/events/batch" + (filters ? "?" + filters : "");
   }
 
   // --- 1. Level chips ------------------------------------------------------
@@ -99,8 +103,17 @@
     }, 150);
   });
 
+  // --- 2. Date/time jump ---------------------------------------------------
+  // The jump request carries the live chip selection, overriding the hidden
+  // no-JS `level` mirror the form serialises.
+  document.addEventListener("htmx:configRequest", function (e) {
+    var elt = e.detail && e.detail.elt;
+    if (!elt || elt.id !== "events-jump") return;
+    e.detail.parameters.level = activeLevels();
+  });
+
   // --- 3. New-events pill --------------------------------------------------
-  var pollTimer = null;
+  var POLL_NAME = "events-since";
   var lastCount = 0;
 
   function pill() {
@@ -121,7 +134,9 @@
     return isNaN(id) ? null : id;
   }
 
-  function poll() {
+  // A tlmPoll (poll.js) callback: `request` sends the passive-poll headers and
+  // rejects on an error, which tlmPoll answers with backoff.
+  function poll(request) {
     var p = pill();
     if (!p || !window.fetch) return;
     var after = newestListId();
@@ -129,34 +144,29 @@
     var url = "/events/since?after=" + encodeURIComponent(after);
     var filters = activeFilterQuery();
     if (filters) url += "&" + filters;
-    window
-      .fetch(url, { headers: { "X-Requested-With": "fetch" } })
-      .then(function (r) {
-        return r.ok ? r.json() : null;
-      })
-      .then(function (data) {
-        if (!data || typeof data.count !== "number") return;
-        var n = data.count;
-        // Announce only on a 0->N edge, not on every tick that still has N.
-        if (n > 0 && lastCount === 0) {
-          var label = n === 1 ? "1 new event" : n + " new events";
-          var span = p.querySelector("[data-new-count]");
-          if (span) span.textContent = label;
-          p.hidden = false;
-        } else if (n === 0) {
-          p.hidden = true;
-        }
-        lastCount = n;
-      })
-      .catch(function () {
-        /* transient network error -> retry next tick */
-      });
+    return request(url).then(function (data) {
+      if (!data || typeof data.count !== "number") return;
+      var n = data.count;
+      // Announce only on a 0->N edge, not on every tick that still has N.
+      if (n > 0 && lastCount === 0) {
+        var label = n === 1 ? "1 new event" : n + " new events";
+        var span = p.querySelector("[data-new-count]");
+        if (span) span.textContent = label;
+        p.hidden = false;
+      } else if (n === 0) {
+        p.hidden = true;
+      }
+      lastCount = n;
+    });
   }
 
   function startPolling() {
-    if (pollTimer) window.clearInterval(pollTimer);
-    if (!pill()) return;
-    pollTimer = window.setInterval(poll, POLL_MS);
+    if (!window.tlmPoll) return;
+    if (!pill()) {
+      window.tlmPoll.stop(POLL_NAME);
+      return;
+    }
+    window.tlmPoll.every(POLL_NAME, poll, POLL_MS);
   }
 
   function resetBaseline() {

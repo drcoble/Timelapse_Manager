@@ -65,8 +65,20 @@
         <span class="form-hint">
           Enter an IANA timezone name (e.g. <code>America/New_York</code>,
           <code>Europe/London</code>, <code>Asia/Tokyo</code>).
-          Leave blank to use your browser&rsquo;s auto-detected timezone.
+          The zone you save stays until you change it here, even on a device in
+          another zone. Leave it blank and save to take your browser&rsquo;s zone
+          again on the next page.
           Capture schedules and date bounds are always shown in UTC.
+        </span>
+      </div>
+      {# Filled and shown by preferences.js when the browser reports a different
+         zone from the stored one (#70 F-R4). #}
+      <div class="form-group" id="timezone-browser-hint" hidden>
+        <span class="form-hint" role="status">
+          Your browser reports <strong class="mono" data-browser-tz></strong>.
+          <button type="button" id="timezone-use-browser-btn" class="btn btn-ghost btn-sm">
+            Use it
+          </button>
         </span>
       </div>
       {% if viewer_timezone %}
@@ -176,72 +188,11 @@
 
 {#
   Theme applies live on segment change (instant feedback); Save persists both
-  theme and timezone to /account/theme and /account/timezone, then reloads so
-  timestamps re-render in the chosen zone.
+  theme and timezone to /account/theme and /account/timezone (source=manual),
+  then reloads so timestamps re-render in the chosen zone. A failed save shows a
+  toast and does not reload. Deferred, so net.js, htmx-errors.js and
+  timezone.js (end of base.html's body) have run before it (#70 F-R2, F-R4).
 #}
-<script>
-  (function () {
-    function selectedTheme() {
-      var checked = document.querySelector('#theme-segment input:checked');
-      return checked ? checked.value : 'system';
-    }
-    function applyTheme(t) {
-      if (t === 'system') {
-        document.documentElement.removeAttribute('data-theme');
-      } else {
-        document.documentElement.setAttribute('data-theme', t);
-      }
-      try { localStorage.setItem('theme', t); } catch (e) {}
-    }
-
-    // Live-apply the theme as the user picks a segment.
-    var seg = document.getElementById('theme-segment');
-    if (seg) {
-      seg.addEventListener('change', function () { applyTheme(selectedTheme()); });
-    }
-
-    // Auto-detect timezone from the browser.
-    var detect = document.getElementById('timezone-detect-btn');
-    if (detect) {
-      detect.addEventListener('click', function () {
-        try {
-          var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-          if (tz) document.getElementById('timezone-input').value = tz;
-        } catch (e) {}
-      });
-    }
-
-    var btn = document.getElementById('save-preferences-btn');
-    if (!btn) return;
-    btn.addEventListener('click', function () {
-      var csrf = document.querySelector('meta[name="csrf-token"]');
-      if (!csrf) return;
-      var token = csrf.getAttribute('content');
-      var theme = selectedTheme();
-      var timezone = document.getElementById('timezone-input').value.trim();
-
-      function post(url, body) {
-        return fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'X-CSRF-Token': token
-          },
-          body: body
-        });
-      }
-
-      Promise.all([
-        post('/account/theme', 'theme=' + encodeURIComponent(theme)),
-        post('/account/timezone', 'timezone=' + encodeURIComponent(timezone))
-      ]).then(function () {
-        applyTheme(theme);
-        window.location.reload();
-      }).catch(function () {
-        alert('Could not save preferences. Please try again.');
-      });
-    });
-  })();
-</script>
+<script src="{{ static_url('js/preferences.js') }}" defer></script>
 
 {% endblock %}

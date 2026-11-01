@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 from dataclasses import dataclass
 
@@ -31,7 +32,9 @@ from ..dependencies import (
     templates,
 )
 from ._viewmodels import (
+    AlertScopeLink,
     _fmt_dt,
+    alert_scope_links,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,9 @@ _ALERT_LEVEL_CLASS = {
     "error": "error",
     "critical": "error",
 }
+
+# Client event carrying a rotated CSRF token (handled by ``csrf.js``).
+CSRF_ROTATED_EVENT = "tlm:csrf"
 
 # Cap on how many alerts the panel lists at once; the badge still shows the
 # full active count regardless of this page size.
@@ -63,10 +69,17 @@ class _AlertView:
     timestamp: str | None
     # Raw datetime for timezone-aware display via the localdt template filter.
     timestamp_raw: datetime.datetime | None
+    # What the alert is about ("camera Driveway"), and a link to it when the
+    # camera or project still exists (#69 CAM-R6: offline alerts are per camera).
+    scope_label: str = ""
+    scope_url: str | None = None
 
 
-def _alert_view(alert: ActiveAlert) -> _AlertView:
+def _alert_view(alert: ActiveAlert, link: AlertScopeLink | None = None) -> _AlertView:
     """Build an alert view model, mapping the level onto its display class."""
+    if link is None:
+        suffix = f" #{alert.scope_id}" if alert.scope_id is not None else ""
+        link = AlertScopeLink(label=f"{alert.scope}{suffix}", url=None)
     return _AlertView(
         id=alert.id,
         level=alert.level,
@@ -76,11 +89,18 @@ def _alert_view(alert: ActiveAlert) -> _AlertView:
         scope_id=alert.scope_id,
         timestamp=_fmt_dt(alert.timestamp),
         timestamp_raw=alert.timestamp,
+        scope_label=link.label,
+        scope_url=link.url,
     )
 
 
 def _active_alerts_fragment(request: Request, db: DbSession, user: User) -> Response:
-    """Render the active-alerts fragment (badge + panel) for the given user.
+    """Render the active-alerts update for the given user.
+
+    The fragment is out-of-band elements only (#70 F-R6): replacements for
+    ``#alerts-badge``, ``#alerts-count-label`` and ``#alerts-panel-body``. The
+    toggle and the panel around them are static in the page header, so neither
+    a poll nor a clear can take the toggle's focus or close an open panel.
 
     Shared by the polling summary load and the post-clear refresh so the badge
     count and the panel always reflect the same query. The clear controls are
@@ -93,6 +113,7 @@ def _active_alerts_fragment(request: Request, db: DbSession, user: User) -> Resp
         limit=_ALERTS_PANEL_LIMIT,
         offset=0,
     )
+    links = alert_scope_links(db, [(a.scope, a.scope_id) for a in alerts])
     return templates.TemplateResponse(
         request,
         "_partials/active_alerts.html",
@@ -101,26 +122,41 @@ def _active_alerts_fragment(request: Request, db: DbSession, user: User) -> Resp
             db,
             user,
             alert_count=total,
-            alerts=[_alert_view(a) for a in alerts],
+            alerts=[_alert_view(a, links.get((a.scope, a.scope_id))) for a in alerts],
         ),
     )
 
 
 @router.get("/alerts/summary", response_class=HTMLResponse)
 def alerts_summary(request: Request, db: DbDep, user: CurrentUser) -> Response:
-    """Return the active-alerts fragment for the polling indicator.
+    """Return the out-of-band alerts update for the polling indicator.
 
     Available to any authenticated user. The badge shows the total active
     count; the clear controls render only for operators and admins.
+
+    Also the page's CSRF rotation signal (#70 F-R3). Every htmx request carries
+    the page's token (``csrf.js``), so this poll does too. When that token no
+    longer verifies against the live session -- another tab signed in again --
+    the response adds ``HX-Trigger: {"tlm:csrf": {"token": ...}}`` with a fresh
+    masked token, and ``csrf.js`` writes it into the page's meta tag and every
+    form, so open pages keep working without a reload (#165). A current token,
+    masked or bare, never triggers.
     """
-    return _active_alerts_fragment(request, db, user)
+    response = _active_alerts_fragment(request, db, user)
+    if not deps.csrf_presented_is_current(request, db):
+        token = deps.csrf_token_for(request, db)
+        if token:
+            response.headers["HX-Trigger"] = json.dumps(
+                {CSRF_ROTATED_EVENT: {"token": token}}
+            )
+    return response
 
 
 @router.post("/alerts/{alert_id}/clear", response_class=HTMLResponse)
 def alerts_clear_one(
     request: Request, db: DbDep, user: OperatorUser, alert_id: int
 ) -> Response:
-    """Clear one active alert, then return the refreshed alerts fragment.
+    """Clear one active alert, then return the out-of-band alerts update.
 
     Operator/admin only (a viewer is 403). Idempotent: clearing an
     already-cleared alert, a non-alert event, or an unknown id is a no-op. The
@@ -133,7 +169,7 @@ def alerts_clear_one(
 
 @router.post("/alerts/clear-all", response_class=HTMLResponse)
 def alerts_clear_all(request: Request, db: DbDep, user: OperatorUser) -> Response:
-    """Clear every active alert, then return the refreshed alerts fragment.
+    """Clear every active alert, then return the out-of-band alerts update.
 
     Operator/admin only (a viewer is 403). Idempotent: with no active alerts
     this clears nothing. Event rows are never deleted -- only marked cleared.

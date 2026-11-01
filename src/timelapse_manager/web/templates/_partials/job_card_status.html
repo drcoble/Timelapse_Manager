@@ -1,0 +1,34 @@
+{#
+  Partial: job_card_status.html — status line + failure/missing-file alerts,
+  shared by render_card.html and export_card.html. Context: card.
+#}
+<p class="job-card-status">
+  Status:
+  {% if card.status == 'queued' %}
+    <strong>Queued</strong>
+  {% elif card.status == 'running' %}
+    <strong style="color:var(--color-accent-hover);">Running</strong>
+  {% elif card.status == 'complete' %}
+    <strong style="color:var(--color-running);">Complete</strong>
+  {% elif card.status == 'error' %}
+    <strong style="color:var(--color-error);">Error</strong>
+  {% endif %}
+</p>
+{% if card.status == 'error' %}
+  <div class="alert error" role="status">
+    <div class="alert-body">
+      <div class="alert-title">Failure reason</div>
+      <div class="alert-desc">{{ card.failure_reason or 'not recorded' }}</div>
+    </div>
+  </div>
+{% endif %}
+{% if card.file_missing %}
+  <div class="alert warning" role="status">
+    <div class="alert-body">
+      <div class="alert-title">File missing</div>
+      <div class="alert-desc">
+        The job finished, but its output file is no longer on disk.
+      </div>
+    </div>
+  </div>
+{% endif %}

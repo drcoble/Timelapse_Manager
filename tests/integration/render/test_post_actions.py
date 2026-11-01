@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 from sqlalchemy.orm import sessionmaker
 
@@ -122,6 +123,19 @@ class _WebhookCapture(BaseHTTPRequestHandler):
 
     def log_message(self, *args: object) -> None:  # pragma: no cover
         pass  # suppress server log noise in test output
+
+
+async def _pass_through(url: str) -> str:
+    """Stand-in for the SSRF check: the test server is on loopback."""
+    return url
+
+
+def _plain_client(timeout: float) -> httpx.AsyncClient:
+    """An unpinned client, so the webhook can reach the loopback test server.
+
+    Pinning itself is covered in tests/abuse/test_ssrf_rebinding.py.
+    """
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
 
 
 def _start_webhook_server() -> tuple[HTTPServer, int]:
@@ -308,9 +322,15 @@ async def test_webhook_posts_correct_payload(
         webhook_url = f"http://127.0.0.1:{port}/webhook"
         action_specs = [{"type": "external_trigger", "url": webhook_url}]
 
-        with patch(
-            "timelapse_manager.render.post_actions.validate_outbound_url",
-            side_effect=lambda url: url,
+        with (
+            patch(
+                "timelapse_manager.render.post_actions.validate_outbound_url_async",
+                side_effect=_pass_through,
+            ),
+            patch(
+                "timelapse_manager.render.post_actions._webhook_client",
+                side_effect=_plain_client,
+            ),
         ):
             await run_post_actions(
                 settings_no_autostart,
@@ -598,7 +618,8 @@ async def test_webhook_runs_under_docker(
     import timelapse_manager.render.post_actions as _mod
 
     monkeypatch.setattr(_mod, "running_under_docker", lambda: True)
-    monkeypatch.setattr(_mod, "validate_outbound_url", lambda url: url)
+    monkeypatch.setattr(_mod, "validate_outbound_url_async", _pass_through)
+    monkeypatch.setattr(_mod, "_webhook_client", _plain_client)
 
     project_id, job_id = _seed_project_and_job(migrated_factory, settings_no_autostart)
 

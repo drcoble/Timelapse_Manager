@@ -22,6 +22,7 @@ from timelapse_manager.db.models.event import Event
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
 from timelapse_manager.security import create_session, verify_password
+from timelapse_manager.security.authz import prefixed_cookie_name
 
 # Password min-length in web_settings fixture (conftest.py AuthSettings): 12.
 # A too-short password must be below this; a valid one must meet or exceed it.
@@ -386,7 +387,7 @@ class TestAccountPasswordValidation:
         monkeypatch.setattr(_sessions_mod, "_revalidate", lambda *a, **kw: True)
 
         ctx = get_context()
-        cookie_name = ctx.settings.session.cookie_name
+        cookie_name = prefixed_cookie_name(ctx.settings.session.cookie_name)
         with session_scope(ctx.session_factory) as db:
             ldap_user = db.get(User, uid)
             _session_row, raw_token = create_session(

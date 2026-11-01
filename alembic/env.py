@@ -19,7 +19,10 @@ from timelapse_manager.db.engine import DEFAULT_DATABASE_URL, create_db_engine
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Keep every logger that already exists. The service migrates in-process
+    # before it serves, and fileConfig's default (disable_existing_loggers=True)
+    # silenced ``uvicorn.error`` -- so 500s left no traceback in the journal (#37).
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # No declarative models defined yet; explicit migrations only.
 target_metadata = None

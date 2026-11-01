@@ -182,6 +182,9 @@ class TestServerSideSmuggleGuard:
         (username or password)``.  When inherit_default is True the condition
         is False, so credentials is None regardless of what was submitted.
         """
+        # The inherit flag only counts while usable defaults exist (#318).
+        with session_scope(get_context().session_factory) as db:
+            db.add(CameraDefaultCredentials(id=1, enabled=True, username="shared"))
         csrf = csrf_of(admin_client, "/cameras")
         resp = admin_client.post(
             "/cameras",
@@ -216,6 +219,9 @@ class TestServerSideSmuggleGuard:
         The edit handler guards at line 1473: ``if inherit_default: credentials =
         None`` — own creds are unconditionally cleared when inherit is on.
         """
+        # The inherit flag only counts while usable defaults exist (#318).
+        with session_scope(get_context().session_factory) as db:
+            db.add(CameraDefaultCredentials(id=1, enabled=True, username="shared"))
         ctx = get_context()
         # Seed a camera that previously had own credentials.
         with session_scope(ctx.session_factory) as db:

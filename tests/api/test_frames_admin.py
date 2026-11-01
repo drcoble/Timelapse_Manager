@@ -28,6 +28,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from tests.conftest import LOOPBACK_PEER
 from timelapse_manager.app import create_app
 from timelapse_manager.cameras.base import CapturedFrame
 from timelapse_manager.capture.frame_writer import FrameWriter
@@ -188,7 +189,7 @@ def frames_client(
     _run_migrations(settings)
     token = ensure_local_token(settings)
     app = create_app(settings)
-    with TestClient(app) as c:
+    with TestClient(app, client=LOOPBACK_PEER) as c:
         yield c, settings, token
 
 
@@ -516,7 +517,7 @@ class TestAdminGate403:
         app = create_app(settings)
         app.dependency_overrides[require_operator_or_admin_principal] = _deny_admin
 
-        with TestClient(app) as client:
+        with TestClient(app, client=LOOPBACK_PEER) as client:
             ctx = _seed_project_and_frame(client, settings, tmp_path, "sd-403")
             resp = client.post(
                 f"/api/v1/projects/{ctx['project_id']}/frames/{ctx['frame_id']}/soft-delete",
@@ -532,7 +533,7 @@ class TestAdminGate403:
         app = create_app(settings)
         app.dependency_overrides[require_operator_or_admin_principal] = _allow_operator
 
-        with TestClient(app) as client:
+        with TestClient(app, client=LOOPBACK_PEER) as client:
             ctx = _seed_project_and_frame(client, settings, tmp_path, "sd-op")
             resp = client.post(
                 f"/api/v1/projects/{ctx['project_id']}/frames/{ctx['frame_id']}/soft-delete",
@@ -547,7 +548,7 @@ class TestAdminGate403:
         app = create_app(settings)
         app.dependency_overrides[require_operator_or_admin_principal] = _deny_admin
 
-        with TestClient(app) as client:
+        with TestClient(app, client=LOOPBACK_PEER) as client:
             ctx = _seed_project_and_frame(client, settings, tmp_path, "rs-403")
             # Soft-delete first without override (direct via allow)
             app.dependency_overrides[require_operator_or_admin_principal] = _allow_admin
@@ -569,7 +570,7 @@ class TestAdminGate403:
         app = create_app(settings)
         app.dependency_overrides[require_operator_or_admin_principal] = _deny_admin
 
-        with TestClient(app) as client:
+        with TestClient(app, client=LOOPBACK_PEER) as client:
             ctx = _seed_project_and_frame(
                 client, settings, tmp_path, "up-403", with_file=False
             )

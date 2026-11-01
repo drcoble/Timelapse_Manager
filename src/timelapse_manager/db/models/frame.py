@@ -53,6 +53,25 @@ class Frame(TimestampMixin, Base):
         UniqueConstraint("project_id", "sequence_index", name="uq_frame_project_seq"),
         Index("ix_frame_project_id", "project_id"),
         Index("ix_frame_capture_timestamp", "capture_timestamp"),
+        # Read-path indexes (migration 035, #66 C5/C6). ``ix_frame_project_ts``
+        # matches the render gather's full ORDER BY (capture time, then the
+        # sequence tie-break), so it streams in index order with no sort step.
+        Index(
+            "ix_frame_project_ts", "project_id", "capture_timestamp", "sequence_index"
+        ),
+        # Covers the dashboard's grouped aggregate (last capture, disk usage),
+        # so that query never reads the table rows.
+        Index(
+            "ix_frame_project_state_origin_ts_size",
+            "project_id",
+            "lifecycle_state",
+            "origin",
+            "capture_timestamp",
+            "file_size_bytes",
+        ),
+        # AUTOINCREMENT (migration 031, #17): a deleted frame's id is never
+        # reused in URLs or the "frame N ..." audit messages.
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

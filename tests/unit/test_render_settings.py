@@ -61,6 +61,7 @@ def test_view_falls_back_to_defaults_for_none() -> None:
         "encoder": settings.DEFAULT_ENCODER,
         "container": settings.DEFAULT_CONTAINER,
         "fps": settings.DEFAULT_FPS,
+        "fps_auto": False,
         "resolution": settings.DEFAULT_RESOLUTION,
         "auto_prune": settings.DEFAULT_AUTO_PRUNE,
         "autoprune": settings.DEFAULT_AUTO_PRUNE,

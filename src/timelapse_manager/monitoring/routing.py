@@ -15,6 +15,10 @@ A routing rule is a plain dict (as persisted in the notification settings):
 state, and is trivially testable. An empty result means "record in the
 application only, do not notify any channel".
 
+Rules never look at an event's scope. A camera-scoped alert (the per-camera
+``camera_offline`` since #69 CAM-R6) therefore reaches exactly the channels the
+same alert reached when it was project-scoped.
+
 The notification delivery-failure event type is hard-excluded here so that a
 failed delivery can never itself be routed to a channel -- the single chokepoint
 that prevents a notification storm when a channel is unhealthy.

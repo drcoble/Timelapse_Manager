@@ -26,6 +26,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from timelapse_manager.db.migration_utils import suspend_foreign_keys
+
 # revision identifiers, used by Alembic.
 revision: str = "013_add_project_ptz"
 down_revision: str | None = "012_add_event_alert_lifecycle"
@@ -42,7 +44,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("project") as batch_op:
+    # Dropping columns makes SQLite rebuild ``project`` (create-copy-drop-rename).
+    # The implicit DROP of the old table cascades through the ON DELETE CASCADE
+    # foreign keys on ``frame``/``render_job``/``milestone`` and would silently
+    # delete those child rows. Suspend FK enforcement across the rebuild so child
+    # data survives.
+    with suspend_foreign_keys(op), op.batch_alter_table("project") as batch_op:
         batch_op.drop_column("ptz_zoom")
         batch_op.drop_column("ptz_tilt")
         batch_op.drop_column("ptz_pan")

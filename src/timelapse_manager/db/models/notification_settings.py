@@ -42,4 +42,9 @@ class NotificationSettings(TimestampMixin, Base):
     smtp_from_address: Mapped[str | None] = mapped_column(String, nullable=True)
     smtp_recipients: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     webhook_urls: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Optional HMAC signing secret for webhook deliveries, encrypted at rest
+    # exactly like ``smtp_password``. When set, each POST body is signed with
+    # HMAC-SHA256 and the digest sent in an ``X-Signature-256`` header; absent
+    # leaves webhooks unsigned. Resolved (decrypted) only at send time.
+    webhook_signing_secret: Mapped[str | None] = mapped_column(String, nullable=True)
     routing_rules: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)

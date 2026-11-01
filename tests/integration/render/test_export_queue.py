@@ -16,6 +16,7 @@ import struct
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -120,11 +121,9 @@ async def _drain_until_terminal(
 ) -> str:
     await queue.start()
     try:
-        deadline = asyncio.get_event_loop().time() + 10.0
-        while asyncio.get_event_loop().time() < deadline:
-            if _job(factory, job_id).status in ("done", "failed"):
-                break
-            await asyncio.sleep(0.05)
+        # Wait for the worker to drain the job to a terminal state and park,
+        # rather than polling the row (deterministic, no load-induced flake).
+        await asyncio.wait_for(queue.wait_idle(), 30.0)
     finally:
         await queue.stop()
     return _job(factory, job_id).status
@@ -135,7 +134,6 @@ async def _drain_until_terminal(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.flaky(reruns=2, reruns_delay=1)
 async def test_export_job_produces_downloadable_zip(
     migrated_factory: sessionmaker,  # type: ignore[type-arg]
     settings_no_autostart: Settings,
@@ -377,3 +375,131 @@ async def test_render_prune_does_not_delete_export_zip_or_row(
     assert _job(migrated_factory, export_job_id).status == "done"
     # Sanity: the prune actually ran (older manual renders were swept).
     assert not render_files[0].is_file()
+
+
+# ---------------------------------------------------------------------------
+# Test: free-space gate refuses an export below the low watermark
+# ---------------------------------------------------------------------------
+
+
+def _fake_disk_usage(*, free: int, total: int = 100_000_000_000):  # type: ignore[no-untyped-def]
+    """Return a ``shutil.disk_usage`` stand-in reporting fixed free/total bytes."""
+
+    def _probe(_path: Path) -> SimpleNamespace:
+        return SimpleNamespace(total=total, used=total - free, free=free)
+
+    return _probe
+
+
+def test_export_refused_when_free_space_below_watermark(
+    migrated_factory: sessionmaker,  # type: ignore[type-arg]
+    settings_no_autostart: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An export below the low watermark fails cleanly and writes no archive."""
+    project_id, frame_ids = _seed_project(migrated_factory, settings_no_autostart)
+    job_id = _enqueue_export(migrated_factory, project_id, frame_ids)
+
+    # 500 MB free is below the 1 GB default low watermark.
+    monkeypatch.setattr(
+        "timelapse_manager.render.export.shutil.disk_usage",
+        _fake_disk_usage(free=500_000_000),
+    )
+
+    result = build_export_zip(settings_no_autostart, migrated_factory, job_id=job_id)
+
+    assert result.success is False
+    assert result.output_path is None
+    assert "disk space" in (result.error or "")
+    # No archive (or temp part) was written under the project render root.
+    with session_scope(migrated_factory) as session:
+        proj = session.get(Project, project_id)
+        assert proj is not None
+        root = project_render_root(settings_no_autostart, proj)
+    assert not (root / f"export-{job_id}.zip").exists()
+    assert not (root / f"export-{job_id}.zip.part").exists()
+
+
+def test_export_proceeds_when_free_space_ample(
+    migrated_factory: sessionmaker,  # type: ignore[type-arg]
+    settings_no_autostart: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ample free space the gate is transparent and the zip is produced."""
+    project_id, frame_ids = _seed_project(migrated_factory, settings_no_autostart)
+    job_id = _enqueue_export(migrated_factory, project_id, frame_ids)
+
+    # 50 GB free clears both the byte and percentage floors.
+    monkeypatch.setattr(
+        "timelapse_manager.render.export.shutil.disk_usage",
+        _fake_disk_usage(free=50_000_000_000),
+    )
+
+    result = build_export_zip(settings_no_autostart, migrated_factory, job_id=job_id)
+
+    assert result.success is True
+    assert result.output_path is not None
+    assert result.output_path.is_file()
+    with zipfile.ZipFile(result.output_path) as archive:
+        assert len(archive.namelist()) == len(frame_ids)
+
+
+# ---------------------------------------------------------------------------
+# Containment (#67 S16): a frame path that escapes the project tree is skipped.
+# ---------------------------------------------------------------------------
+
+
+def test_export_skips_symlinked_frame_pointing_outside_root(
+    migrated_factory: sessionmaker,  # type: ignore[type-arg]
+    settings_no_autostart: Settings,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project_id, frame_ids = _seed_project(migrated_factory, settings_no_autostart)
+    frames_root = settings_no_autostart.paths.frames_root
+    assert frames_root is not None
+    secret = tmp_path / "secret.key"
+    secret.write_bytes(b"TOP-SECRET")
+    planted = frames_root / str(project_id) / "frame_0001.jpg"
+    planted.unlink()
+    planted.symlink_to(secret)
+    job_id = _enqueue_export(migrated_factory, project_id, frame_ids)
+
+    with caplog.at_level("WARNING", logger="timelapse_manager.render.export"):
+        result = build_export_zip(
+            settings_no_autostart, migrated_factory, job_id=job_id
+        )
+
+    assert result.success
+    assert result.output_path is not None
+    with zipfile.ZipFile(result.output_path) as archive:
+        names = archive.namelist()
+        assert len(names) == len(frame_ids) - 1
+        assert not any(name.endswith("frame_0001.jpg") for name in names)
+        assert all(archive.read(name) != b"TOP-SECRET" for name in names)
+    assert "outside project" in caplog.text
+    assert _job(migrated_factory, job_id).frame_count == len(frame_ids) - 1
+
+
+def test_export_skips_traversal_and_absolute_escape(
+    migrated_factory: sessionmaker,  # type: ignore[type-arg]
+    settings_no_autostart: Settings,
+    tmp_path: Path,
+) -> None:
+    project_id, frame_ids = _seed_project(migrated_factory, settings_no_autostart)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(_JPEG)
+    with session_scope(migrated_factory) as session:
+        first = session.get(Frame, frame_ids[0])
+        second = session.get(Frame, frame_ids[1])
+        assert first is not None and second is not None
+        first.file_path = "../../outside.jpg"
+        second.file_path = str(outside)
+    job_id = _enqueue_export(migrated_factory, project_id, frame_ids)
+
+    result = build_export_zip(settings_no_autostart, migrated_factory, job_id=job_id)
+
+    assert result.success
+    assert result.output_path is not None
+    with zipfile.ZipFile(result.output_path) as archive:
+        assert len(archive.namelist()) == 1

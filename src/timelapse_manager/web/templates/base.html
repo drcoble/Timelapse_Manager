@@ -1,40 +1,44 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme-pref="{{ user_theme }}" data-viewer-tz="{{ viewer_timezone or '' }}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  {# CSRF token in meta — read by HTMX on every mutating request via hx-headers on <body> #}
+  {# The page's CSRF token: masked afresh on every response (#70 F-S4). csrf.js
+     reads it at request time for every htmx request (X-CSRF-Token) and into
+     every form on submit, and rewrites it when /alerts/summary reports a
+     rotated session (#70 F-R3). net.js, theme.js and timezone.js read it too. #}
   <meta name="csrf-token" content="{{ csrf_token }}">
   <title>{% block title %}Timelapse Manager{% endblock %}</title>
   {#
-    No-flash theme script: runs BEFORE the stylesheet so the correct
-    data-theme is set before the first paint, preventing a flash.
-    For signed-in users the server inlines their stored preference;
-    for anonymous users we fall back to localStorage.
+    No-flash theme: theme-init.js is a blocking script, loaded before the
+    stylesheet, so data-theme is set before the first paint. It reads the
+    signed-in user's stored preference from <html data-theme-pref> and falls
+    back to localStorage for anonymous visitors. External, so a strict
+    script-src needs no inline allowance (#70 F-S3).
   #}
-  <script>
-    (function () {
-      var pref = {{ user_theme | tojson }};
-      if (!pref || pref === 'system') {
-        try { pref = localStorage.getItem('theme') || 'system'; } catch (e) {}
-      }
-      if (pref === 'light' || pref === 'dark') {
-        document.documentElement.setAttribute('data-theme', pref);
-      }
-      // 'system' → no data-theme attr → CSS @media drives it
-    })();
-  </script>
-  <link rel="stylesheet" href="/static/css/app.css">
-  <script src="/static/js/htmx.min.js"></script>
+  <script src="{{ static_url('js/theme-init.js') }}"></script>
+  {# Start the UI font download in parallel with the stylesheet. The href must be
+     byte-identical to the URL inside the CSS bundle (both come from static_url),
+     and crossorigin is required for a font preload to be reused. #}
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="{{ static_url('fonts/Geist-Variable.woff2') }}">
+  <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
+  {# htmx reads this when it initialises (#70 F-R1, F-S3): a 30 s default timeout
+     (long requests override it per element), no eval of trigger filters or
+     js: values, same-origin requests only, and no page snapshots in
+     localStorage. Indicator styles come from htmx.css, not an injected <style>. #}
+  <meta name="htmx-config" content='{"timeout":30000,"allowEval":false,"selfRequestsOnly":true,"historyCacheSize":0,"includeIndicatorStyles":false,"allowScriptTags":false}'>
+  <script src="{{ static_url('js/htmx.min.js') }}"></script>
 </head>
-{#
-  hx-headers on <body> injects X-CSRF-Token into every HTMX request automatically.
-  The meta tag is read at request time so the value is always current.
-#}
-<body hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
+{# No hx-headers here: a literal token frozen into the markup cannot follow a
+   rotation. csrf.js sets X-CSRF-Token from the meta tag on each request. #}
+<body>
 
   {# Icon sprite — hidden <symbol> defs referenced via <use> throughout #}
   {% include '_partials/shell/icons.html' %}
+
+  {# First Tab stop: jumps past the header and nav to the page content (#70 F-R10).
+     Visually hidden until focused. #}
+  <a class="skip-link" href="#main-content">Skip to main content</a>
 
   <div class="app-shell">
 
@@ -50,7 +54,7 @@
     {% include '_partials/shell/nav.html' %}
 
     <!-- ===== MAIN ===== -->
-    <main class="app-main" id="main-content">
+    <main class="app-main" id="main-content" tabindex="-1">
 
       {#
         Status banner — lazily loaded so a monitoring query hiccup can never
@@ -62,16 +66,38 @@
            hx-trigger="load"
            hx-swap="outerHTML"></div>
 
-      {# Flash messages rendered as toasts in a fixed region #}
-      {% if flash_messages %}
-      <div class="toast-region" role="status" aria-live="polite">
+      {# Flash messages rendered as toasts in a fixed region. Always present
+         (empty when there is nothing to say) so an HTMX response can append a
+         toast out-of-band, e.g. "Render #N deleted". #}
+      <div class="toast-region" id="toast-region" role="status" aria-live="polite">
         {% for msg in flash_messages %}
         {% include '_partials/toast.html' %}
         {% endfor %}
       </div>
-      {% endif %}
+
+      {# Shown by htmx-errors.js while the server is unreachable; hidden again
+         by the next request that gets any response. #}
+      <div class="connection-banner" id="connection-banner" role="alert" hidden>
+        Connection lost &ndash; retrying.
+      </div>
 
       {% block content %}{% endblock %}
+
+      {#
+        Help footer: "Report a problem" (#8) for every signed-in role. Opens the
+        form in the drawer, prefilled from this page (path + query only); the
+        href is the no-JS full-page fallback.
+      #}
+      {% if reporting_enabled is defined and reporting_enabled %}
+      {% set report_from = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+      <footer class="app-footer">
+        <a href="/report?page={{ report_from | urlencode }}"
+           data-drawer-open="#drawer-main"
+           hx-get="/drawers/report?page={{ report_from | urlencode }}"
+           hx-target="#drawer-main .drawer-body" hx-swap="innerHTML"
+           data-drawer-title="Report a problem">Report a problem</a>
+      </footer>
+      {% endif %}
 
     </main>
 
@@ -81,8 +107,11 @@
      Fragment routes load their form into `.drawer-body`; drawer.js opens the
      panel once the content has swapped in, and traps focus while it is open. #}
   <div class="drawer-backdrop" data-drawer-backdrop></div>
-  <aside id="drawer-main" class="drawer" role="dialog" aria-modal="true"
-         aria-hidden="true" aria-labelledby="drawer-title">
+  {# Closed from the first byte: `inert` and `drawer--hidden` (visibility:hidden)
+     keep focus and assistive tech out until drawer.js opens it. #}
+  <aside id="drawer-main" class="drawer drawer--hidden" role="dialog"
+         aria-modal="true" aria-hidden="true" inert
+         aria-labelledby="drawer-title">
     <header class="drawer-header">
       <h2 class="drawer-title" id="drawer-title"></h2>
       <button type="button" class="drawer-close" data-drawer-close
@@ -91,34 +120,57 @@
     <div class="drawer-body"></div>
   </aside>
 
+  {# Error plumbing first, so every later script can call window.tlmToast. #}
+  <script src="{{ static_url('js/htmx-errors.js') }}"></script>
+  {# CSRF header on every htmx request, rotation and submit-time refresh
+     (csrf.js): before any poller sends its first request. #}
+  <script src="{{ static_url('js/csrf.js') }}"></script>
+  {# Guarded fetch (tlmRequest/tlmExclusive), used by scrubber.js and selection.js. #}
+  <script src="{{ static_url('js/net.js') }}"></script>
+  {# Polling policy (tlmPoll, data-poll, tlm:visible): before every poller,
+     including frames-nav.js and events-nav.js. #}
+  <script src="{{ static_url('js/poll.js') }}"></script>
+  {# Alerts panel open state (alerts.js): after poll.js, whose paused flag it sets. #}
+  <script src="{{ static_url('js/alerts.js') }}"></script>
+
   {#
     Theme toggle script. Cycles: current → next in [light, dark, system].
     Persists to the server (signed-in users) and to localStorage (fallback).
     Loaded at end-of-body (not deferred) so #theme-toggle-btn is already parsed.
   #}
-  <script src="/static/js/theme.js"></script>
+  <script src="{{ static_url('js/theme.js') }}"></script>
 
   {#
-    Browser timezone detection. The server-rendered stored value is passed to
-    the external script via a tiny window.__viewerTz shim (kept as a literal
-    `| tojson` expression so the rendered value is byte-identical to before).
-    The shim must precede the external <script src>.
+    Browser timezone detection. The stored zone is read by timezone.js from
+    <html data-viewer-tz> (empty when none is stored).
   #}
-  <script>window.__viewerTz = {{ viewer_timezone | tojson }};</script>
-  <script src="/static/js/timezone.js"></script>
+  <script src="{{ static_url('js/timezone.js') }}"></script>
 
   {# Component behaviours — event-delegated, tolerate HTMX-swapped markup #}
-  <script src="/static/js/drawer.js"></script>
-  <script src="/static/js/modal.js"></script>
-  <script src="/static/js/chips.js"></script>
-  <script src="/static/js/ribbon.js"></script>
-  <script src="/static/js/frames-nav.js"></script>
-  <script src="/static/js/scrubber.js"></script>
-  <script src="/static/js/selection.js"></script>
-  <script src="/static/js/density.js"></script>
-  <script src="/static/js/events-nav.js"></script>
-  <script src="/static/js/tabs.js"></script>
-  <script src="/static/js/scroll-announce.js"></script>
+  <script src="{{ static_url('js/drawer.js') }}"></script>
+  <script src="{{ static_url('js/modal.js') }}"></script>
+  <script src="{{ static_url('js/playability.js') }}"></script>
+  <script src="{{ static_url('js/latest-render.js') }}"></script>
+  <script src="{{ static_url('js/chips.js') }}"></script>
+  <script src="{{ static_url('js/ribbon.js') }}"></script>
+  <script src="{{ static_url('js/frames-nav.js') }}"></script>
+  <script src="{{ static_url('js/scrubber.js') }}"></script>
+  <script src="{{ static_url('js/selection.js') }}"></script>
+  <script src="{{ static_url('js/density.js') }}"></script>
+  <script src="{{ static_url('js/events-nav.js') }}"></script>
+  <script src="{{ static_url('js/tabs.js') }}"></script>
+  <script src="{{ static_url('js/scroll-announce.js') }}"></script>
+  <script src="{{ static_url('js/row-actions.js') }}"></script>
+  <script src="{{ static_url('js/row-click.js') }}"></script>
+  {# Delegated data-action registry (actions.js), then the modules that register
+     with it. No inline <script> or on*= handler may be added (#70 F-S3): a new
+     behaviour registers an action. project-forms.js needs htmx (loaded in the
+     head) for its htmx.onLoad initialiser. #}
+  <script src="{{ static_url('js/actions.js') }}"></script>
+  <script src="{{ static_url('js/project-forms.js') }}"></script>
+  {# Submit guards (forms.js): last, so its document-level submit listener runs
+     after any other script's validation has had the chance to cancel. #}
+  <script src="{{ static_url('js/forms.js') }}"></script>
 
 </body>
 </html>

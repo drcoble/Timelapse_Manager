@@ -14,6 +14,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from tests.conftest import LOOPBACK_PEER
+
 
 class TestSystemEndpointAuth:
     def test_returns_401_without_auth_header(self, client: TestClient) -> None:
@@ -179,7 +181,7 @@ class TestDbUrlRedaction:
         try:
             # Skip the lifespan so our manually-installed context stands.
             app = create_app(settings)
-            c = TestClient(app, raise_server_exceptions=True)
+            c = TestClient(app, raise_server_exceptions=True, client=LOOPBACK_PEER)
             body = c.get(
                 "/api/v1/system",
                 headers={"Authorization": f"Bearer {token}"},

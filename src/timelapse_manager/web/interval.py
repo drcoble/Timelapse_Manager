@@ -85,3 +85,28 @@ def decompose_seconds(seconds: int | None) -> tuple[int, str]:
             return seconds // factor, unit
     # Unreachable: seconds=1 always divides evenly, but be explicit.
     return seconds, "seconds"
+
+
+# Compact display units, largest first: (suffix, seconds). Weeks and months are
+# left out on purpose; a list cell reads ``7d`` or ``30d``, not ``1w``.
+_COMPACT_UNITS: tuple[tuple[str, int], ...] = (
+    ("d", 86400),
+    ("h", 3600),
+    ("m", 60),
+    ("s", 1),
+)
+
+
+def format_interval_compact(seconds: int | None) -> str:
+    """Format a capture interval for a list cell, e.g. ``30s``, ``15m``, ``2h``.
+
+    Uses the largest of d/h/m/s that divides ``seconds`` exactly, so 5400
+    reads ``90m`` and 90 reads ``90s``. ``None``, zero and negative values
+    (a project with no interval, e.g. time-of-day anchored) give ``\u2014``.
+    """
+    if seconds is None or seconds <= 0:
+        return "\u2014"
+    for suffix, factor in _COMPACT_UNITS:
+        if seconds % factor == 0:
+            return f"{seconds // factor}{suffix}"
+    raise AssertionError("unreachable: every integer divides by 1")  # pragma: no cover

@@ -44,6 +44,26 @@ Read `ffmpeg-pin.json`:
 Note the `version` string (a git-describe tag such as `N-124941-g54749da98a`)
 and the tarball `url`.
 
+The file may also carry an optional `mirror_urls` list: alternative locations
+for the same tarball, tried in order, each checked against the same `sha256`.
+The committed file lists the public BtbN URL first. A BtbN autobuild URL
+disappears when BtbN prunes old builds, so a project that builds in its own
+infrastructure can keep a copy of the pinned tarball on a mirror it controls
+(for example a generic package on a self-hosted registry, `<registry>/<owner>`)
+and have its build try that mirror before the public URL. The mirror is a
+convenience, never a trust anchor: the SHA-256 in the pin is what is verified.
+
+To have a build try a private mirror first without committing its address, set
+`TLM_FFMPEG_MIRROR_URL` to the mirror's full tarball URL. `packaging/release.sh`
+and both Dockerfiles (as the `TLM_FFMPEG_MIRROR_URL` build argument) put that URL
+ahead of the pin's own list, and send the registry token (`GITEA_TOKEN`, or the
+`gitea_token` build secret) to that URL only. When a mirror URL and a token are
+both given, a failed mirror fails the build instead of silently falling back to
+the public URL. `python3 packaging/refresh-ffmpeg-pin.py --mirror-url` prints the
+mirror URL for the pinned build, given `TLM_REGISTRY_URL` and
+`TLM_REGISTRY_OWNER`; `--apply` uploads a new build there (it also needs
+`GITEA_TOKEN`) and commits only the public URL.
+
 ### 2. Identify the replacement build
 
 Obtain a new static linux/amd64 FFmpeg build. The project uses GPL static
@@ -160,33 +180,34 @@ print(ffmpeg['version'])
 
 ### 6. Run the CVE scan
 
-The CI Trivy gate scans the **Docker base image** (`python:3.12-slim-bookworm`)
+The CI Trivy gate scans the **Docker base image** (`python:3.12-slim-trixie`)
 for HIGH/CRITICAL CVEs, not the FFmpeg binary itself. The FFmpeg pin's
 integrity guarantee is the SHA-256 verification at Docker build time (step 4)
 plus the SBOM component with its recorded hash.
 
-If the advisory also affects the Python base image, no Dockerfile edit is
-needed: the base image is pinned by digest **at build time**, not in the
-committed source. The `ARG PYTHON_IMAGE` default in `docker/Dockerfile` is an
-all-zeros placeholder left in place on purpose so an un-pinned build fails
-loudly; both the release CI and the local `make image` target resolve the live
-`python:3.12-slim-bookworm` digest and pass it via `--build-arg`. Cutting a new
-release (or rebuilding the image) therefore picks up the current base digest
-automatically, with no source change to commit.
+If the advisory also affects a base image, edit the digest defaults in
+`docker/Dockerfile`. `PYTHON_IMAGE` (runtime and builder),
+`FFMPEG_BASE_IMAGE` (the FFmpeg download stage) and `UV_IMAGE` are each pinned to
+a real digest, and a test refuses an unpinned or all-zeros value. Release CI and
+`make image` build with those defaults unless a `--build-arg` overrides them, so
+a base-image refresh is a committed change, not a build-time lookup.
 
-To see the digest a build would resolve to:
+To see the current digest of a tag:
 
 ```sh
-docker buildx imagetools inspect python:3.12-slim-bookworm \
+docker buildx imagetools inspect python:3.12-slim-trixie \
   --format '{{.Manifest.Digest}}'
 ```
+
+Commit the new digest and its date comment, then run the CVE scan again.
 
 ### 7. Publish
 
 Commit the change (`ffmpeg-pin.json`) and push a new version tag. The SBOM is a
 generated release artifact (written to the git-ignored `dist/` and regenerated
 by the release CI on the tag), so it is not committed; the base image is pinned
-by digest at build time, so `docker/Dockerfile` is not edited here either:
+by digest in `docker/Dockerfile`, which is edited only when a base image needs
+refreshing (step 6):
 
 ```sh
 git add ffmpeg-pin.json
@@ -195,23 +216,30 @@ git tag v<next-version>
 git push origin main v<next-version>
 ```
 
-The release CI (`release.yml`) triggers on the tag and:
+The release CI triggers on the tag and:
 
-1. Runs unit tests
-2. Builds and smoke-tests the PyInstaller bundle
-3. Builds the Docker image (downloads and SHA-verifies the pinned FFmpeg) and
-   runs the Trivy base-image CVE gate
-4. Runs the systemd install test
-5. Generates the SBOM, signs `SHA256SUMS`, and publishes the GitHub release
+1. Runs lint, format, typecheck and the unit tests on Python 3.12 and 3.11, and
+   writes the CycloneDX SBOM.
+2. Builds the PyInstaller bundle in an Enterprise Linux 9 container with the
+   pinned FFmpeg, fails if any file needs a glibc newer than 2.34, and
+   smoke-tests `/healthz` on a clean EL9 image.
+3. Builds the `.deb` and the signed `.rpm`, and the Proxmox CT template, then
+   scans the template (fixable HIGH/CRITICAL findings fail the release) and
+   writes its SBOM.
+4. Builds the Docker image (downloads and SHA-verifies the pinned FFmpeg),
+   checks it, scans it with Trivy (fixable HIGH/CRITICAL findings fail the
+   release), writes its SBOM and pushes it.
+5. Publishes every file, then uploads `SHA256SUMS` over the whole set last and
+   verifies the published release.
 
-> **PyInstaller bundle gap:** as noted above, the release CI currently does not
-> set `TLM_BUNDLE_FFMPEG_DIR` before building the bundle, so the released
-> PyInstaller artifact uses the runner's PATH `ffmpeg` rather than the pin.
-> Before a security-advisory release, add a step to the `bundle` job in
-> `release.yml` that downloads + verifies the pinned build and sets
-> `TLM_BUNDLE_FFMPEG_DIR` to its directory before running `./packaging/release.sh`.
-> Until that is done, only the Docker image is guaranteed to ship the exact
-> pinned binary.
+The files and the image are then attached to the GitHub Release (see
+[Verifying Releases](./verifying-releases.md)), whose own workflow only
+verifies them; it builds nothing.
+
+A manual run with `publish=false` does everything except publish.
+
+The tarball, `.deb`, `.rpm`, CT template and image all ship the pinned FFmpeg:
+`release.sh` stages the build named in `ffmpeg-pin.json` before freezing the bundle.
 
 ---
 

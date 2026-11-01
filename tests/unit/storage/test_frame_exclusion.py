@@ -54,7 +54,9 @@ def _seed(session, n: int, *, name: str = "exc") -> tuple[int, list[int]]:
             project_id=proj.id,
             sequence_index=i,
             capture_timestamp=(_T0 + _STEP * i).replace(tzinfo=None),
-            file_path=f"/frames/{i:08d}.jpg",
+            # Relative, as the writer stores it for a default-layout project:
+            # gather_frames drops a path outside the project tree (#67 S16).
+            file_path=f"{i:08d}.jpg",
             capture_status="captured",
             origin="captured",
             lifecycle_state="active",

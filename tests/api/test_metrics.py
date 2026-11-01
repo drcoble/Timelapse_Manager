@@ -13,6 +13,7 @@ client fixtures do not expose.
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,13 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.conftest import LOOPBACK_PEER
 from timelapse_manager.app import create_app
+from timelapse_manager.capture.supervisor import (
+    CaptureState,
+    CaptureTarget,
+    _ProjectRunner,
+)
 from timelapse_manager.config.settings import (
     CaptureSettings,
     DatabaseSettings,
@@ -36,6 +43,7 @@ from timelapse_manager.config.settings import (
 from timelapse_manager.db.engine import create_db_engine
 from timelapse_manager.db.models import Camera, Event, Frame, Project, RenderJob
 from timelapse_manager.db.session import create_session_factory, session_scope
+from timelapse_manager.runtime import get_context
 from timelapse_manager.security.token import ensure_local_token
 
 # ---------------------------------------------------------------------------
@@ -86,7 +94,7 @@ def disabled_client(
 ) -> Generator[TestClient, None, None]:
     _migrate(alembic_cfg, disabled_settings.database.url)
     app = create_app(disabled_settings)
-    with TestClient(app) as c:
+    with TestClient(app, client=LOOPBACK_PEER) as c:
         yield c
 
 
@@ -96,7 +104,7 @@ def enabled_client(
 ) -> Generator[TestClient, None, None]:
     _migrate(alembic_cfg, enabled_settings.database.url)
     app = create_app(enabled_settings)
-    with TestClient(app) as c:
+    with TestClient(app, client=LOOPBACK_PEER) as c:
         yield c
 
 
@@ -364,3 +372,128 @@ def test_label_value_escaping(
     assert expected_line in body, (
         f"escaped label line not found.\nexpected: {expected_line!r}\nbody:\n{body}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Stall-detection series (issue #7)
+# ---------------------------------------------------------------------------
+
+
+def test_stall_detection_series_are_present(
+    enabled_client: TestClient, enabled_settings: Settings
+) -> None:
+    """Runner heartbeat/state, executor and loop-lag series are exposed."""
+    supervisor = get_context().capture_supervisor
+    assert supervisor is not None
+    now = datetime.now(UTC)
+    state = CaptureState(
+        project_id=9,
+        camera_id=1,
+        state="error",
+        started_at=now,
+        last_cycle_at=now - timedelta(seconds=30),
+    )
+    target = CaptureTarget(
+        project_id=9, project_name="Roof", camera_id=1, interval_seconds=60
+    )
+    supervisor._runners[9] = _ProjectRunner(state=state, target=target)  # noqa: SLF001
+
+    body = enabled_client.get(
+        "/api/v1/metrics", headers=_admin_headers(enabled_settings)
+    ).text
+    for name in (
+        "tlm_runner_last_cycle_age_seconds",
+        "tlm_runner_state",
+        "tlm_executor_queue_depth",
+        "tlm_executor_threads",
+        "tlm_event_loop_lag_seconds",
+    ):
+        assert f"# TYPE {name} gauge" in body, f"missing TYPE for {name}"
+
+    samples = _parse_samples(body)
+    labels = 'project="Roof",project_id="9"'
+    age = samples[f"tlm_runner_last_cycle_age_seconds{{{labels}}}"]
+    assert 30 <= age < 120
+    assert samples[f'tlm_runner_state{{{labels},state="error"}}'] == 1
+    assert samples[f'tlm_runner_state{{{labels},state="running"}}'] == 0
+    assert samples["tlm_executor_queue_depth"] >= 0
+    assert samples["tlm_executor_threads"] >= 0
+    assert samples["tlm_event_loop_lag_seconds"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# Readiness series (#67 R5)
+# ---------------------------------------------------------------------------
+
+
+class _RunningQueue:
+    _started = True
+
+    def __init__(self, orphans: int, oldest: datetime | None) -> None:
+        self.unreclaimed_orphans = orphans
+        self.oldest_encoding_started_at = oldest
+
+    def is_running(self) -> bool:
+        return True
+
+    def encoding_overruns(self, now: datetime) -> list[float]:
+        return []
+
+
+class _RunningDispatcher:
+    _started = True
+
+    def __init__(self, age: float) -> None:
+        self._age = age
+
+    def is_running(self) -> bool:
+        return True
+
+    def last_poll_age_seconds(self, now: float | None = None) -> float | None:
+        return self._age
+
+
+def test_readiness_series_with_idle_components(
+    enabled_client: TestClient, enabled_settings: Settings
+) -> None:
+    """Not autostarted: status ok, and the component series carry no sample."""
+    body = enabled_client.get(
+        "/api/v1/metrics", headers=_admin_headers(enabled_settings)
+    ).text
+    for name in (
+        "tlm_health_status",
+        "tlm_render_orphans",
+        "tlm_render_oldest_encoding_age_seconds",
+        "tlm_dispatcher_last_poll_age_seconds",
+    ):
+        assert f"# TYPE {name} gauge" in body, f"missing TYPE for {name}"
+    samples = _parse_samples(body)
+    assert samples['tlm_health_status{status="ok"}'] == 1
+    assert samples['tlm_health_status{status="degraded"}'] == 0
+    assert samples['tlm_health_status{status="failed"}'] == 0
+    assert "tlm_render_orphans" not in samples
+    assert "tlm_dispatcher_last_poll_age_seconds" not in samples
+
+
+def test_readiness_series_report_the_render_and_poll_figures(
+    enabled_client: TestClient,
+    enabled_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = get_context()
+    oldest = (datetime.now(UTC) - timedelta(seconds=90)).replace(tzinfo=None)
+    monkeypatch.setattr(context, "render_queue", _RunningQueue(2, oldest))
+    monkeypatch.setattr(context, "notification_dispatcher", _RunningDispatcher(12.5))
+
+    body = enabled_client.get(
+        "/api/v1/metrics", headers=_admin_headers(enabled_settings)
+    ).text
+    samples = _parse_samples(body)
+    assert samples["tlm_render_orphans"] == 2
+    assert 90 <= samples["tlm_render_oldest_encoding_age_seconds"] < 150
+    assert samples["tlm_dispatcher_last_poll_age_seconds"] == 12.5
+    # Two unreclaimed orphans make the probe degraded.
+    assert samples['tlm_health_status{status="degraded"}'] == 1
+    assert samples['tlm_health_status{status="ok"}'] == 0
+    healthz = enabled_client.get("/healthz").json()
+    assert healthz["status"] == "degraded"

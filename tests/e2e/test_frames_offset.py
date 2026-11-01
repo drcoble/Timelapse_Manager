@@ -1,9 +1,10 @@
 """E2E for the bulk timestamp-offset panel (render-only).
 
 Verifies the inline offset panel reveals on demand and its live preview reacts
-to the duration inputs. The actual shift (a POST) is covered by the web-layer
-tests — applying it from the browser races the test server's CSRF-on-SQLite and
-is intentionally not exercised here.
+to the duration inputs. Applying the shift from the browser (the real POST,
+checked in the database) is covered by
+``test_double_submit.py::TestOffsetDoubleSubmit``; the route itself by the
+web-layer tests (``tests/web/test_frames_offset_routes.py``).
 
 Requires the ``ui`` marker; auto-skips when Playwright browsers are absent.
 Uses ``logged_in_data_page`` (admin → operator, so the controls render).

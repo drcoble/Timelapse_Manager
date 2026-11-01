@@ -35,6 +35,12 @@ new value is encrypted -- the keep-stored branch returns the already-encrypted
 ciphertext untouched, so it is never double-wrapped). Without this, a naive save
 of the displayed (masked) form would clobber the real password with the literal
 mask and silently break delivery.
+
+The one exception is a **retarget** (#67 S9): when the SMTP host, port, security
+mode or username changes, a blank or masked password *clears* the stored secret.
+The old password was issued for the old server; repointing the settings must not
+be a way to send it to a new one. The form then shows no password stored, and the
+admin types the new one.
 """
 
 from __future__ import annotations
@@ -60,8 +66,14 @@ MASK_SENTINEL = "***"
 # The singleton row's fixed primary key.
 _ROW_ID = 1
 
-# SMTP security modes the form may submit; anything else falls back to "none".
+# SMTP security modes the form may submit. An unknown mode is rejected, never
+# coerced: silently turning a typo into ``none`` would downgrade to plaintext
+# (#214; LDAP's TLS mode follows the same rule).
 _SECURITY_MODES = ("none", "tls", "starttls")
+
+
+class NotificationSettingsError(ValueError):
+    """A submitted notification setting is invalid (the message is safe to show)."""
 
 
 @dataclass(frozen=True)
@@ -102,7 +114,9 @@ class NotificationSettingsUpdate:
     smtp_port: int | None
     smtp_security: str
     smtp_username: str | None
-    smtp_password: str | None
+    # ``repr=False``: the plaintext password must not show up in a failing test's
+    # output or a logged exception.
+    smtp_password: str | None = field(repr=False)
     smtp_from_address: str | None
     smtp_recipients: list[str]
     webhook_urls: list[str]
@@ -143,22 +157,46 @@ def update_settings(
     """Apply an update to the singleton row (creating it on first write).
 
     Implements the masked write-back rule for the SMTP password: the stored
-    secret is preserved unless the submitted value is genuinely new. Returns the
-    refreshed, masked view. The caller's surrounding transaction commits.
+    secret is preserved unless the submitted value is genuinely new -- or the SMTP
+    target (host, port, security mode or username) changed, in which case a blank
+    or masked password clears it. Returns the refreshed, masked view. The caller's
+    surrounding transaction commits.
+
+    :raises NotificationSettingsError: for an unknown SMTP security mode (nothing
+        is written).
     """
+    if update.smtp_security not in _SECURITY_MODES:
+        raise NotificationSettingsError(
+            "Unknown SMTP security mode: choose none, starttls or tls."
+        )
     row = session.get(NotificationSettings, _ROW_ID)
     if row is None:
         row = NotificationSettings(id=_ROW_ID)
         session.add(row)
 
-    row.enabled_channels = list(update.enabled_channels)
-    row.smtp_server = update.smtp_server or None
-    row.smtp_port = update.smtp_port
-    row.smtp_security = (
-        update.smtp_security if update.smtp_security in _SECURITY_MODES else "none"
+    new_security = update.smtp_security
+    new_target = (
+        update.smtp_server or None,
+        update.smtp_port,
+        new_security,
+        update.smtp_username or None,
     )
-    row.smtp_username = update.smtp_username or None
-    row.smtp_password = _resolve_password(update.smtp_password, row.smtp_password)
+    # Compared against the stored values *before* they are overwritten below.
+    retargeted = new_target != (
+        row.smtp_server or None,
+        row.smtp_port,
+        row.smtp_security or "none",
+        row.smtp_username or None,
+    )
+
+    row.enabled_channels = list(update.enabled_channels)
+    row.smtp_server = new_target[0]
+    row.smtp_port = update.smtp_port
+    row.smtp_security = new_security
+    row.smtp_username = new_target[3]
+    row.smtp_password = _resolve_password(
+        update.smtp_password, row.smtp_password, retargeted=retargeted
+    )
     row.smtp_from_address = update.smtp_from_address or None
     row.smtp_recipients = [r for r in update.smtp_recipients if r]
     # Webhook URLs always arrive as plaintext from the form (no keep-stored
@@ -170,16 +208,20 @@ def update_settings(
     return load_settings(session)
 
 
-def _resolve_password(submitted: str | None, stored: str | None) -> str | None:
+def _resolve_password(
+    submitted: str | None, stored: str | None, *, retargeted: bool = False
+) -> str | None:
     """Return the password to persist, honouring the masked write-back rule.
 
     A blank submission or the mask sentinel means "the admin did not type a new
-    password" -- keep whatever is stored (already-encrypted) ciphertext untouched.
-    Any other value is a genuine change and is encrypted before storage. Only the
-    new-value branch encrypts, so an unchanged secret is never double-wrapped.
+    password" -- keep whatever is stored (already-encrypted) ciphertext untouched,
+    *unless* the SMTP target was retargeted: then the stored secret belongs to the
+    old server and is cleared (``None``). Any other value is a genuine change and
+    is encrypted before storage. Only the new-value branch encrypts, so an
+    unchanged secret is never double-wrapped.
     """
     if submitted is None or submitted == "" or submitted == MASK_SENTINEL:
-        return stored
+        return None if retargeted else stored
     return encrypt_secret(submitted)
 
 
@@ -210,6 +252,25 @@ def resolve_webhook_urls(session: Session) -> list[str]:
     return [decrypt_secret(u) for u in _as_str_list(row.webhook_urls)]
 
 
+def resolve_webhook_signing_secret(session: Session) -> str | None:
+    """Return the decrypted per-channel webhook signing secret, or ``None``.
+
+    The decrypt-at-use seam for HMAC request signing. When a secret is stored it
+    is decrypted here (legacy plaintext passes through unchanged) and never
+    logged; the channel signs each POST body with it. Reads the column
+    defensively via :func:`getattr` so the resolver tolerates a settings row that
+    predates the column: absent or empty yields ``None``, leaving the webhook
+    unsigned.
+    """
+    row = session.get(NotificationSettings, _ROW_ID)
+    if row is None:
+        return None
+    stored = getattr(row, "webhook_signing_secret", None)
+    if not stored:
+        return None
+    return decrypt_secret(stored)
+
+
 def build_webhook_channel(
     session: Session, *, send_timeout_seconds: float
 ) -> NotificationChannel | None:
@@ -217,16 +278,21 @@ def build_webhook_channel(
 
     Decrypts the stored webhook URLs at use (never logging them) and constructs a
     :class:`~timelapse_manager.monitoring.channels.webhook.WebhookChannel`, which
-    runs the outbound-URL validation seam on each decrypted URL at send time.
-    Returns ``None`` when no URL is configured, so a half-configured row yields no
-    channel.
+    runs the outbound-URL validation seam on each decrypted URL at send time. An
+    optional signing secret is resolved and threaded through so that, when one is
+    configured, every POST is signed with HMAC-SHA256. Returns ``None`` when no
+    URL is configured, so a half-configured row yields no channel.
     """
     from .channels.webhook import WebhookChannel
 
     urls = [u for u in resolve_webhook_urls(session) if u]
     if not urls:
         return None
-    return WebhookChannel(urls, send_timeout_seconds=send_timeout_seconds)
+    return WebhookChannel(
+        urls,
+        send_timeout_seconds=send_timeout_seconds,
+        signing_secret=resolve_webhook_signing_secret(session),
+    )
 
 
 def _as_str_list(value: Any) -> list[str]:

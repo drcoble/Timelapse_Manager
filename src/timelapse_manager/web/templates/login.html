@@ -8,17 +8,12 @@
   <title>Sign In — Timelapse Manager</title>
   {# No-flash theme: apply the localStorage preference before the stylesheet so
      the toggle below persists across reloads of this pre-auth page. #}
-  <script>
-    (function () {
-      try {
-        var pref = localStorage.getItem('theme');
-        if (pref === 'light' || pref === 'dark') {
-          document.documentElement.setAttribute('data-theme', pref);
-        }
-      } catch (e) {}
-    })();
-  </script>
-  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="{{ static_url('js/theme-init.js') }}"></script>
+  {# Start the UI font download in parallel with the stylesheet. The href must be
+     byte-identical to the URL inside the CSS bundle (both come from static_url),
+     and crossorigin is required for a font preload to be reused. #}
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="{{ static_url('fonts/Geist-Variable.woff2') }}">
+  <link rel="stylesheet" href="{{ static_url('css/app.css') }}">
 </head>
 {# Login page has no app shell — it is pre-authentication #}
 <body>
@@ -145,28 +140,7 @@
   </div>{# /login-card #}
 </main>
 
-<script>
-  (function () {
-    var CYCLE = ['light', 'dark', 'system'];
-    var btn = document.getElementById('login-theme-toggle');
-    if (!btn) return;
-    function current() {
-      return document.documentElement.getAttribute('data-theme') || 'system';
-    }
-    function apply(t) {
-      if (t === 'system') {
-        document.documentElement.removeAttribute('data-theme');
-      } else {
-        document.documentElement.setAttribute('data-theme', t);
-      }
-      try { localStorage.setItem('theme', t); } catch (e) {}
-    }
-    btn.addEventListener('click', function () {
-      var i = CYCLE.indexOf(current());
-      apply(CYCLE[(i + 1) % CYCLE.length]);
-    });
-  })();
-</script>
+<script src="{{ static_url('js/login-theme.js') }}"></script>
 
 </body>
 </html>

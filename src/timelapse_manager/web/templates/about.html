@@ -39,6 +39,21 @@
   </span>
 </section>
 
+{% if reporting_enabled %}
+<section class="card form-section">
+  <div class="form-section-title">Something wrong?</div>
+  <p>
+    If the app is not doing what you expect, file a report. It tells the
+    maintainers what you saw and attaches a redacted snapshot of the app's state
+    at that moment, with passwords and other secrets removed.
+  </p>
+  <a href="/report?page=%2Fabout" class="btn btn-secondary"
+     data-drawer-open="#drawer-main" hx-get="/drawers/report?page=%2Fabout"
+     hx-target="#drawer-main .drawer-body" hx-swap="innerHTML"
+     data-drawer-title="Report a problem">Report a problem</a>
+</section>
+{% endif %}
+
 <section class="card form-section">
   <div class="form-section-title">License</div>
   <p>

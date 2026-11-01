@@ -16,15 +16,24 @@ denied-access path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from ..db.models import User
-from ..db.session import get_session
+from ..db.session import DbSessionDep
 from ..runtime import get_context
-from .token import _extract_bearer, ensure_local_token, verify_token
+from .authz import session_cookie_value
+from .token import (
+    _extract_bearer,
+    current_local_token,
+    current_metrics_token,
+    enforce_token_peer,
+    invalid_token_error,
+    peer_allowed,
+    refuse_token_peer,
+    verify_token,
+)
 
 # The sentinel administrator returned until real identities exist. Its id is used
 # as the actor on every audit event a privileged mutation writes, so audit rows
@@ -75,7 +84,7 @@ class Principal:
 
 def require_admin_principal(
     request: Request,
-    db: Annotated[Session, Depends(get_session)],
+    db: DbSessionDep,
 ) -> Principal:
     """FastAPI dependency yielding the administrator behind a mutation.
 
@@ -90,19 +99,21 @@ def require_admin_principal(
       principal exactly as before, preserving every existing loopback CLI caller;
       a missing or invalid token is ``401``.
 
-    Tests substitute their own principal (or a denying handler) via FastAPI
-    dependency overrides keyed on this function.
+    Under ``/api/v1`` the router's bearer dependency has already required a valid
+    bearer, so there the cookie path only applies to a request that carries both
+    (#261). Tests substitute their own principal (or a denying handler) via
+    FastAPI dependency overrides keyed on this function.
     """
     settings = get_context().settings
-    raw_token = request.cookies.get(settings.session.cookie_name)
+    raw_token = session_cookie_value(request, settings.session)
     if raw_token is not None:
-        return _principal_from_session(db, raw_token, allowed=(_ADMIN_ROLE,))
+        return _principal_from_session(request, db, allowed=(_ADMIN_ROLE,))
     return _principal_from_local_token(request)
 
 
 def require_operator_or_admin_principal(
     request: Request,
-    db: Annotated[Session, Depends(get_session)],
+    db: DbSessionDep,
 ) -> Principal:
     """FastAPI dependency yielding an operator-or-admin behind a mutation.
 
@@ -121,26 +132,30 @@ def require_operator_or_admin_principal(
     dependency overrides keyed on this function.
     """
     settings = get_context().settings
-    raw_token = request.cookies.get(settings.session.cookie_name)
+    raw_token = session_cookie_value(request, settings.session)
     if raw_token is not None:
         return _principal_from_session(
-            db, raw_token, allowed=(_OPERATOR_ROLE, _ADMIN_ROLE)
+            request, db, allowed=(_OPERATOR_ROLE, _ADMIN_ROLE)
         )
     return _principal_from_local_token(request)
 
 
 def _principal_from_session(
-    db: Session, raw_token: str, *, allowed: tuple[str, ...]
+    request: Request, db: Session, *, allowed: tuple[str, ...]
 ) -> Principal:
-    """Resolve a web session cookie to a principal in ``allowed``, or raise.
+    """Resolve the request's session cookie to a principal in ``allowed``, or raise.
 
     ``401`` if the session is not live; ``403`` if its user's role is not one of
-    ``allowed``.
+    ``allowed``. The session is resolved at most once per request (#67 R3), and a
+    passive poll still does not touch it (the same rule as every other layer).
     """
-    from .sessions import lookup_session
+    from .sessions import live_principal_from_cache, resolve_request_session
 
     settings = get_context().settings.session
-    user = lookup_session(db, raw_token, settings=settings)
+    resolved = resolve_request_session(request, db, settings=settings)
+    # The cached answer may predate a slow body read: re-check access live and
+    # take the role from the live user row (#207).
+    user = live_principal_from_cache(db, resolved) if resolved is not None else None
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -157,16 +172,67 @@ def _principal_from_session(
 def _principal_from_local_token(request: Request) -> Principal:
     """Validate the CLI bearer token and yield the sentinel admin principal.
 
-    Mirrors :func:`require_local_token` exactly for the no-cookie path so the
-    loopback CLI contract is unchanged: a valid token yields the sentinel
-    administrator; a missing or invalid one is ``401``.
+    Mirrors :func:`require_local_token` exactly for the no-cookie path, so the
+    routes outside the bearer router (metrics, debug) apply the same peer
+    policy: a refused peer is ``403`` before any compare, an unusable token file
+    is ``503``, a missing or invalid token is ``401``, and a valid one yields
+    the sentinel administrator.
     """
-    expected = ensure_local_token(get_context().settings)
+    enforce_token_peer(request, get_context().settings.server.api_token_allowed_clients)
+    expected = current_local_token()
     received = _extract_bearer(request)
     if received is None or not verify_token(received, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid local API token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise invalid_token_error()
     return Principal(user_id=_SENTINEL_ADMIN_USER_ID, role=_ADMIN_ROLE)
+
+
+def require_metrics_reader(request: Request, db: DbSessionDep) -> Principal | None:
+    """FastAPI dependency gating the metrics scrape (#67 S2).
+
+    Accepts, in order:
+
+    * an **administrator session cookie** (unchanged; a non-admin is ``403``);
+    * the **local admin token**, under the local-token peer policy (loopback,
+      or HTTPS from ``server.api_token_allowed_clients``); yields the sentinel
+      administrator;
+    * the **metrics token**, from a peer in
+      ``observability.metrics_allowed_clients``, over HTTP or HTTPS (it only
+      reads); yields ``None``, since it is not a user.
+
+    A peer allowed for neither token is ``403`` before any compare. A missing or
+    wrong token from an allowed peer is ``401``. The metrics token is accepted
+    nowhere else: every other route compares against the local token only.
+    """
+    settings = get_context().settings
+    raw_cookie = session_cookie_value(request, settings.session)
+    if raw_cookie is not None:
+        return _principal_from_session(request, db, allowed=(_ADMIN_ROLE,))
+
+    trusted = settings.server.trusted_proxies
+    admin_peer = peer_allowed(
+        request,
+        settings.server.api_token_allowed_clients,
+        trusted_proxies=trusted,
+        require_https=True,
+    )
+    metrics_peer = peer_allowed(
+        request,
+        settings.observability.metrics_allowed_clients,
+        trusted_proxies=trusted,
+        require_https=False,
+    )
+    if not (admin_peer or metrics_peer):
+        raise refuse_token_peer(
+            request,
+            "metrics/API token",
+            "observability.metrics_allowed_clients",
+        )
+
+    received = _extract_bearer(request)
+    if received is None:
+        raise invalid_token_error()
+    if admin_peer and verify_token(received, current_local_token()):
+        return Principal(user_id=_SENTINEL_ADMIN_USER_ID, role=_ADMIN_ROLE)
+    if metrics_peer and verify_token(received, current_metrics_token()):
+        return None
+    raise invalid_token_error()

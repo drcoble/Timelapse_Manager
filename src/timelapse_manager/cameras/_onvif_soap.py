@@ -7,6 +7,12 @@ hand-written SOAP envelopes and parsed with :mod:`xml.etree.ElementTree`. That
 keeps the dependency surface tiny and the behaviour transparent, at the cost of
 covering only the operations below.
 
+The device is untrusted in both directions. Responses are parsed through
+:func:`._bounded.safe_fromstring` (size-capped, no DTDs, so no entity tricks),
+and every value interpolated into an outgoing envelope is XML-escaped, so a
+username, a profile token or a camera-returned reference parameter cannot
+inject markup into the request (#69 CAM-S7, #67-S24).
+
 WS-Security (UsernameToken with a digested password) is included so cameras that
 require authentication for these calls are supported; cameras that allow
 anonymous device/media queries work without credentials too.
@@ -18,8 +24,11 @@ import base64
 import hashlib
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
+
+from ._bounded import local_name, safe_fromstring, walk_named_descendants
 
 # XML namespaces used across ONVIF SOAP messages.
 NS = {
@@ -65,14 +74,21 @@ _NONCE_ENCODING = (
 )
 
 
-def _security_header(username: str, password: str) -> str:
+def _security_header(
+    username: str, password: str, clock_offset: timedelta = timedelta(0)
+) -> str:
     """Build a WS-Security UsernameToken header with a digested password.
 
     The digest is ``Base64(SHA1(nonce + created + password))`` per the ONVIF /
-    WS-Security UsernameToken profile.
+    WS-Security UsernameToken profile. The username is XML-escaped; the other
+    values are base64 or a timestamp and cannot carry markup.
+
+    ``clock_offset`` is how far the camera's clock is ahead of ours: ``Created``
+    is stamped in the camera's time, since a device refuses a token whose
+    timestamp is too far from its own clock (#69 CAM-R9).
     """
     nonce = os.urandom(16)
-    created = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created = (datetime.now(UTC) + clock_offset).strftime("%Y-%m-%dT%H:%M:%SZ")
     digest = base64.b64encode(
         hashlib.sha1(
             nonce + created.encode("utf-8") + password.encode("utf-8")
@@ -83,7 +99,7 @@ def _security_header(username: str, password: str) -> str:
         f'<wsse:Security xmlns:wsse="{NS["wsse"]}" '
         f'xmlns:wsu="{NS["wsu"]}">'
         "<wsse:UsernameToken>"
-        f"<wsse:Username>{username}</wsse:Username>"
+        f"<wsse:Username>{escape(username)}</wsse:Username>"
         f'<wsse:Password Type="{_PASSWORD_TYPE}">{digest}</wsse:Password>'
         f'<wsse:Nonce EncodingType="{_NONCE_ENCODING}">{nonce_b64}</wsse:Nonce>'
         f"<wsu:Created>{created}</wsu:Created>"
@@ -96,6 +112,7 @@ def envelope(
     body: str,
     credentials: tuple[str, str] | None,
     extra_headers: str = "",
+    clock_offset: timedelta = timedelta(0),
 ) -> str:
     """Wrap a SOAP body in an envelope, adding WS-Security if credentials given.
 
@@ -110,10 +127,13 @@ def envelope(
     front so the bodies and headers below can use those prefixes without
     redeclaring them; the unused declarations are inert for the device/media
     calls.
+
+    ``clock_offset`` shifts the token's ``Created`` into the camera's time (see
+    :func:`_security_header`); it defaults to no shift.
     """
     header_content = extra_headers
     if credentials is not None:
-        header_content += _security_header(*credentials)
+        header_content += _security_header(*credentials, clock_offset)
     header = f"<s:Header>{header_content}</s:Header>" if header_content else ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -140,26 +160,30 @@ def addressing_headers(
     subscription's ReferenceParameters subtree (the ``dom0:SubscriptionId``
     element) echoed as a header on PullMessages/Renew/Unsubscribe so the camera
     can identify which subscription the call targets; it is empty for
-    CreatePullPointSubscription and the stateless GetEventProperties.
+    CreatePullPointSubscription and the stateless GetEventProperties. It must
+    already be safe XML: :func:`parse_subscription_reference` builds it with
+    every camera-supplied value escaped. ``to`` is the camera-returned
+    subscription address, so it is escaped here.
     """
     message_id = f"urn:uuid:{uuid.uuid4()}"
     return (
-        f"<wsa:Action>{action}</wsa:Action>"
+        f"<wsa:Action>{escape(action)}</wsa:Action>"
         f"<wsa:MessageID>{message_id}</wsa:MessageID>"
         "<wsa:ReplyTo>"
         f"<wsa:Address>{WSA_ANONYMOUS_REPLY}</wsa:Address>"
         "</wsa:ReplyTo>"
-        f"<wsa:To>{to}</wsa:To>"
+        f"<wsa:To>{escape(to)}</wsa:To>"
         f"{reference_parameters}"
     )
 
 
 def parse_xml(text: str) -> ET.Element | None:
-    """Parse SOAP/XML text, returning the root element or None on bad XML."""
-    try:
-        return ET.fromstring(text)
-    except ET.ParseError:
-        return None
+    """Parse SOAP/XML text, returning the root element or None.
+
+    ``None`` means the text is malformed, over the SOAP size cap, or carries a
+    DTD (see :func:`._bounded.safe_fromstring`).
+    """
+    return safe_fromstring(text)
 
 
 def find_text(element: ET.Element, path: str) -> str | None:
@@ -187,6 +211,46 @@ ACTION_UNSUBSCRIBE = (
 ACTION_GET_EVENT_PROPERTIES = (
     "http://www.onvif.org/ver10/events/wsdl/EventPortType/GetEventPropertiesRequest"
 )
+
+
+def get_system_date_and_time_body() -> str:
+    """SOAP body asking the device for its clock (sent without credentials)."""
+    return "<tds:GetSystemDateAndTime/>"
+
+
+def parse_utc_datetime(xml_text: str) -> datetime | None:
+    """Return the device's ``UTCDateTime`` from a GetSystemDateAndTimeResponse.
+
+    ``None`` when the response cannot be parsed or carries no valid UTC date and
+    time, so the caller keeps using no offset.
+    """
+    root = parse_xml(xml_text)
+    if root is None:
+        return None
+    utc = _find_local_element(root, "UTCDateTime")
+    if utc is None:
+        return None
+    parts: dict[str, int] = {}
+    for name in ("Year", "Month", "Day", "Hour", "Minute", "Second"):
+        text = _find_local_text(utc, name)
+        if text is None:
+            return None
+        try:
+            parts[name] = int(text.strip())
+        except ValueError:
+            return None
+    try:
+        return datetime(
+            parts["Year"],
+            parts["Month"],
+            parts["Day"],
+            parts["Hour"],
+            parts["Minute"],
+            parts["Second"],
+            tzinfo=UTC,
+        )
+    except ValueError:
+        return None
 
 
 def get_event_properties_body() -> str:
@@ -297,17 +361,23 @@ def _element_to_inline_xml(element: ET.Element) -> str:
     so the produced fragment is self-contained when spliced into an outbound
     header. Only the single element and its text are rendered (the reference
     parameters seen here are flat leaf elements).
+
+    Both values come from the camera, so the text is XML-escaped and the
+    namespace is escaped for a double-quoted attribute: a reference parameter
+    cannot inject markup into the app's later requests (#69 CAM-S7). The local
+    name needs no escaping, because the parser accepted it as an XML name.
     """
     tag = element.tag
     if tag.startswith("{"):
         namespace, local = tag[1:].split("}", 1)
-        open_tag = f'<dom0:{local} xmlns:dom0="{namespace}">'
+        quoted_namespace = escape(namespace, {'"': "&quot;"})
+        open_tag = f'<dom0:{local} xmlns:dom0="{quoted_namespace}">'
         close_tag = f"</dom0:{local}>"
     else:
         open_tag = f"<{tag}>"
         close_tag = f"</{tag}>"
     text = element.text or ""
-    return f"{open_tag}{text.strip()}{close_tag}"
+    return f"{open_tag}{escape(text.strip())}{close_tag}"
 
 
 def parse_pull_messages(xml_text: str) -> list[dict[str, object]]:
@@ -402,31 +472,28 @@ def parse_event_topics(xml_text: str) -> list[str]:
             break
     if topic_set is None:
         return []
-    topics: list[str] = []
-    _walk_topic_set(topic_set, [], topics)
-    return topics
+    return _walk_topic_set(topic_set)
 
 
 _TOPIC_MARKER = f"{{{NS['wstop']}}}topic"
 
 
-def _walk_topic_set(element: ET.Element, path: list[str], out: list[str]) -> None:
-    """Recursively collect topic paths from a TopicSet subtree.
+def _walk_topic_set(topic_set: ET.Element) -> list[str]:
+    """Collect topic paths from a TopicSet subtree.
 
     An element carrying ``wstop:topic="true"`` is a leaf message topic and its
     accumulated path is emitted. The walk continues into children regardless, so
     a topic that also nests sub-topics still contributes both itself and its
-    descendants.
+    descendants. The walk is iterative and stops at
+    :data:`._bounded.XML_MAX_DEPTH` levels, so a deeply nested response yields
+    the topics above the cap instead of raising ``RecursionError`` (#69 CAM-R12).
     """
-    for child in element:
-        local = _local_name(child.tag)
-        if not local:
-            continue
-        child_path = [*path, local]
-        marker = child.get(_TOPIC_MARKER) or child.get("topic")
+    topics: list[str] = []
+    for element, path in walk_named_descendants(topic_set):
+        marker = element.get(_TOPIC_MARKER) or element.get("topic")
         if marker is not None and marker.strip().lower() == "true":
-            out.append("/".join(child_path))
-        _walk_topic_set(child, child_path, out)
+            topics.append("/".join(path))
+    return topics
 
 
 def _simple_items(message: ET.Element, container_local: str) -> dict[str, str]:
@@ -450,11 +517,8 @@ def _simple_items(message: ET.Element, container_local: str) -> dict[str, str]:
     return items
 
 
-def _local_name(tag: object) -> str:
-    """Return the local part of a possibly-namespaced ElementTree tag."""
-    if not isinstance(tag, str):
-        return ""
-    return tag.rsplit("}", 1)[-1]
+# Kept under its historical private name for this module's callers.
+_local_name = local_name
 
 
 def _find_local_element(root: ET.Element, local_name: str) -> ET.Element | None:

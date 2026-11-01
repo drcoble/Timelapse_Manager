@@ -32,7 +32,7 @@
 <div class="page-header">
   <div class="page-title">
     <h1>Settings</h1>
-    <div class="subtitle">Server configuration &middot; TLS &middot; Sessions &middot; Network access &middot; Notifications &middot; Directory &middot; Credentials</div>
+    <div class="subtitle">Server configuration &middot; TLS &middot; Sessions &middot; Network access &middot; Notifications &middot; Directory &middot; Credentials &middot; Problem reports</div>
   </div>
 </div>
 
@@ -47,6 +47,8 @@
           aria-selected="false" data-tab-target="#tab-notifications">Notifications</button>
   <button type="button" class="tab-item" role="tab"
           aria-selected="false" data-tab-target="#tab-credentials">Credentials</button>
+  <button type="button" class="tab-item" role="tab"
+          aria-selected="false" data-tab-target="#tab-reports">Problem reports</button>
 </div>
 
 <div class="settings-tab-panels">
@@ -266,6 +268,19 @@
     #}
     {% include '_partials/camera_default_credentials.html' %}
   </div>{# /tab-credentials #}
+
+  <!-- ===================== PROBLEM REPORTS ===================== -->
+  <div id="tab-reports" class="tab-panel" role="tabpanel"
+       aria-label="Problem reports" hidden>
+    {#
+      Reports filed from "Report a problem" (#8). The table loads on demand from
+      its own admin-only route; without JS the link opens the full page.
+    #}
+    <div id="report-admin" hx-get="/settings/reports/table" hx-trigger="load"
+         hx-swap="outerHTML">
+      <a href="/settings/reports">Open problem reports</a>
+    </div>
+  </div>{# /tab-reports #}
 
 </div>{# /settings-tab-panels #}
 

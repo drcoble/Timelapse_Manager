@@ -1,0 +1,14 @@
+{#
+  Partial: job_card_file.html — the output file row of a job card's <dl>,
+  stat-ed at request time. Context: card.
+#}
+<dt>File</dt>
+<dd>
+  {% if card.file_name %}
+    <span class="mono">{{ card.file_name }}</span> &middot; {{ card.file_size_display }}
+  {% elif card.file_missing %}
+    <span style="color:var(--color-warning);">missing</span>
+  {% else %}
+    <span class="text-muted">none yet</span>
+  {% endif %}
+</dd>

@@ -8,24 +8,35 @@ Covers:
 - _hosts_from_spec handles CIDR, dash-range, single IP; raises on invalid
 - scan_range with an invalid range returns [] without raising
 - scan_range host enumeration (patch _unicast_probe to avoid real sockets)
+- the datagram endpoints, against responders on loopback (no executor threads)
 
-No real network sockets are opened.
+The only sockets opened are on the loopback interface.
 """
 
 from __future__ import annotations
 
+import asyncio
+import socket
+import time
+import typing
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from xml.etree import ElementTree as ET
 
 import pytest
 
+from timelapse_manager.cameras import discovery
 from timelapse_manager.cameras.discovery import (
+    _MAX_MULTICAST_BYTES,
+    _MAX_MULTICAST_REPLIES,
     InvalidScanRange,
     ScanRangeTooLarge,
     _hosts_from_spec,
     _parse_probe_match,
     _probe_message,
+    _unicast_probe,
     check_scan_range,
     count_hosts,
     scan_range,
@@ -377,3 +388,400 @@ class TestScanRangeEnumeration:
 
         assert call_count == 4
         assert len(result) == 4
+
+
+# ---------------------------------------------------------------------------
+# WP-69-T (CAM-S4): overall deadline, reply caps, and source binding
+# ---------------------------------------------------------------------------
+
+
+def _probe_match_for(xaddrs: str) -> bytes:
+    """Return a ProbeMatch datagram advertising ``xaddrs``."""
+    return _PROBE_MATCH_XML.replace(
+        b"http://192.168.1.50/onvif/device_service", xaddrs.encode()
+    )
+
+
+class _Responder(asyncio.DatagramProtocol):
+    """A UDP responder on loopback that answers each probe on a schedule.
+
+    ``replies`` is a list of ``(delay_seconds, datagram)`` sent back to whoever
+    probed, in order; ``trickle`` instead sends ``trickle[1]`` every
+    ``trickle[0]`` seconds until the test ends. ``probes`` counts what arrived.
+    """
+
+    def __init__(
+        self,
+        replies: list[tuple[float, bytes]] | None = None,
+        trickle: tuple[float, bytes] | None = None,
+    ) -> None:
+        self._replies = replies or []
+        self._trickle = trickle
+        self._tasks: list[asyncio.Task[None]] = []
+        self.transport: asyncio.DatagramTransport | None = None
+        self.probes = 0
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = typing.cast(asyncio.DatagramTransport, transport)
+
+    def datagram_received(self, data: bytes, addr: Any) -> None:
+        self.probes += 1
+        self._tasks.append(asyncio.ensure_future(self._answer(addr)))
+
+    async def _answer(self, addr: Any) -> None:
+        assert self.transport is not None
+        if self._trickle is not None:
+            delay, data = self._trickle
+            while not self.transport.is_closing():
+                await asyncio.sleep(delay)
+                self.transport.sendto(data, addr)
+        for delay, data in self._replies:
+            await asyncio.sleep(delay)
+            if self.transport.is_closing():
+                return
+            self.transport.sendto(data, addr)
+
+    def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        if self.transport is not None:
+            self.transport.close()
+
+    @property
+    def port(self) -> int:
+        assert self.transport is not None
+        return int(self.transport.get_extra_info("sockname")[1])
+
+
+@pytest.fixture
+async def responder_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[Callable[..., Awaitable[_Responder]]]:
+    """Start loopback responders and aim discovery's probe port at the last one."""
+    started: list[_Responder] = []
+
+    async def start(**kwargs: Any) -> _Responder:
+        loop = asyncio.get_running_loop()
+        _transport, protocol = await loop.create_datagram_endpoint(
+            lambda: _Responder(**kwargs), local_addr=("127.0.0.1", 0)
+        )
+        started.append(protocol)
+        monkeypatch.setattr(discovery, "WS_DISCOVERY_PORT", protocol.port)
+        monkeypatch.setattr(discovery, "WS_DISCOVERY_ADDRESS", "127.0.0.1")
+        return protocol
+
+    yield start
+    for protocol in started:
+        protocol.stop()
+
+
+class TestReplyCollectorBounds:
+    """The protocol object enforces the caps and the source binding (WP-69-T)."""
+
+    def test_reply_count_is_capped(self) -> None:
+        collector = discovery._ReplyCollector(
+            max_replies=_MAX_MULTICAST_REPLIES, max_bytes=_MAX_MULTICAST_BYTES
+        )
+        for i in range(300):
+            collector.datagram_received(b"<x/>", (f"10.0.{i // 250}.{i % 250 + 1}", 1))
+        assert len(collector.replies) == _MAX_MULTICAST_REPLIES == 256
+        assert collector.capped and collector.done.is_set()
+
+    def test_total_bytes_are_capped(self) -> None:
+        collector = discovery._ReplyCollector(
+            max_replies=_MAX_MULTICAST_REPLIES, max_bytes=_MAX_MULTICAST_BYTES
+        )
+        big = b"x" * 60_000
+        for _ in range(40):
+            collector.datagram_received(big, ("10.0.0.7", 1))
+        assert sum(len(data) for data, _ in collector.replies) <= _MAX_MULTICAST_BYTES
+        assert len(collector.replies) == _MAX_MULTICAST_BYTES // len(big)
+        assert collector.done.is_set()
+
+    def test_keeps_each_reply_source_address(self) -> None:
+        collector = discovery._ReplyCollector(max_replies=10, max_bytes=1000)
+        collector.datagram_received(b"one", ("10.0.0.7", 3702))
+        collector.datagram_received(b"two", ("10.0.0.8", 3702))
+        assert collector.replies == [(b"one", "10.0.0.7"), (b"two", "10.0.0.8")]
+
+    def test_a_refused_source_is_ignored_and_does_not_end_the_round(self) -> None:
+        collector = discovery._ReplyCollector(
+            max_replies=1, max_bytes=1000, accept=lambda source: source == "10.0.0.5"
+        )
+        collector.datagram_received(b"spoofed", ("10.0.0.66", 3702))
+        assert collector.replies == [] and not collector.done.is_set()
+        collector.datagram_received(b"genuine", ("10.0.0.5", 3702))
+        assert collector.replies == [(b"genuine", "10.0.0.5")]
+        assert collector.done.is_set()
+
+    def test_nothing_is_kept_after_the_round_is_over(self) -> None:
+        collector = discovery._ReplyCollector(max_replies=1, max_bytes=1000)
+        collector.datagram_received(b"first", ("10.0.0.5", 1))
+        collector.datagram_received(b"late", ("10.0.0.6", 1))
+        assert collector.replies == [(b"first", "10.0.0.5")]
+
+
+class TestMulticastRound:
+    async def test_collects_replies_with_their_source(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        await responder_factory(replies=[(0.0, b"one"), (0.01, b"two")])
+        replies = await discovery._collect_multicast_replies(0.4, None)
+        assert replies == [(b"one", "127.0.0.1"), (b"two", "127.0.0.1")]
+
+    async def test_steady_trickle_cannot_hold_the_round_open(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        """A reply every 0.1 s under a 0.35 s window used to reset the timer."""
+        await responder_factory(trickle=(0.1, _PROBE_MATCH_XML))
+        started = time.monotonic()
+        replies = await discovery._collect_multicast_replies(0.35, None)
+        assert time.monotonic() - started < 1.0
+        assert 1 <= len(replies) <= 4
+
+    async def test_a_burst_over_the_cap_ends_the_round_early(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        await responder_factory(replies=[(0.0, b"<x/>")] * 300)
+        started = time.monotonic()
+        replies = await discovery._collect_multicast_replies(10.0, None)
+        assert time.monotonic() - started < 5.0
+        assert 0 < len(replies) <= _MAX_MULTICAST_REPLIES
+
+    async def test_an_unusable_interface_returns_nothing(self) -> None:
+        # 192.0.2.1 is not an address of this host: bind fails, no raise.
+        assert await discovery._collect_multicast_replies(0.1, "192.0.2.1") == []
+
+    async def test_the_socket_is_closed_after_a_round(
+        self,
+        responder_factory: Callable[..., Awaitable[_Responder]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await responder_factory(replies=[])
+        opened: list[socket.socket] = []
+        real = discovery._udp_socket
+
+        def spy(family: int = socket.AF_INET) -> socket.socket:
+            sock = real(family)
+            opened.append(sock)
+            return sock
+
+        monkeypatch.setattr(discovery, "_udp_socket", spy)
+        await discovery._collect_multicast_replies(0.05, None)
+        await asyncio.sleep(0.01)  # a closing transport releases its fd next tick
+        assert opened and all(sock.fileno() == -1 for sock in opened)
+
+
+class TestUnicastProbe:
+    async def test_returns_the_probed_hosts_reply(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        responder = await responder_factory(replies=[(0.0, b"genuine")])
+        assert await _unicast_probe("127.0.0.1", 1.0) == b"genuine"
+        assert responder.probes == 1
+
+    async def test_silence_times_out_at_the_deadline(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        await responder_factory(replies=[])
+        started = time.monotonic()
+        assert await _unicast_probe("127.0.0.1", 0.2) is None
+        elapsed = time.monotonic() - started
+        assert 0.15 <= elapsed < 1.5
+
+    async def test_a_trickle_from_the_host_cannot_extend_the_deadline(
+        self, responder_factory: Callable[..., Awaitable[_Responder]]
+    ) -> None:
+        # Replies keep coming but the first one ends the probe at once.
+        await responder_factory(trickle=(0.05, b"x"))
+        started = time.monotonic()
+        assert await _unicast_probe("127.0.0.1", 5.0) == b"x"
+        assert time.monotonic() - started < 2.0
+
+    async def test_an_ipv6_host_uses_an_ipv6_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            transport, protocol = await loop.create_datagram_endpoint(
+                lambda: _Responder(replies=[(0.0, b"v6")]),
+                local_addr=("::1", 0),
+                family=socket.AF_INET6,
+            )
+        except OSError:
+            pytest.skip("no IPv6 loopback on this host")
+        try:
+            monkeypatch.setattr(discovery, "WS_DISCOVERY_PORT", protocol.port)
+            assert await _unicast_probe("::1", 1.0) == b"v6"
+        finally:
+            protocol.stop()
+            transport.close()
+
+    async def test_an_unreachable_family_is_none_not_an_error(self) -> None:
+        # An IPv6 literal that cannot be routed from here must not raise.
+        assert await _unicast_probe("2001:db8::1", 0.05) is None
+
+
+class TestScanDoesNotUseThreads:
+    """CAM-P3: a /24 scan holds no executor thread and does not lag the loop."""
+
+    async def test_a_silent_24_keeps_the_loop_responsive_and_uses_no_executor(
+        self,
+        private_scan_context: None,
+        responder_factory: Callable[..., Awaitable[_Responder]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        silent = await responder_factory(replies=[])
+        loop = asyncio.get_running_loop()
+
+        def no_executor(*_args: object, **_kwargs: object) -> typing.NoReturn:
+            raise AssertionError("discovery used an executor thread")
+
+        monkeypatch.setattr(loop, "run_in_executor", no_executor)
+        monkeypatch.setattr(asyncio, "to_thread", no_executor)
+        # 254 targets, all aimed at the silent loopback responder (the guard is
+        # bypassed here only so the probes can leave the machine).
+        monkeypatch.setattr(discovery, "assert_address_allowed", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            discovery, "_hosts_from_spec", lambda _spec: ["127.0.0.1"] * 254
+        )
+
+        # Warm up first: the first scan in a process pays one-off costs (lazy
+        # imports, socket setup) that a loaded CI runner turned into a single
+        # 0.4 s tick (release dry run, 2026-10-30). The bound below is about the
+        # scan itself, so measure a scan that runs warm.
+        assert (
+            await scan_range(
+                "10.0.0.1-10.0.0.1", max_concurrent=1, per_host_timeout=0.05
+            )
+            == []
+        )
+        warmup_probes = silent.probes
+
+        lags: list[float] = []
+        running = True
+
+        async def ticker() -> None:
+            while running:
+                before = time.monotonic()
+                await asyncio.sleep(0.005)
+                lags.append(time.monotonic() - before - 0.005)
+
+        tick = asyncio.create_task(ticker())
+        try:
+            found = await scan_range(
+                "10.0.0.1-10.0.0.254", max_concurrent=10, per_host_timeout=0.05
+            )
+        finally:
+            running = False
+            await tick
+        assert found == []
+        assert silent.probes - warmup_probes == 254
+        # The 50 ms target, with room for a loaded CI machine.
+        assert max(lags) < 0.25, f"event loop lagged {max(lags):.3f}s during the scan"
+
+    async def test_a_responder_per_host_is_found(
+        self,
+        private_scan_context: None,
+        responder_factory: Callable[..., Awaitable[_Responder]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await responder_factory(replies=[(0.0, _PROBE_MATCH_XML)])
+        monkeypatch.setattr(discovery, "assert_address_allowed", lambda *_a, **_k: None)
+        monkeypatch.setattr(discovery, "_hosts_from_spec", lambda _spec: ["127.0.0.1"])
+        found = await scan_range("10.0.0.1", per_host_timeout=1.0)
+        assert [camera.address for camera in found] == ["127.0.0.1"]
+
+
+class TestParseProbeMatchSourceBinding:
+    def test_matching_source_is_kept(self) -> None:
+        camera = _parse_probe_match(_PROBE_MATCH_XML, "192.168.1.50")
+        assert camera is not None
+        assert camera.address == "192.168.1.50"
+
+    def test_spoofed_xaddrs_is_dropped(self) -> None:
+        assert _parse_probe_match(_PROBE_MATCH_XML, "192.168.1.99") is None
+
+    def test_any_matching_xaddrs_entry_is_used(self) -> None:
+        data = _probe_match_for(
+            "http://[fe80::1]/onvif/device_service http://10.0.0.7/onvif/device_service"
+        )
+        camera = _parse_probe_match(data, "10.0.0.7")
+        assert camera is not None
+        assert camera.address == "10.0.0.7"
+
+    def test_hostname_xaddrs_cannot_be_bound_and_is_dropped(self) -> None:
+        data = _probe_match_for("http://camera.example/onvif/device_service")
+        assert _parse_probe_match(data, "10.0.0.7") is None
+
+
+class TestDiscoverOnvifSourceBinding:
+    async def test_reply_advertising_another_host_is_dropped(
+        self, private_scan_context: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        replies = [
+            # 10.0.0.9 claims to be 10.0.0.50: dropped.
+            (_probe_match_for("http://10.0.0.50/onvif/device_service"), "10.0.0.9"),
+            (_probe_match_for("http://10.0.0.7/onvif/device_service"), "10.0.0.7"),
+        ]
+        monkeypatch.setattr(
+            discovery,
+            "_collect_multicast_replies",
+            AsyncMock(return_value=replies),
+        )
+        found = await discovery.discover_onvif(timeout_seconds=0.1)
+        assert [camera.address for camera in found] == ["10.0.0.7"]
+
+
+class TestMalformedXaddrs:
+    """A malformed XAddrs entry spoils only itself, never the round."""
+
+    def test_malformed_entry_beside_a_valid_one_without_source(self) -> None:
+        data = _probe_match_for(
+            "http://10.0.0.7/onvif/device_service http://[bad/onvif"
+        )
+        camera = _parse_probe_match(data)
+        assert camera is not None
+        assert camera.address == "10.0.0.7"
+
+    def test_malformed_first_entry_without_source_is_none(self) -> None:
+        data = _probe_match_for("http://[bad/onvif http://10.0.0.7/onvif")
+        assert _parse_probe_match(data) is None
+
+    def test_malformed_entry_beside_a_matching_one_with_source(self) -> None:
+        data = _probe_match_for("http://[x]/onvif http://10.0.0.7/onvif")
+        camera = _parse_probe_match(data, "10.0.0.7")
+        assert camera is not None
+        assert camera.address == "10.0.0.7"
+
+    def test_only_malformed_entry_with_source_is_none(self) -> None:
+        assert _parse_probe_match(_probe_match_for("http://[bad/x"), "10.0.0.7") is None
+
+    async def test_malformed_reply_does_not_sink_discover_onvif(
+        self, private_scan_context: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        replies = [
+            (_probe_match_for("http://[bad/x"), "10.0.0.9"),
+            (_probe_match_for("http://10.0.0.7/onvif/device_service"), "10.0.0.7"),
+        ]
+        monkeypatch.setattr(
+            discovery,
+            "_collect_multicast_replies",
+            AsyncMock(return_value=replies),
+        )
+        found = await discovery.discover_onvif(timeout_seconds=0.1)
+        assert [camera.address for camera in found] == ["10.0.0.7"]
+
+    async def test_malformed_reply_does_not_sink_scan_range(
+        self, private_scan_context: None
+    ) -> None:
+        def _probe(host: str, timeout: float) -> bytes:
+            if host == "10.0.0.1":
+                return _probe_match_for("http://[bad/x")
+            return _PROBE_MATCH_XML
+
+        with patch(
+            "timelapse_manager.cameras.discovery._unicast_probe", side_effect=_probe
+        ):
+            result = await scan_range("10.0.0.1-10.0.0.2", per_host_timeout=0.01)
+        assert [camera.address for camera in result] == ["10.0.0.2"]

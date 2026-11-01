@@ -13,7 +13,7 @@ HTTPS_PORT := 8443
 .DEFAULT_GOAL := help
 
 .PHONY: help bootstrap dev-cert run test lint typecheck fmt migrate \
-        mock-cameras check bundle release sbom sign image
+        mock-cameras check bundle release packages ct-template sbom sign image
 
 help: ## Show this help.
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -71,9 +71,13 @@ bundle: ## Freeze the app into a relocatable bundle (no tarball/smoke).
 release: ## Build the bundle + tarball and run a local smoke test.
 	./packaging/release.sh
 
+# The SBOM lists what ships, so it scans a runtime-only environment
+# (.venv-runtime, no dev tooling) with the dev environment's cyclonedx-py. The
+# sync gets its own environment variable, kept off the `uv run` that follows.
 sbom: ## Generate the CycloneDX SBOM (dist/cyclonedx-bom.json) incl. bundled FFmpeg.
 	mkdir -p dist
-	uv run python dev/gen_sbom.py --output dist/cyclonedx-bom.json
+	UV_PROJECT_ENVIRONMENT=.venv-runtime uv sync --locked --no-dev
+	uv run python dev/gen_sbom.py --venv .venv-runtime --output dist/cyclonedx-bom.json
 
 sign: release sbom ## Build artifacts, then write SHA256SUMS + a detached signature.
 	# All artifacts must share one directory so the manifest uses bare names;
@@ -82,16 +86,41 @@ sign: release sbom ## Build artifacts, then write SHA256SUMS + a detached signat
 		dist/timelapse-manager-*.tar.gz \
 		dist/cyclonedx-bom.json
 
-# Build the linux/amd64 Docker image locally, resolving the base-image digest
-# the same way release CI does so a hand-built image is digest-pinned too. The
-# Dockerfile's PYTHON_IMAGE default is a placeholder that fails on purpose; the
-# real digest is supplied here via --build-arg. Requires Docker with buildx.
-image: ## Build the linux/amd64 Docker image (digest-pinned base) locally.
-	@digest="$$(docker buildx imagetools inspect python:3.12-slim-bookworm \
-		--format '{{.Manifest.Digest}}')"; \
-	version="$$(uv run python -c 'import timelapse_manager as t; print(t.__version__)')"; \
-	echo "==> base python:3.12-slim-bookworm@$$digest"; \
+# Build the .deb and .rpm from the bundle `make release` froze (needs nfpm on
+# PATH; a signed .rpm also needs TLM_RPM_SIGNING_KEY_FILE, see the script).
+packages: ## Build the .deb and .rpm from the frozen bundle (run `make release` first).
+	@version="$$(uv run python -c 'import timelapse_manager as t; print(t.__version__)')"; \
+	./packaging/build-linux-packages.sh "$$version" amd64
+
+# Build the Proxmox CT template from the .deb in dist/ (needs Docker with
+# buildx, zstd and the .deb from `make packages`).
+ct-template: ## Build the Proxmox CT template (.tar.zst) from the .deb in dist/.
+	@version="$$(uv run python -c 'import timelapse_manager as t; print(t.__version__)')"; \
+	deb="$$(ls dist/timelapse-manager_*_amd64.deb 2>/dev/null | head -n 1)"; \
+	[ -n "$$deb" ] || { echo "error: no .deb in dist/ (run make packages)" >&2; exit 1; }; \
+	./packaging/lxc/build-ct-template.sh --deb "$$deb" --version "$$version" --out-dir dist
+
+# Build the linux/amd64 Docker image locally. The Dockerfile carries real
+# digest-pinned defaults for its three bases (python, debian, uv), so a hand
+# build is as reproducible as release CI. Override one with, for example,
+# `make image PYTHON_IMAGE=python:3.12-slim-trixie@sha256:...`. The pinned FFmpeg
+# is fetched from the public URL in ffmpeg-pin.json and sha256-checked. To try a
+# private mirror first, set TLM_FFMPEG_MIRROR_URL and pass GITEA_TOKEN in the
+# environment (buildx secret). Requires Docker with buildx.
+IMAGE_NAME ?= ghcr.io/drcoble/timelapse_manager
+comma := ,
+image: ## Build the linux/amd64 Docker image (digest-pinned bases) locally.
+	@version="$$(uv run python -c 'import timelapse_manager as t; print(t.__version__)')"; \
+	revision="$$(git rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	echo "==> $(IMAGE_NAME):$$version"; \
 	docker buildx build --platform linux/amd64 \
-		--build-arg PYTHON_IMAGE=python:3.12-slim-bookworm@$$digest \
+		$(if $(PYTHON_IMAGE),--build-arg PYTHON_IMAGE=$(PYTHON_IMAGE)) \
+		$(if $(FFMPEG_BASE_IMAGE),--build-arg FFMPEG_BASE_IMAGE=$(FFMPEG_BASE_IMAGE)) \
+		$(if $(UV_IMAGE),--build-arg UV_IMAGE=$(UV_IMAGE)) \
+		--build-arg VERSION=$$version --build-arg VCS_REF=$$revision \
+		--build-arg BUILD_DATE=$$created \
+		$(if $(TLM_FFMPEG_MIRROR_URL),--build-arg TLM_FFMPEG_MIRROR_URL=$(TLM_FFMPEG_MIRROR_URL)) \
+		$(if $(GITEA_TOKEN),--secret id=gitea_token$(comma)env=GITEA_TOKEN) \
 		-f docker/Dockerfile \
-		-t timelapse-manager:$$version --load .
+		-t $(IMAGE_NAME):$$version --load .

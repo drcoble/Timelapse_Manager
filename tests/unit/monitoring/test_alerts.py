@@ -325,3 +325,40 @@ class TestAutoClearEvaluator:
             assert session.get(Event, new_id).alert_clear_reason == CLEAR_REASON_AUTO
             # old row retains its manual clear reason (not overwritten to auto)
             assert session.get(Event, old_id).alert_clear_reason == CLEAR_REASON_MANUAL
+
+
+class TestAutoClearResolveBound:
+    """#134: a resolve clears only alerts raised before it."""
+
+    def test_alert_raised_after_the_resolve_is_left_active(
+        self, migrated_factory
+    ) -> None:
+        before = _seed_event(
+            migrated_factory,
+            scope="project",
+            scope_id=3,
+            level="warning",
+            reason="camera_offline",
+        )
+        resolve = _seed_event(
+            migrated_factory, scope="project", scope_id=3, reason="camera_recovered"
+        )
+        after = _seed_event(
+            migrated_factory,
+            scope="project",
+            scope_id=3,
+            level="warning",
+            reason="camera_offline",
+        )
+        with session_scope(migrated_factory) as session:
+            cleared = auto_clear_for_event(
+                session,
+                scope="project",
+                scope_id=3,
+                reason="camera_recovered",
+                resolve_event_id=resolve,
+            )
+        assert cleared == 1
+        with session_scope(migrated_factory) as session:
+            assert session.get(Event, before).alert_cleared_at is not None
+            assert session.get(Event, after).alert_cleared_at is None

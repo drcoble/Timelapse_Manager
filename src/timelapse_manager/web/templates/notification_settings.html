@@ -6,9 +6,11 @@
     settings       — NotificationSettingsView (password is masked: "***" if set)
     channels       — tuple of selectable channel names ("email", "webhook")
     security_modes — tuple of SMTP security modes
+    webhook_signing_secret     — masked signing secret ("***" if set, else "")
+    webhook_signing_secret_set — bool: whether a signing secret is stored
 
-  Transport configuration changes take effect on the next restart; only the
-  routing rules are re-read live by the dispatcher.
+  Transport configuration changes and routing rules are both picked up live by
+  the dispatcher on its next poll; no restart is needed.
 #}
 
 {% block title %}Notifications — Timelapse Manager{% endblock %}
@@ -21,7 +23,7 @@
     <h1>Notification Settings</h1>
     <div class="subtitle">
       Email &amp; webhook channels &middot; routing rules &middot;
-      transport changes apply on restart
+      changes apply without a restart
     </div>
   </div>
 </div>
@@ -125,6 +127,22 @@
         <span class="form-hint">
           Each URL receives a JSON POST. Credentials embedded in a URL are stored
           as entered and never echoed in logs.
+        </span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="webhook_signing_secret">Signing secret</label>
+        <input type="password" id="webhook_signing_secret" name="webhook_signing_secret"
+               class="form-control" autocomplete="new-password"
+               value="{{ webhook_signing_secret }}">
+        <span class="form-hint">
+          {% if webhook_signing_secret_set %}
+            A signing secret is stored (shown masked). Leave as
+            <span class="mono">***</span> to keep it; type a new value to change it.
+          {% else %}
+            Optional. When set, each delivery is signed with
+            <span class="mono">X-Signature-256: sha256=HMAC-SHA256(secret, body)</span>
+            so receivers can verify authenticity. Leave blank to keep webhooks unsigned.
+          {% endif %}
         </span>
       </div>
     </div>

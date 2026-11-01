@@ -176,3 +176,35 @@ class TestEdgeCases:
     def test_base_zero_yields_zero(self) -> None:
         d = _backoff_delay(5, base=0.0, maximum=300.0, jitter_fraction=0.5, rng=_rng())
         assert d == 0.0
+
+
+class TestSaturate:
+    """A refused login starts at the ceiling instead of ramping up (#69 CAM-R5)."""
+
+    def test_first_attempt_is_already_at_the_ceiling(self) -> None:
+        delay = _backoff_delay(
+            1,
+            base=1.0,
+            maximum=300.0,
+            jitter_fraction=0.0,
+            rng=_rng(),
+            saturate=True,
+        )
+        assert delay == 300.0
+
+    def test_saturate_still_applies_jitter_around_the_ceiling(self) -> None:
+        delay = _backoff_delay(
+            1,
+            base=1.0,
+            maximum=300.0,
+            jitter_fraction=0.1,
+            rng=_rng(),
+            saturate=True,
+        )
+        assert 270.0 <= delay <= 330.0
+
+    def test_default_is_unchanged(self) -> None:
+        assert (
+            _backoff_delay(1, base=1.0, maximum=300.0, jitter_fraction=0.0, rng=_rng())
+            == 1.0
+        )

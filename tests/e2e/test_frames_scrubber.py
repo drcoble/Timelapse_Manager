@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.e2e._tz_support import set_viewer_zone
+
 pytestmark = pytest.mark.ui
 
 
@@ -78,6 +80,9 @@ class TestFramesScrubber:
         """
         page, base = logged_in_data_page  # type: ignore[misc]
         page.goto(f"{base}/frames?project_id=1")  # type: ignore[union-attr]
+        # The pre-fill is in the viewer's stored zone (#70 F-R5); pin it to UTC
+        # so the expected value does not depend on the host's zone.
+        set_viewer_zone(page, "UTC")
         page.wait_for_selector("#frame-jump-at", timeout=30000)  # type: ignore[union-attr]
         page.wait_for_selector(".frame-ribbon .time-ribbon", timeout=30000)  # type: ignore[union-attr]
         # 2026-01-01T00:20:00Z -> the input should read the minute-trimmed value.

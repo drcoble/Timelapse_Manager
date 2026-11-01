@@ -23,8 +23,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
+from tests.conftest import make_jpeg
 from timelapse_manager.cameras.base import UnreachableCaptureError
 from timelapse_manager.cameras.rtsp import RtspAdapter
 
@@ -71,8 +73,10 @@ class _FakeProcess:
     returncode = 0
 
     async def communicate(self) -> tuple[bytes, bytes]:
-        # Minimal JPEG SOI/EOI so frame_from_bytes accepts it as an image.
-        return (b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 16 + b"\xff\xd9", b"")
+        # A structurally whole JPEG (SOI, SOF with real dimensions, EOI): the
+        # RTSP frame build rejects a body without readable dimensions (#69
+        # CAM-R11).
+        return (make_jpeg(1, 1), b"")
 
     def kill(self) -> None:  # pragma: no cover - not reached on the happy path
         return None
@@ -266,3 +270,94 @@ class TestOnvifSoapStreamUriGuarded:
         # The poisoned URI must NOT have been cached.
         assert adapter._stream_uri is None  # noqa: SLF001
         await adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# The device/media SOAP chokepoint (_soap_call) guards its target before POST
+# ---------------------------------------------------------------------------
+
+
+class _SoapPostSentinel(httpx.AsyncClient):
+    """Stand-in httpx client recording whether a SOAP POST was ever issued.
+
+    If a *denied* device URL ever reaches the POST, the guard has failed open;
+    the sentinel records it so the test can assert it was never called. On the
+    *allowed* path it returns a minimal GetProfilesResponse so ``_soap_call``
+    completes and we can assert the guard let the request through. It is a real
+    client over a mock transport, so the streamed, size-capped read runs too.
+    """
+
+    def __init__(self) -> None:
+        self.posted = False
+        super().__init__(transport=httpx.MockTransport(self._handle))
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.posted = True
+        return httpx.Response(
+            200,
+            text=(
+                "<env:Envelope"
+                " xmlns:env='http://www.w3.org/2003/05/soap-envelope'"
+                " xmlns:trt='http://www.onvif.org/ver10/media/wsdl'>"
+                "<env:Body><trt:GetProfilesResponse>"
+                "<trt:Profiles token='profile0'/>"
+                "</trt:GetProfilesResponse></env:Body></env:Envelope>"
+            ),
+        )
+
+
+@pytest.mark.abuse
+class TestOnvifSoapDeviceUrlGuarded:
+    """Every device/media SOAP request funnels through ``_soap_call``.
+
+    Its target URL is built from the operator-supplied camera address; a denied
+    address (loopback, link-local/metadata, or a private host outside the admin
+    opt-in) must be rejected before the POST so an internal SOAP request can
+    never be aimed at it. This covers GetProfiles, GetSnapshotUri, GetStreamUri,
+    GetServices, GetGeoLocation, and GetHostname at the one shared chokepoint.
+    """
+
+    @pytest.mark.parametrize(
+        "denied_host",
+        [
+            "127.0.0.1",  # loopback
+            "169.254.169.254",  # cloud-metadata endpoint
+            "172.31.5.5",  # RFC-1918 (172.16/12) but NOT in the admin opt-in
+        ],
+    )
+    async def test_denied_soap_target_never_posts(
+        self,
+        denied_host: str,
+        _ssrf_context: None,
+    ) -> None:
+        from timelapse_manager.cameras.onvif import OnvifAdapter, _device_url
+
+        sentinel = _SoapPostSentinel()
+        adapter = OnvifAdapter(client=sentinel, address=denied_host)
+        with pytest.raises(UnreachableCaptureError):
+            await adapter._soap_call(  # noqa: SLF001
+                _device_url(denied_host), "<trt:GetProfiles/>"
+            )
+        assert sentinel.posted is False, (
+            "a denied device URL must be rejected before the SOAP POST"
+        )
+
+    async def test_allowed_private_soap_target_reaches_post(
+        self,
+        _ssrf_context: None,
+    ) -> None:
+        """A device inside an admin-allowed subnet passes the guard and POSTs.
+
+        The explicit "don't break real cameras" guarantee: a legitimately
+        configured private camera (e.g. an Axis on 10.0.0.x) still issues its
+        SOAP request.
+        """
+        from timelapse_manager.cameras.onvif import OnvifAdapter, _device_url
+
+        sentinel = _SoapPostSentinel()
+        adapter = OnvifAdapter(client=sentinel, address="10.0.0.42")
+        text = await adapter._soap_call(  # noqa: SLF001
+            _device_url("10.0.0.42"), "<trt:GetProfiles/>"
+        )
+        assert sentinel.posted is True
+        assert "GetProfilesResponse" in text

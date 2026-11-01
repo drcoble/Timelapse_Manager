@@ -38,6 +38,9 @@ _KNOWN_SPAWN_FILES: tuple[Path, ...] = (
     # local ffmpeg advertises; argv[0] is the admin-configured binary and no
     # caller input reaches the argv.
     _SRC_ROOT / "encode" / "hwaccel.py",
+    # Codec probe (#25): spawns ffprobe beside the configured ffmpeg with a fixed
+    # argv list (stream fields + the render's own output path), 10 s timeout.
+    _SRC_ROOT / "encode" / "media_probe.py",
     _SRC_ROOT / "cameras" / "rtsp.py",
     _SRC_ROOT / "service" / "tls.py",
     _SRC_ROOT / "version.py",

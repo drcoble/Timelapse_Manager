@@ -127,7 +127,7 @@ class TestDispatchE2EBothChannels:
             patch("smtplib.SMTP", return_value=mock_smtp),
             patch("httpx.AsyncClient", side_effect=make_webhook_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -179,7 +179,7 @@ class TestDispatchE2EBothChannels:
             patch("smtplib.SMTP", return_value=mock_smtp),
             patch("httpx.AsyncClient", side_effect=make_webhook_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -237,7 +237,7 @@ class TestDispatchE2EBothChannels:
             patch("smtplib.SMTP", return_value=mock_smtp),
             patch("httpx.AsyncClient", side_effect=make_webhook_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):
@@ -295,7 +295,7 @@ class TestDispatchE2ERedaction:
         with (
             patch("httpx.AsyncClient", side_effect=make_webhook_client),
             patch(
-                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url",
+                "timelapse_manager.monitoring.channels.webhook.validate_outbound_url_async",
                 side_effect=lambda u: u,
             ),
         ):

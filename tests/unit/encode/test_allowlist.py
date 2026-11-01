@@ -6,6 +6,9 @@ import pytest
 
 from timelapse_manager.encode.allowlist import (
     ensure_filters_allowed,
+    parse_filter_names,
+    parse_filter_options,
+    parse_filtergraph,
     resolve_codec,
     resolve_container,
     validate_bitrate_kbps,
@@ -13,7 +16,7 @@ from timelapse_manager.encode.allowlist import (
     validate_dimensions,
     validate_fps,
 )
-from timelapse_manager.encode.encoder import EncoderCapabilityError
+from timelapse_manager.encode.encoder import EncoderCapabilityError, EncoderError
 
 # ---------------------------------------------------------------------------
 # resolve_codec
@@ -275,3 +278,106 @@ class TestValidateBitrateKbps:
         with pytest.raises(EncoderCapabilityError) as exc_info:
             validate_bitrate_kbps(1_000_001)
         assert exc_info.value.option == "bitrate_kbps"
+
+
+# ---------------------------------------------------------------------------
+# parse_filter_names / parse_filtergraph / parse_filter_options (#67 S4)
+# ---------------------------------------------------------------------------
+
+
+class TestParseFilterNames:
+    def test_simple_chain(self) -> None:
+        assert parse_filter_names("setpts=N/24/TB,fps=24,format=yuv420p") == [
+            "setpts",
+            "fps",
+            "format",
+        ]
+
+    def test_filter_without_options(self) -> None:
+        assert parse_filter_names("deflicker,hwupload") == ["deflicker", "hwupload"]
+
+    def test_quoted_comma_and_semicolon_do_not_split(self) -> None:
+        graph = "drawtext=text='a,b;c[d]e',scale=2:2"
+        assert parse_filter_names(graph) == ["drawtext", "scale"]
+
+    def test_backslash_escaped_quote_does_not_open_quoting(self) -> None:
+        # Outside quotes "\'" is a literal quote, so the comma after it splits.
+        graph = "drawtext=text=it\\'s,movie=x"
+        assert parse_filter_names(graph) == ["drawtext", "movie"]
+
+    def test_backslash_inside_quotes_is_literal(self) -> None:
+        # Inside quotes a backslash does not escape: "\'" closes the quote, so
+        # the old timestamp escaping let the next comma start a new filter.
+        graph = "drawtext=text='x\\',movie=/etc/passwd'"
+        assert parse_filter_names(graph) == ["drawtext", "movie"]
+
+    def test_escaped_separator_outside_quotes(self) -> None:
+        assert parse_filter_names("drawtext=text=a\\,b,fps=1") == ["drawtext", "fps"]
+
+    def test_pad_labels_are_stripped(self) -> None:
+        graph = "[0:v]setpts=PTS/TB,fps=24[v];[v][1:v]overlay=10:10[out]"
+        assert parse_filter_names(graph) == ["setpts", "fps", "overlay"]
+
+    def test_unquoted_bracket_ends_the_options(self) -> None:
+        # "[a]" after options is an output label, then ";" starts a chain.
+        assert parse_filter_names("drawtext=text=x[a];movie=y") == [
+            "drawtext",
+            "movie",
+        ]
+
+    def test_quoted_filter_name_is_unquoted(self) -> None:
+        assert parse_filter_names("'movie'=x") == ["movie"]
+
+    def test_instance_name_is_kept(self) -> None:
+        assert parse_filter_names("drawtext@x=text=a") == ["drawtext@x"]
+
+    def test_whitespace_around_filters(self) -> None:
+        assert parse_filter_names("  fps=1 ,\n scale=2:2 ") == ["fps", "scale"]
+
+    @pytest.mark.parametrize(
+        "graph",
+        [
+            "",
+            "   ",
+            ",fps=1",
+            "fps=1,,scale=2:2",
+            "[v]",
+            "[]fps=1",
+            "[v fps=1",
+            "fps=1[out]x",
+            "fps=1]",
+        ],
+    )
+    def test_unparseable_graph_raises(self, graph: str) -> None:
+        with pytest.raises(EncoderError, match="unparseable filtergraph"):
+            parse_filter_names(graph)
+
+    def test_options_are_unquoted_once(self) -> None:
+        (parsed,) = parse_filtergraph("drawtext=fontfile='/a\\:b':text='%{pts\\:x}'")
+        assert parsed.args == "fontfile=/a\\:b:text=%{pts\\:x}"
+
+
+class TestParseFilterOptions:
+    def test_keyed_options(self) -> None:
+        assert parse_filter_options("fontfile=/a\\:b:text=%{pts\\:x}:x=1") == [
+            ("fontfile", "/a:b"),
+            ("text", "%{pts:x}"),
+            ("x", "1"),
+        ]
+
+    def test_shorthand_options_have_no_key(self) -> None:
+        assert parse_filter_options("640:480") == [(None, "640"), (None, "480")]
+
+    def test_escaped_colon_stays_in_the_value(self) -> None:
+        assert parse_filter_options("text=a\\:textfile=/etc/passwd") == [
+            ("text", "a:textfile=/etc/passwd")
+        ]
+
+    def test_unescaped_colon_starts_a_new_option(self) -> None:
+        assert parse_filter_options("text=a:textfile=/etc/passwd") == [
+            ("text", "a"),
+            ("textfile", "/etc/passwd"),
+        ]
+
+    def test_empty_args(self) -> None:
+        assert parse_filter_options("") == []

@@ -28,14 +28,18 @@ Three invariants make these safe:
   validation seam (:func:`validate_outbound_url`) so a later phase can enforce a
   deny-list without touching this call site. Redirects are not followed and a
   timeout is always set.
+
+The file work -- the export copy and both prunes -- runs on the jobs executor
+the render queue passes in (#66 C3), like the render it follows; the short event
+and lookup writes stay on the loop's default executor.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import shutil
+from concurrent.futures import Executor
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +50,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..config import Settings
 from ..db.models import RenderJob
 from ..db.session import session_scope
+from ..executors import run_in
 from ..monitoring.events import EventType, log_event
+from .outputs import delete_render_output
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +99,21 @@ def validate_outbound_url(url: str) -> str:
     return assert_allowed_url(url, allow_private=False)
 
 
+async def validate_outbound_url_async(url: str) -> str:
+    """The event-loop form of :func:`validate_outbound_url` (#67 P6).
+
+    The same policy (full deny-list, no private opt-in), but the host is
+    resolved in a worker thread and an allowed verdict is cached for 60 s, so
+    a slow resolver never stalls the loop and a burst of sends to one host
+    resolves it once.
+
+    :raises SsrfError: when the URL targets a denied address or does not resolve.
+    """
+    from ..security.ssrf import assert_allowed_url_async
+
+    return await assert_allowed_url_async(url, allow_private=False)
+
+
 async def run_post_actions(
     settings: Settings,
     session_factory: sessionmaker[Session],
@@ -101,6 +122,7 @@ async def run_post_actions(
     output_path: Path | None,
     action_specs: list[dict[str, Any]],
     kind: str = "manual",
+    executor: Executor | None = None,
 ) -> None:
     """Run every configured post-render action for a finished render.
 
@@ -118,6 +140,9 @@ async def run_post_actions(
     configured -- so it is evaluated after the action loop and isolated in its own
     failure boundary, exactly like a configured action: a failure is logged and
     recorded as a project event but never fails the render.
+
+    ``executor`` is the jobs executor the export copy and the prunes run on
+    (#66 C3); ``None`` uses the loop's default executor.
     """
     if output_path is None:
         return
@@ -151,6 +176,7 @@ async def run_post_actions(
                 action_type=action_type,
                 spec=spec,
                 kind=kind,
+                executor=executor,
             )
         except Exception as exc:  # noqa: BLE001 - actions must not fail the render
             logger.warning(
@@ -177,8 +203,13 @@ async def run_post_actions(
     # in its own failure boundary so it can never fail an already-finished render
     # (the row is committed ``done`` before this is reached).
     try:
-        await asyncio.to_thread(
-            _auto_prune, settings, session_factory, project_id=project_id, kind=kind
+        await run_in(
+            executor,
+            _auto_prune,
+            settings,
+            session_factory,
+            project_id=project_id,
+            kind=kind,
         )
     except Exception as exc:  # noqa: BLE001 - auto-prune must not fail the render
         logger.warning("auto-prune failed for job=%s (kind=%s): %s", job_id, kind, exc)
@@ -202,8 +233,13 @@ async def _dispatch_action(
     action_type: str,
     spec: dict[str, Any],
     kind: str,
+    executor: Executor | None = None,
 ) -> None:
-    """Route one action spec to its handler. Unknown types are ignored (logged)."""
+    """Route one action spec to its handler. Unknown types are ignored (logged).
+
+    The export copy and the prune run on ``executor`` (the jobs executor), or on
+    the loop's default executor when it is ``None``.
+    """
     if action_type == "export":
         if running_under_docker():
             logger.info(
@@ -212,11 +248,12 @@ async def _dispatch_action(
                 job_id,
             )
             return
-        await asyncio.to_thread(_export, output_path, spec)
+        await run_in(executor, _export, output_path, spec)
     elif action_type == "external_trigger":
         await _webhook(settings, project_id=project_id, job_id=job_id, spec=spec)
     elif action_type == "prune":
-        await asyncio.to_thread(
+        await run_in(
+            executor,
             _prune,
             settings,
             session_factory,
@@ -252,25 +289,45 @@ async def _webhook(
 ) -> None:
     """POST a small JSON notification to the configured webhook URL.
 
-    The URL passes through the outbound-validation seam; the request carries a
-    timeout and does not follow redirects (so a 30x cannot bounce the call to an
-    unintended host). A non-2xx response raises, to be caught and audited.
+    The URL passes through the outbound-validation seam, and the connection
+    goes only to the address that check approved (:func:`_webhook_client`). The
+    request carries a timeout and does not follow redirects (so a 30x cannot
+    bounce the call to an unintended host). A non-2xx response raises, to be
+    caught and audited.
     """
     url = spec.get("url")
     if not url:
         raise ValueError("external_trigger action requires a 'url'")
-    # validate_outbound_url resolves the host via blocking socket.getaddrinfo;
-    # off-load it so a slow/stalled resolver cannot stall the event loop.
-    target = await asyncio.to_thread(validate_outbound_url, str(url))
+    # The async seam resolves in a worker thread (a slow resolver cannot stall
+    # the loop) and caches the allowed answer the pinned transport connects to.
+    target = await validate_outbound_url_async(str(url))
     payload = {
         "event": "render_completed",
         "project_id": project_id,
         "render_id": job_id,
     }
     timeout = settings.render.webhook_timeout_seconds
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+    async with _webhook_client(timeout) as client:
         response = await client.post(target, json=payload)
         response.raise_for_status()
+
+
+def _webhook_client(timeout: float) -> httpx.AsyncClient:
+    """Build the client for the post-render webhook. Tests replace this.
+
+    Its transport connects only to the address the SSRF guard validated, so a
+    rebinding DNS answer (public for the check, private for the connection)
+    cannot redirect the socket (#148). Environment proxies are ignored, since a
+    proxy would make the connection on the transport's behalf.
+    """
+    from ..security.pinned_http import pinned_async_transport
+
+    return httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=False,
+        transport=pinned_async_transport(),
+        trust_env=False,
+    )
 
 
 def _prune(
@@ -332,7 +389,7 @@ def _prune(
             .all()
         )
         for job in candidates[keep_count:]:
-            _delete_render_output(job, render_root)
+            delete_render_output(job, render_root)
             session.delete(job)
 
 
@@ -386,30 +443,8 @@ def _auto_prune(
         )
         # Keep only the newest (N=1); delete every older render of this kind.
         for job in candidates[1:]:
-            _delete_render_output(job, render_root)
+            delete_render_output(job, render_root)
             session.delete(job)
-
-
-def _delete_render_output(job: RenderJob, render_root: Path) -> None:
-    """Unlink a render's output file when confined to the render root.
-
-    Never touches frames or anything outside the render root: a stored path that
-    does not resolve inside it is left on disk (only the row is removed by the
-    caller), so a corrupted path can never trigger a delete elsewhere.
-    """
-    if not job.output_file_path:
-        return
-    resolved = Path(job.output_file_path).resolve()
-    if not resolved.is_relative_to(render_root):
-        logger.warning(
-            "skipping prune of render %s: output %s is outside render root %s",
-            job.id,
-            resolved,
-            render_root,
-        )
-        return
-    with contextlib.suppress(FileNotFoundError):
-        resolved.unlink()
 
 
 def _project_for_prune(session: Session, project_id: int) -> Any:

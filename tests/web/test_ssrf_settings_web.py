@@ -53,7 +53,7 @@ class TestSsrfSettingsAdminOnly:
     def test_viewer_post_is_403(self, viewer_client: TestClient) -> None:
         resp = viewer_client.post(
             "/settings/ssrf",
-            data={"ssrf_allowed_private_subnets": "10.1.16.0/24"},
+            data={"ssrf_allowed_private_subnets": "10.0.16.0/24"},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
@@ -62,7 +62,7 @@ class TestSsrfSettingsAdminOnly:
     def test_operator_post_is_403(self, operator_client: TestClient) -> None:
         resp = operator_client.post(
             "/settings/ssrf",
-            data={"ssrf_allowed_private_subnets": "10.1.16.0/24"},
+            data={"ssrf_allowed_private_subnets": "10.0.16.0/24"},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
@@ -72,52 +72,52 @@ class TestSsrfSettingsAdminOnly:
 class TestSsrfSettingsSave:
     def test_save_persists_and_applies_live(self, admin_client: TestClient) -> None:
         """The reported defect: a subnet added in the UI must be honoured at once."""
-        resp = _post_ssrf(admin_client, "10.1.16.0/24")
+        resp = _post_ssrf(admin_client, "10.0.16.0/24")
         assert resp.status_code == 303
 
-        assert _stored_subnets() == ["10.1.16.0/24"]
+        assert _stored_subnets() == ["10.0.16.0/24"]
         # Applied to the running policy without a restart -- this is what lets the
-        # 10.1.16.30 camera be added immediately after saving.
-        assert "10.1.16.0/24" in _runtime_subnets()
+        # 10.0.16.30 camera be added immediately after saving.
+        assert "10.0.16.0/24" in _runtime_subnets()
 
     def test_bare_host_is_stored_as_slash_32(self, admin_client: TestClient) -> None:
-        resp = _post_ssrf(admin_client, "10.1.16.30")
+        resp = _post_ssrf(admin_client, "10.0.16.30")
         assert resp.status_code == 303
-        assert _stored_subnets() == ["10.1.16.30/32"]
+        assert _stored_subnets() == ["10.0.16.30/32"]
 
     def test_host_with_prefix_collapses_to_network(
         self, admin_client: TestClient
     ) -> None:
-        resp = _post_ssrf(admin_client, "10.1.16.30/24")
+        resp = _post_ssrf(admin_client, "10.0.16.30/24")
         assert resp.status_code == 303
-        assert _stored_subnets() == ["10.1.16.0/24"]
+        assert _stored_subnets() == ["10.0.16.0/24"]
 
     def test_multiple_lines_dedupe_and_keep_order(
         self, admin_client: TestClient
     ) -> None:
-        resp = _post_ssrf(admin_client, "10.1.16.0/24\n192.168.5.0/24\n10.1.16.0/24\n")
+        resp = _post_ssrf(admin_client, "10.0.16.0/24\n192.168.5.0/24\n10.0.16.0/24\n")
         assert resp.status_code == 303
-        assert _stored_subnets() == ["10.1.16.0/24", "192.168.5.0/24"]
+        assert _stored_subnets() == ["10.0.16.0/24", "192.168.5.0/24"]
 
     def test_config_baseline_is_preserved_in_runtime(
         self, admin_client: TestClient
     ) -> None:
         """An env/config-provided subnet survives an admin edit (union semantics)."""
         # Simulate a subnet supplied by TLM_SSRF__ALLOWED_PRIVATE_SUBNETS at boot.
-        get_context().ssrf_config_subnets = ("10.1.40.0/24",)
+        get_context().ssrf_config_subnets = ("10.0.40.0/24",)
 
-        resp = _post_ssrf(admin_client, "10.1.16.0/24")
+        resp = _post_ssrf(admin_client, "10.0.16.0/24")
         assert resp.status_code == 303
 
         runtime = _runtime_subnets()
-        assert "10.1.40.0/24" in runtime  # baseline kept
-        assert "10.1.16.0/24" in runtime  # admin addition applied
+        assert "10.0.40.0/24" in runtime  # baseline kept
+        assert "10.0.16.0/24" in runtime  # admin addition applied
         # The DB row holds only the admin list, never the env baseline.
-        assert _stored_subnets() == ["10.1.16.0/24"]
+        assert _stored_subnets() == ["10.0.16.0/24"]
 
     def test_empty_clears_admin_list(self, admin_client: TestClient) -> None:
-        _post_ssrf(admin_client, "10.1.16.0/24")
-        assert _stored_subnets() == ["10.1.16.0/24"]
+        _post_ssrf(admin_client, "10.0.16.0/24")
+        assert _stored_subnets() == ["10.0.16.0/24"]
 
         resp = _post_ssrf(admin_client, "")
         assert resp.status_code == 303
@@ -136,7 +136,7 @@ class TestSsrfSettingsValidation:
         assert _stored_subnets() in (None, [])
 
     def test_one_bad_line_refuses_whole_save(self, admin_client: TestClient) -> None:
-        resp = _post_ssrf(admin_client, "10.1.16.0/24\nbogus")
+        resp = _post_ssrf(admin_client, "10.0.16.0/24\nbogus")
         assert resp.status_code == 200
         # The good line is not silently kept -- the save is refused as a unit.
         assert _stored_subnets() in (None, [])

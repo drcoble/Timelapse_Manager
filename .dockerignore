@@ -1,0 +1,16 @@
+# Allowlist: deny everything by default, then re-include only the paths that
+# COPY statements in docker/Dockerfile actually reference.  This ensures that
+# TLS private keys, SQLite databases, bearer-token files, .git history,
+# virtualenvs, dev-data directories, and caches never enter the build context,
+# even if they are present in the working tree.
+*
+
+# --- what the Dockerfile needs (must match every COPY source exactly) ---
+!ffmpeg-pin.json
+!pyproject.toml
+!uv.lock
+!README.md
+!src
+!alembic.ini
+!alembic
+!docker

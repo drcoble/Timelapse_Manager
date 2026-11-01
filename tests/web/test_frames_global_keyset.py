@@ -151,3 +151,33 @@ def test_soft_delete_swap_has_no_label_in_single_project_grid(
     )
     assert resp.status_code == 200
     assert 'class="frame-tile-project"' not in resp.text
+
+
+# --- #226: the picker's "All Projects" option requests ``project_id=`` ----------
+
+
+def test_empty_project_id_is_the_all_projects_grid(admin_client: TestClient) -> None:
+    """``/frames?project_id=`` (the "All Projects" option) is not a 422."""
+    ids = _seed_two_projects()
+    bare = admin_client.get("/frames")
+    empty = admin_client.get("/frames?project_id=")
+    assert empty.status_code == 200
+    for fid in ids["A"] + ids["B"]:
+        assert f'id="frame-tile-{fid}"' in empty.text
+    assert "proj-alpha" in empty.text and "proj-bravo" in empty.text
+    assert empty.text.count("frame-tile-") == bare.text.count("frame-tile-")
+
+
+def test_blank_project_id_works_on_batch_and_since(admin_client: TestClient) -> None:
+    ids = _seed_two_projects()
+    newest = max(ids["A"] + ids["B"])
+    batch = admin_client.get(f"/frames/batch?project_id=&before={newest}")
+    assert batch.status_code == 200
+    assert f"frame-tile-{newest}" not in batch.text  # strictly older
+    since = admin_client.get("/frames/since?after=0&project_id=")
+    assert since.status_code == 200
+    assert since.json() == {"count": len(ids["A"] + ids["B"])}
+
+
+def test_a_non_numeric_project_id_is_still_rejected(admin_client: TestClient) -> None:
+    assert admin_client.get("/frames?project_id=abc").status_code == 422

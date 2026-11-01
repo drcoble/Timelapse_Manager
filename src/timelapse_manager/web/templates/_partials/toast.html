@@ -8,10 +8,10 @@
   <div class="toast-body">
     <div class="toast-message">{{ msg.message }}</div>
   </div>
+  {# Dismissed by htmx-errors.js's delegated .toast-close listener. #}
   <button
     class="toast-close"
-    aria-label="Dismiss notification"
-    onclick="this.closest('.toast').remove()">
+    aria-label="Dismiss notification">
     &#215;
   </button>
 </div>

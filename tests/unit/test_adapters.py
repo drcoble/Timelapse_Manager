@@ -15,20 +15,27 @@ No network, subprocess, or filesystem access.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 
+from timelapse_manager.api.cameras import _persist_device_geolocation
 from timelapse_manager.cameras.base import (
     AuthCaptureError,
+    GeoLocation,
+    GeolocationAccessDenied,
     OtherCaptureError,
     TimeoutCaptureError,
     UnreachableCaptureError,
     UnsupportedCodecCaptureError,
     ValidationFailure,
+    valid_coordinates,
 )
 from timelapse_manager.cameras.http_jpeg import classify_http_status, credentials_from
+from timelapse_manager.cameras.onvif import OnvifAdapter
 from timelapse_manager.cameras.rtsp import (
     RtspAdapter,
     build_ffmpeg_command,
@@ -37,8 +44,14 @@ from timelapse_manager.cameras.rtsp import (
 from timelapse_manager.cameras.vapix import (
     PARAM_PATH,
     SCENE_METADATA_SCHEMA_VERSION,
+    SCENE_PARAM_GROUP,
     SNAPSHOT_PATH,
+    STREAM_PROFILE_GROUP,
+    STREAM_PROFILE_MISSING,
+    STREAM_PROFILE_TIMED_OUT,
+    STREAM_PROFILE_UNREADABLE,
     VapixAdapter,
+    admin_read_host,
     build_snapshot_url,
     geolocation_from_params,
     geolocation_from_position_xml,
@@ -144,6 +157,24 @@ class TestBuildSnapshotUrl:
         url = build_snapshot_url("10.0.0.1/")
         assert "//" not in url.replace("http://", "")
 
+    @pytest.mark.parametrize(
+        ("address", "expected_prefix"),
+        [
+            ("user:pa55@10.0.0.1", "http://10.0.0.1/axis-cgi/"),
+            ("user:pa55@10.0.0.1:8080", "http://10.0.0.1:8080/axis-cgi/"),
+            ("http://user:pa55@10.0.0.1", "http://10.0.0.1/axis-cgi/"),
+            ("https://user:pa55@10.0.0.1", "https://10.0.0.1/axis-cgi/"),
+        ],
+    )
+    def test_userinfo_stripped_for_every_address_form(
+        self, address: str, expected_prefix: str
+    ) -> None:
+        """Credentials embedded in the address never survive into the URL (#68)."""
+        url = build_snapshot_url(address)
+        assert url.startswith(expected_prefix)
+        assert "pa55" not in url
+        assert "@" not in url
+
 
 class TestParseParamResponse:
     def test_parses_single_key_value(self) -> None:
@@ -208,6 +239,13 @@ class TestGeolocationFromParams:
         geo = geolocation_from_params(params)
         assert geo is not None
 
+    def test_unset_zero_params_are_none(self) -> None:
+        params = {
+            "root.Geolocation.Latitude": "0",
+            "root.Geolocation.Longitude": "0",
+        }
+        assert geolocation_from_params(params) is None
+
 
 _POSITION_XML_OK = (
     '<PositionResponse SchemaVersion="1.0"><Success><GetSuccess>'
@@ -264,6 +302,34 @@ class TestGeolocationFromPositionXml:
         )
         assert geolocation_from_position_xml(xml) is None
 
+    def test_unset_zero_position_without_flag_is_none(self) -> None:
+        """Axis reports 0/0 when nothing is set; that is not "Null Island"."""
+        xml = (
+            "<PositionResponse><Success><GetSuccess><Location>"
+            "<Lat>0</Lat><Lng>0.000000</Lng></Location>"
+            "</GetSuccess></Success></PositionResponse>"
+        )
+        assert geolocation_from_position_xml(xml) is None
+
+    def test_zero_position_is_none_even_when_flagged_valid(self) -> None:
+        xml = (
+            "<PositionResponse><Success><GetSuccess><Location>"
+            "<Lat>0.0</Lat><Lng>0.0</Lng></Location>"
+            "<ValidPosition>true</ValidPosition>"
+            "</GetSuccess></Success></PositionResponse>"
+        )
+        assert geolocation_from_position_xml(xml) is None
+
+    def test_one_zero_coordinate_is_a_real_position(self) -> None:
+        """Only the 0/0 pair is the unset default; the equator is real."""
+        xml = (
+            "<PositionResponse><Location><Lat>0.0</Lat>"
+            "<Lng>32.5</Lng></Location></PositionResponse>"
+        )
+        geo = geolocation_from_position_xml(xml)
+        assert geo is not None
+        assert geo.longitude == pytest.approx(32.5)
+
 
 class TestVapixGetGeolocation:
     """get_geolocation prefers the API and falls back to the legacy params."""
@@ -295,6 +361,224 @@ class TestVapixGetGeolocation:
         assert geo is not None
         assert geo.latitude == pytest.approx(1.5)
         assert geo.longitude == pytest.approx(2.5)
+
+    async def test_api_success_skips_param_group(self) -> None:
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        mock_get = AsyncMock(return_value=_POSITION_XML_OK.encode())
+        with patch("timelapse_manager.cameras.vapix.http_get_image", new=mock_get):
+            geo = await adapter.get_geolocation()
+        assert geo is not None
+        assert mock_get.await_count == 1
+
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_auth_refusal_raises_access_denied(self, status: int) -> None:
+        """An operator account refused by get.cgi, no legacy group -> denied."""
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        bodies: list[object] = [
+            AuthCaptureError(
+                f"authentication rejected ({status}) for "
+                "http://10.0.0.9/axis-cgi/geolocation/get.cgi"
+            ),
+            _LEGACY_GROUP_ERROR_BODY,
+        ]
+        with (
+            patch(
+                "timelapse_manager.cameras.vapix.http_get_image",
+                new=AsyncMock(side_effect=bodies),
+            ),
+            pytest.raises(GeolocationAccessDenied) as excinfo,
+        ):
+            await adapter.get_geolocation()
+        assert excinfo.value.protocol == "vapix"
+        assert excinfo.value.required_role == "Administrator"
+        assert excinfo.value.status == status
+
+    async def test_auth_refusal_with_legacy_location_returns_it(self) -> None:
+        """Very old firmware: get.cgi refused, but the param group has a fix."""
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        legacy = b"root.Geolocation.Latitude=1.5\nroot.Geolocation.Longitude=2.5\n"
+        bodies: list[object] = [
+            AuthCaptureError("authentication rejected (401) for http://10.0.0.9/x"),
+            legacy,
+        ]
+        with patch(
+            "timelapse_manager.cameras.vapix.http_get_image",
+            new=AsyncMock(side_effect=bodies),
+        ):
+            geo = await adapter.get_geolocation()
+        assert geo is not None
+        assert geo.latitude == pytest.approx(1.5)
+
+    async def test_api_absent_with_legacy_location_returns_it(self) -> None:
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        legacy = b"root.Geolocation.Latitude=1.5\nroot.Geolocation.Longitude=2.5\n"
+        bodies: list[object] = [
+            OtherCaptureError("unexpected status 404 from http://10.0.0.9/x"),
+            legacy,
+        ]
+        with patch(
+            "timelapse_manager.cameras.vapix.http_get_image",
+            new=AsyncMock(side_effect=bodies),
+        ):
+            geo = await adapter.get_geolocation()
+        assert geo is not None
+        assert geo.longitude == pytest.approx(2.5)
+
+    async def test_api_absent_and_no_legacy_group_is_none(self) -> None:
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        bodies: list[object] = [
+            OtherCaptureError("unexpected status 404 from http://10.0.0.9/x"),
+            _LEGACY_GROUP_ERROR_BODY,
+        ]
+        with patch(
+            "timelapse_manager.cameras.vapix.http_get_image",
+            new=AsyncMock(side_effect=bodies),
+        ):
+            assert await adapter.get_geolocation() is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UnreachableCaptureError("cannot reach http://10.0.0.9/x"),
+            TimeoutCaptureError("timed out requesting http://10.0.0.9/x"),
+        ],
+    )
+    async def test_unreachable_or_timeout_is_none_not_denied(
+        self, error: Exception
+    ) -> None:
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        with patch(
+            "timelapse_manager.cameras.vapix.http_get_image",
+            new=AsyncMock(side_effect=[error, error]),
+        ):
+            assert await adapter.get_geolocation() is None
+
+    async def test_denial_logged_at_info_without_credentials(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        adapter = VapixAdapter(
+            MagicMock(),
+            address="10.0.0.9",
+            credentials=("op-user-7f3a", "op-secret-9c1e"),
+        )
+        bodies: list[object] = [
+            AuthCaptureError(
+                "authentication rejected (401) for "
+                "http://10.0.0.9/axis-cgi/geolocation/get.cgi"
+            ),
+            _LEGACY_GROUP_ERROR_BODY,
+        ]
+        with (
+            caplog.at_level(logging.DEBUG, logger="timelapse_manager.cameras"),
+            patch(
+                "timelapse_manager.cameras.vapix.http_get_image",
+                new=AsyncMock(side_effect=bodies),
+            ),
+            pytest.raises(GeolocationAccessDenied) as excinfo,
+        ):
+            await adapter.get_geolocation()
+        denials = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "denied" in r.getMessage()
+        ]
+        assert len(denials) == 1
+        assert "Administrator" in denials[0].getMessage()
+        assert "401" in denials[0].getMessage()
+        for text in [r.getMessage() for r in caplog.records] + [str(excinfo.value)]:
+            assert "op-user-7f3a" not in text
+            assert "op-secret-9c1e" not in text
+
+
+class TestAdminReadHost:
+    """The admin read keys on exactly the host the adapter connects to (#68)."""
+
+    @pytest.mark.parametrize(
+        ("address", "host"),
+        [
+            ("10.0.0.9", "10.0.0.9"),
+            ("10.0.0.9:8080", "10.0.0.9"),
+            ("http://10.0.0.9", "10.0.0.9"),
+            ("https://Cam-A.Example.", "cam-a.example."),
+            ("http://[fe80::1]:80", "fe80::1"),
+            ("10.0.0.9/axis", "10.0.0.9"),
+        ],
+    )
+    def test_matches_the_base_url_host(self, address: str, host: str) -> None:
+        assert admin_read_host(address) == host
+        assert urlsplit(build_snapshot_url(address)).hostname == host
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "10.0.0.9?x=@10.0.0.1",
+            "10.0.0.9#@10.0.0.1",
+            "10.0.0.9\\@10.0.0.1",
+            "http://10.0.0.9\\.evil",
+            "user:pw@10.0.0.9",
+            "http://user:pw@10.0.0.9",
+            "a@b@10.0.0.9",
+            "http://10.0.0.9:notaport",
+            "http://",
+            "",
+        ],
+    )
+    def test_refuses_ambiguous_addresses(self, address: str) -> None:
+        with pytest.raises(ValueError):
+            admin_read_host(address)
+
+
+class TestVapixReadGeolocationApi:
+    """The strict get.cgi read the one-time admin lookup relies on (#68)."""
+
+    async def test_returns_location_on_2xx(self) -> None:
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        mock_get = AsyncMock(return_value=_POSITION_XML_OK.encode())
+        with patch("timelapse_manager.cameras.vapix.http_get_image", new=mock_get):
+            geo = await adapter.read_geolocation_api()
+        assert geo is not None
+        assert mock_get.await_count == 1
+
+    async def test_raises_instead_of_falling_back(self) -> None:
+        """No legacy param read and nothing swallowed: callers see the failure."""
+        adapter = VapixAdapter(MagicMock(), address="10.0.0.9")
+        mock_get = AsyncMock(side_effect=OtherCaptureError("unexpected status 404"))
+        with (
+            patch("timelapse_manager.cameras.vapix.http_get_image", new=mock_get),
+            pytest.raises(OtherCaptureError),
+        ):
+            await adapter.read_geolocation_api()
+        assert mock_get.await_count == 1
+
+    async def test_denial_log_never_carries_address_userinfo(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A scheme-less ``user:pass@host`` address is logged as the host only."""
+        adapter = VapixAdapter(MagicMock(), address="cam-user:cam-pw-8d2f@10.0.0.9")
+        with (
+            caplog.at_level(logging.INFO, logger="timelapse_manager.cameras"),
+            patch(
+                "timelapse_manager.cameras.vapix.http_get_image",
+                new=AsyncMock(
+                    side_effect=AuthCaptureError("authentication rejected (401)")
+                ),
+            ) as mock_get,
+            pytest.raises(AuthCaptureError),
+        ):
+            await adapter.read_geolocation_api()
+        assert mock_get.await_args.args[1] == (
+            "http://10.0.0.9/axis-cgi/geolocation/get.cgi"
+        )
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("http://10.0.0.9" in m for m in messages)
+        for message in messages:
+            assert "cam-pw-8d2f" not in message
+            assert "cam-user" not in message
+
+
+# Current Axis firmware answers the legacy Geolocation group with an error body
+# at HTTP 200 (the group does not exist there).
+_LEGACY_GROUP_ERROR_BODY = b'# Error: Error -1 getting param in group "Geolocation"\n'
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +658,7 @@ def _vapix_http_mock(
     into an empty result, which the collector treats as "no metadata".
     """
 
-    async def _side_effect(client, url, credentials, timeout):  # noqa: ANN001
+    async def _side_effect(client, url, credentials, timeout, **_kw):  # noqa: ANN001
         if PARAM_PATH in url:
             if param_response is None:
                 raise TimeoutCaptureError("simulated param read timeout")
@@ -385,13 +669,30 @@ def _vapix_http_mock(
 
 
 class TestVapixCaptureSceneMetadata:
-    async def test_capture_attaches_versioned_scene_envelope(self) -> None:
+    """Scene metadata is read by ``collect_scene_metadata``, not ``capture``.
+
+    ``capture()`` is bounded by the capture budget, so it fetches only the image
+    (#69 CAM-R2); the capture path asks for metadata afterwards.
+    """
+
+    async def test_capture_reads_no_scene_metadata(self) -> None:
         adapter = VapixAdapter(client=MagicMock(), address="192.0.2.10")
         mock = _vapix_http_mock(_FAKE_JPEG, _IMAGE_PARAM_RESPONSE)
         with patch("timelapse_manager.cameras.vapix.http_get_image", mock):
             frame = await adapter.capture()
 
-        meta = frame.scene_metadata
+        assert frame.scene_metadata is None
+        # Exactly one request: the snapshot. No parameter read inside capture().
+        assert mock.await_count == 1
+        assert PARAM_PATH not in mock.await_args.args[1]
+
+    async def test_collect_attaches_versioned_scene_envelope(self) -> None:
+        adapter = VapixAdapter(client=MagicMock(), address="192.0.2.10")
+        mock = _vapix_http_mock(_FAKE_JPEG, _IMAGE_PARAM_RESPONSE)
+        with patch("timelapse_manager.cameras.vapix.http_get_image", mock):
+            frame = await adapter.capture()
+            meta = await adapter.collect_scene_metadata(frame)
+
         assert meta is not None
         # Versioned envelope, non-vacuous: specific keys and values asserted.
         assert meta["schema_version"] == SCENE_METADATA_SCHEMA_VERSION
@@ -408,10 +709,11 @@ class TestVapixCaptureSceneMetadata:
         mock = _vapix_http_mock(_FAKE_JPEG, param_response=None)
         with patch("timelapse_manager.cameras.vapix.http_get_image", mock):
             frame = await adapter.capture()
+            meta = await adapter.collect_scene_metadata(frame)
 
         # The frame is still produced; metadata is simply absent.
         assert frame.image_bytes == _FAKE_JPEG
-        assert frame.scene_metadata is None
+        assert meta is None
 
     async def test_empty_scene_group_yields_no_metadata(self) -> None:
         adapter = VapixAdapter(client=MagicMock(), address="192.0.2.10")
@@ -421,9 +723,98 @@ class TestVapixCaptureSceneMetadata:
         mock = _vapix_http_mock(_FAKE_JPEG, param_response="")
         with patch("timelapse_manager.cameras.vapix.http_get_image", mock):
             frame = await adapter.capture()
+            meta = await adapter.collect_scene_metadata(frame)
 
         assert frame.image_bytes == _FAKE_JPEG
-        assert frame.scene_metadata is None
+        assert meta is None
+
+    async def test_collect_reads_the_scene_group(self) -> None:
+        adapter = VapixAdapter(client=MagicMock(), address="192.0.2.10")
+        mock = _vapix_http_mock(_FAKE_JPEG, _IMAGE_PARAM_RESPONSE)
+        with patch("timelapse_manager.cameras.vapix.http_get_image", mock):
+            frame = await adapter.capture()
+            await adapter.collect_scene_metadata(frame)
+
+        param_urls = [
+            c.args[1] for c in mock.await_args_list if PARAM_PATH in c.args[1]
+        ]
+        assert len(param_urls) == 1
+        assert f"group={SCENE_PARAM_GROUP}" in param_urls[0]
+
+
+class TestVapixStreamProfileDegradation:
+    """A selected stream profile that cannot be applied captures at the camera
+    default and says so on the frame (owner decision OD-2, #69 CAM-R2)."""
+
+    _PROFILES = (
+        "root.StreamProfile.S0.Name=Bandwidth\n"
+        "root.StreamProfile.S0.Parameters=resolution=640x480&compression=40\n"
+    )
+
+    def _get_image(self, urls: list[str]) -> AsyncMock:
+        async def _side_effect(client, url, credentials, timeout, **_kw):  # noqa: ANN001
+            urls.append(url)
+            return _FAKE_JPEG
+
+        return AsyncMock(side_effect=_side_effect)
+
+    async def _capture(self, adapter: VapixAdapter, read_params) -> tuple:  # noqa: ANN001
+        urls: list[str] = []
+        adapter._read_params = read_params  # type: ignore[method-assign]
+        with patch(
+            "timelapse_manager.cameras.vapix.http_get_image", self._get_image(urls)
+        ):
+            frame = await adapter.capture()
+        return frame, urls
+
+    async def test_applied_profile_has_no_note(self) -> None:
+        adapter = VapixAdapter(MagicMock(), "192.0.2.10", stream_id="Bandwidth")
+
+        async def read_params(group: str, *, timeout: float | None = None) -> dict:
+            from timelapse_manager.cameras.vapix import parse_param_response
+
+            assert group == STREAM_PROFILE_GROUP
+            return parse_param_response(self._PROFILES)
+
+        frame, urls = await self._capture(adapter, read_params)
+        assert frame.capture_notes == []
+        assert "resolution=640x480" in urls[0]
+
+    async def test_missing_profile_notes_and_uses_default(self) -> None:
+        adapter = VapixAdapter(MagicMock(), "192.0.2.10", stream_id="Deleted")
+
+        async def read_params(group: str, *, timeout: float | None = None) -> dict:
+            from timelapse_manager.cameras.vapix import parse_param_response
+
+            return parse_param_response(self._PROFILES)
+
+        frame, urls = await self._capture(adapter, read_params)
+        assert frame.capture_notes == [STREAM_PROFILE_MISSING]
+        assert "resolution=" not in urls[0]
+
+    async def test_unreadable_group_notes_and_uses_default(self) -> None:
+        adapter = VapixAdapter(MagicMock(), "192.0.2.10", stream_id="Bandwidth")
+        frame, urls = await self._capture(adapter, AsyncMock(return_value={}))
+        assert frame.capture_notes == [STREAM_PROFILE_UNREADABLE]
+        assert "resolution=" not in urls[0]
+
+    async def test_slow_profile_read_is_bounded_and_notes(self, monkeypatch) -> None:
+        import timelapse_manager.cameras.vapix as vapix_mod
+
+        monkeypatch.setattr(vapix_mod, "STREAM_PROFILE_TIMEOUT", 0.05)
+        adapter = VapixAdapter(MagicMock(), "192.0.2.10", stream_id="Bandwidth")
+
+        async def never(group: str, *, timeout: float | None = None) -> dict:
+            await asyncio.sleep(3600)
+            return {}
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        frame, urls = await self._capture(adapter, never)
+        assert loop.time() - started < 2.0
+        # The snapshot was still taken, at the camera default.
+        assert len(urls) == 1
+        assert frame.capture_notes == [STREAM_PROFILE_TIMED_OUT]
 
 
 class TestNonVapixCaptureHasNoSceneMetadata:
@@ -440,9 +831,12 @@ class TestNonVapixCaptureHasNoSceneMetadata:
             AsyncMock(return_value=_FAKE_JPEG),
         ):
             frame = await adapter.capture()
+            meta = await adapter.collect_scene_metadata(frame)
 
         assert frame.image_bytes == _FAKE_JPEG
         assert frame.scene_metadata is None
+        # The base-class default: no protocol-level scene settings.
+        assert meta is None
 
 
 # ---------------------------------------------------------------------------
@@ -631,3 +1025,113 @@ class TestCredentialsNotLogged:
             )
         log_text = caplog.text
         assert "super_secret_password" not in log_text
+
+
+# ---------------------------------------------------------------------------
+# WP-69-T (CAM-S6): device geolocation is range- and finite-checked
+# ---------------------------------------------------------------------------
+
+_BAD_COORDINATES = [
+    ("nan", "20.0"),
+    ("10.0", "nan"),
+    ("inf", "20.0"),
+    ("10.0", "-inf"),
+    ("200", "20.0"),
+    ("90.5", "20.0"),
+    ("10.0", "180.5"),
+    ("-91", "-181"),
+]
+
+
+class TestValidCoordinates:
+    @pytest.mark.parametrize(
+        ("lat", "lon"),
+        [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0), (34.12, -83.94)],
+    )
+    def test_accepts_real_positions(self, lat: float, lon: float) -> None:
+        assert valid_coordinates(lat, lon)
+
+    @pytest.mark.parametrize(("lat", "lon"), _BAD_COORDINATES)
+    def test_rejects_impossible_positions(self, lat: str, lon: str) -> None:
+        assert not valid_coordinates(float(lat), float(lon))
+
+
+class TestVapixGeolocationRange:
+    @pytest.mark.parametrize(("lat", "lon"), _BAD_COORDINATES)
+    def test_param_values_out_of_range_are_none(self, lat: str, lon: str) -> None:
+        params = {
+            "root.Geolocation.Latitude": lat,
+            "root.Geolocation.Longitude": lon,
+        }
+        assert geolocation_from_params(params) is None
+
+    @pytest.mark.parametrize(("lat", "lon"), _BAD_COORDINATES)
+    def test_position_xml_out_of_range_is_none(self, lat: str, lon: str) -> None:
+        xml = (
+            f"<PositionResponse><Location><Lat>{lat}</Lat>"
+            f"<Lng>{lon}</Lng></Location></PositionResponse>"
+        )
+        assert geolocation_from_position_xml(xml) is None
+
+
+def _onvif_geo_response(lat: str, lon: str) -> str:
+    return (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+        'xmlns:tt="http://www.onvif.org/ver10/schema">'
+        "<s:Body><tds:GetGeoLocationResponse>"
+        f'<tds:Location><tt:Location lat="{lat}" lon="{lon}" elevation="0"/>'
+        "</tds:Location>"
+        "</tds:GetGeoLocationResponse></s:Body></s:Envelope>"
+    )
+
+
+class TestOnvifGeolocationRange:
+    async def test_valid_position_is_returned(self) -> None:
+        adapter = OnvifAdapter(MagicMock(), address="192.0.2.20")
+        with patch.object(
+            adapter,
+            "_soap_call",
+            AsyncMock(return_value=_onvif_geo_response("34.12", "-83.94")),
+        ):
+            geo = await adapter.get_geolocation()
+        assert geo is not None
+        assert geo.latitude == pytest.approx(34.12)
+        assert geo.longitude == pytest.approx(-83.94)
+        assert geo.source == "camera"
+
+    @pytest.mark.parametrize(("lat", "lon"), _BAD_COORDINATES)
+    async def test_out_of_range_position_is_none(self, lat: str, lon: str) -> None:
+        adapter = OnvifAdapter(MagicMock(), address="192.0.2.20")
+        with patch.object(
+            adapter, "_soap_call", AsyncMock(return_value=_onvif_geo_response(lat, lon))
+        ):
+            assert await adapter.get_geolocation() is None
+
+
+class TestPersistDeviceGeolocationRange:
+    @pytest.mark.parametrize(
+        ("lat", "lon"),
+        [(float("nan"), 20.0), (10.0, float("inf")), (200.0, 20.0), (10.0, -181.0)],
+    )
+    def test_invalid_value_is_skipped(self, lat: float, lon: float) -> None:
+        context = MagicMock()
+        with patch("timelapse_manager.api.cameras.get_context", return_value=context):
+            _persist_device_geolocation(
+                1, GeoLocation(latitude=lat, longitude=lon, source="camera")
+            )
+        context.session_factory.assert_not_called()
+
+    def test_valid_value_is_stored(self) -> None:
+        context = MagicMock()
+        session = context.session_factory.return_value.__enter__.return_value
+        camera = MagicMock(geolocation_source=None)
+        session.get.return_value = camera
+        with patch("timelapse_manager.api.cameras.get_context", return_value=context):
+            _persist_device_geolocation(
+                1, GeoLocation(latitude=34.12, longitude=-83.94, source="camera")
+            )
+        assert camera.geolocation_latitude == pytest.approx(34.12)
+        assert camera.geolocation_longitude == pytest.approx(-83.94)
+        assert camera.geolocation_source == "camera"
+        session.commit.assert_called_once()

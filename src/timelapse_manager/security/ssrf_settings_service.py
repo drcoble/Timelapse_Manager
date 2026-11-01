@@ -56,8 +56,8 @@ def normalise_subnets(entries: Iterable[str]) -> tuple[list[str], list[str]]:
 
     Returns ``(normalised, invalid)``. Each accepted entry is parsed with
     :func:`ipaddress.ip_network` in non-strict mode -- so a bare host such as
-    ``10.1.16.30`` becomes ``10.1.16.30/32`` and ``10.1.16.30/24`` is canonicalised
-    to its network ``10.1.16.0/24`` -- using the *same* parser the guard applies
+    ``10.0.16.30`` becomes ``10.0.16.30/32`` and ``10.0.16.30/24`` is canonicalised
+    to its network ``10.0.16.0/24`` -- using the *same* parser the guard applies
     when matching, so the page never accepts an entry the guard would silently
     drop. Blank lines are ignored; duplicates collapse; order is preserved. Any
     entry that does not parse is returned verbatim in ``invalid`` so the caller can

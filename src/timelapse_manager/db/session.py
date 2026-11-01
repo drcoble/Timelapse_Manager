@@ -11,14 +11,28 @@ Wiring for the request dependency
 once at application startup via :func:`set_session_factory`. The application's
 startup code is expected to build the engine, create a factory with
 :func:`create_session_factory`, and call :func:`set_session_factory` before any
-request is served. Requests then depend on :func:`get_session` directly.
+request is served. Requests depend on it through :data:`DbSessionDep`.
+
+Commit before the response (issue #3)
+-------------------------------------
+Since FastAPI 0.118 the exit code of a ``yield`` dependency runs *after* the
+response has been sent by default. For ``get_session`` that meant the commit
+landed after a ``303`` had already reached the client, so an immediate follow-up
+request (the browser following the redirect after login) read the database
+before the new session row existed and got a ``401``. :data:`DbSessionDep`
+declares the dependency with ``scope="function"`` so the commit (or rollback)
+runs when the endpoint returns, before the response starts. Every route must use
+the same alias: a mix of scopes would be two dependency-cache keys, i.e. two
+sessions in one request.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Annotated
 
+from fastapi import Depends
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -82,3 +96,8 @@ def get_session() -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+#: The request-session dependency every route and auth dependency uses. Function
+#: scope makes the commit happen before the response is sent (see module docs).
+DbSessionDep = Annotated[Session, Depends(get_session, scope="function")]

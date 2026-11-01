@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block title %}Report filed — Timelapse Manager{% endblock %}
+{% block page_title_short %}Report a problem{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div class="page-title">
+    <h1>Report filed</h1>
+  </div>
+</div>
+
+<div class="card" style="max-width:640px;">
+  <div class="card-body" style="padding:var(--sp-6);">
+    {% set in_page = true %}
+    {% include '_partials/report_result.html' %}
+  </div>
+</div>
+
+{% endblock %}

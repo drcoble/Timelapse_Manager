@@ -35,7 +35,6 @@ from timelapse_manager.cameras.onvif import OnvifAdapter, parse_profiles
 from timelapse_manager.cameras.registry import build_adapter
 from timelapse_manager.cameras.rtsp import RtspAdapter
 from timelapse_manager.cameras.vapix import (
-    SCENE_PARAM_GROUP,
     SNAPSHOT_PATH,
     STREAM_PROFILE_GROUP,
     VapixAdapter,
@@ -301,7 +300,7 @@ class TestStreamIdHonouredByCapture:
         captured_urls: list[str] = []
 
         async def _record_get_image(
-            client: object, url: str, creds: object, timeout: float
+            client: object, url: str, creds: object, timeout: float, **_: object
         ) -> bytes:
             captured_urls.append(url)
             return b"\xff\xd8\xff\xe0jpeg"
@@ -341,7 +340,7 @@ class TestStreamIdHonouredByCapture:
         captured_urls: list[str] = []
 
         async def _record_get_image(
-            client: object, url: str, creds: object, timeout: float
+            client: object, url: str, creds: object, timeout: float, **_: object
         ) -> bytes:
             captured_urls.append(url)
             return b"\xff\xd8\xff\xe0jpeg"
@@ -373,16 +372,16 @@ class TestStreamIdNoneRegression:
     ) -> None:
         """With stream_id=None the snapshot is taken from the camera default: the
         StreamProfile-resolution path is skipped (no stream knobs on the URL) and
-        exactly one snapshot GET is made. The only param read is the best-effort
-        scene-metadata read, which targets the scene group -- never the
-        StreamProfile group."""
+        exactly one snapshot GET is made. capture() makes no parameter read at
+        all: the scene-metadata read runs after capture, outside the capture
+        budget (#69 CAM-R2)."""
         cam = _camera()
         adapter = build_adapter(cam, MagicMock(), stream_id=None)
 
         captured_urls: list[str] = []
 
         async def _record_get_image(
-            client: object, url: str, creds: object, timeout: float
+            client: object, url: str, creds: object, timeout: float, **_: object
         ) -> bytes:
             captured_urls.append(url)
             return b"\xff\xd8\xff\xe0jpeg"
@@ -396,12 +395,9 @@ class TestStreamIdNoneRegression:
             adapter._read_params = read_params  # type: ignore[method-assign]
             await adapter.capture()
 
-        # The only param read is the scene-metadata read; the StreamProfile group
-        # (resolution selection) is never touched on the default path.
-        read_params.assert_called_once()
-        scene_group = read_params.call_args.args[0]
-        assert scene_group == SCENE_PARAM_GROUP
-        assert scene_group != STREAM_PROFILE_GROUP
+        # No param read inside capture(): neither the StreamProfile group (the
+        # default path selects no profile) nor the scene group (read later).
+        read_params.assert_not_called()
         # Exactly one snapshot GET, with no stream-profile knobs on the URL.
         assert len(captured_urls) == 1
         assert "resolution=" not in captured_urls[0]

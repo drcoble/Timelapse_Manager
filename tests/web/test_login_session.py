@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from tests.conftest import csrf_of, login, seed_admin
+from tests.presession_support import session_cookie, session_set_cookie
 from timelapse_manager.db.session import session_scope
 from timelapse_manager.runtime import get_context
 from timelapse_manager.security.sessions import get_session_row
@@ -20,7 +21,7 @@ class TestLoginCookieFlags:
             follow_redirects=False,
         )
         assert resp.status_code == 303
-        assert "tlm_session" in resp.headers.get("set-cookie", "")
+        assert "tlm_session" in session_set_cookie(resp)
 
     def test_session_cookie_is_httponly(self, web_client: TestClient) -> None:
         seed_admin(web_client)
@@ -30,7 +31,7 @@ class TestLoginCookieFlags:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "")
+        set_cookie = session_set_cookie(resp)
         assert "HttpOnly" in set_cookie
 
     def test_session_cookie_is_secure_over_https(self, web_client: TestClient) -> None:
@@ -42,7 +43,7 @@ class TestLoginCookieFlags:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "")
+        set_cookie = session_set_cookie(resp)
         assert "Secure" in set_cookie
 
     def test_session_cookie_has_samesite_lax(self, web_client: TestClient) -> None:
@@ -53,7 +54,7 @@ class TestLoginCookieFlags:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "").lower()
+        set_cookie = session_set_cookie(resp).lower()
         assert "samesite=lax" in set_cookie
 
     def test_session_cookie_not_secure_over_http(
@@ -71,7 +72,7 @@ class TestLoginCookieFlags:
             },
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "")
+        set_cookie = session_set_cookie(resp)
         assert "Secure" not in set_cookie
 
 
@@ -142,10 +143,9 @@ class TestSessionRotation:
     def test_session_token_changes_on_login(self, web_client: TestClient) -> None:
         """Session is rotated on login: the old token (if any) is revoked."""
         seed_admin(web_client)
-        cookie_name = get_context().settings.session.cookie_name
         # First login.
         login(web_client)
-        token_before = web_client.cookies.get(cookie_name)
+        token_before = session_cookie(web_client)
         # Force a second login (log out then back in).
         csrf = csrf_of(web_client, "/")
         web_client.post(
@@ -155,7 +155,7 @@ class TestSessionRotation:
             follow_redirects=False,
         )
         login(web_client)
-        token_after = web_client.cookies.get(cookie_name)
+        token_after = session_cookie(web_client)
         assert token_before != token_after
 
 
@@ -181,8 +181,7 @@ class TestLogout:
         assert get_resp.headers["location"].startswith("/login")
 
     def test_old_token_is_invalid_after_logout(self, admin_client: TestClient) -> None:
-        cookie_name = get_context().settings.session.cookie_name
-        old_token = admin_client.cookies.get(cookie_name)
+        old_token = session_cookie(admin_client)
         csrf = csrf_of(admin_client, "/")
         admin_client.post(
             "/logout",
@@ -208,7 +207,7 @@ class TestRememberMe:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "").lower()
+        set_cookie = session_set_cookie(resp).lower()
         # Session cookie: no Max-Age or Expires.
         assert "max-age" not in set_cookie
 
@@ -224,14 +223,22 @@ class TestRememberMe:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "").lower()
+        set_cookie = session_set_cookie(resp).lower()
         assert "max-age" in set_cookie
 
 
 class TestXForwardedProto:
-    def test_x_forwarded_proto_https_sets_secure_cookie(
+    def test_x_forwarded_proto_is_ignored_from_untrusted_peer(
         self, web_client_no_redirect: TestClient
     ) -> None:
+        """An untrusted client cannot forge HTTPS via ``X-Forwarded-Proto``.
+
+        With no reverse proxy configured (``trusted_proxies`` empty, the
+        default), the forwarded header is not believed, so the connection's own
+        plaintext scheme stands and the session cookie is NOT marked ``Secure``.
+        Honouring the header only when the peer is a configured trusted proxy is
+        covered by the request-scheme resolver's unit tests.
+        """
         seed_admin(web_client_no_redirect)
         resp = web_client_no_redirect.post(
             "/login",
@@ -242,8 +249,8 @@ class TestXForwardedProto:
             },
             follow_redirects=False,
         )
-        set_cookie = resp.headers.get("set-cookie", "")
-        assert "Secure" in set_cookie
+        set_cookie = session_set_cookie(resp)
+        assert "Secure" not in set_cookie
 
 
 class TestLoginThrottleIntegration:
@@ -263,7 +270,6 @@ class TestLoginThrottleIntegration:
     ) -> None:
         seed_admin(web_client)
         ctx = get_context()
-        cookie_name = ctx.settings.session.cookie_name
         max_failures = ctx.settings.auth.throttle_max_failures
 
         # Exhaust the failure budget from this source with wrong passwords.
@@ -275,4 +281,4 @@ class TestLoginThrottleIntegration:
         # the lockout fires at the web layer before authentication is attempted.
         resp = self._attempt(web_client, "AdminP@ssw0rd1234")
         assert resp.status_code == 401
-        assert web_client.cookies.get(cookie_name) is None  # no session established
+        assert session_cookie(web_client) is None  # no session established

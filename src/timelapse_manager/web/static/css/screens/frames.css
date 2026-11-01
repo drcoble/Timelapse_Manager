@@ -41,12 +41,31 @@
   border-radius: var(--radius-md);
   overflow: hidden;
   cursor: pointer;
+  position: relative;
   transition: border-color var(--transition-fast);
+}
+/* Skip layout and paint for off-screen tiles: a 600-tile grid otherwise lays
+   out every tile on each change. The intrinsic height is a placeholder that the
+   browser replaces with the real one once rendered ("auto"). */
+.frame-tile {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
 }
 .frame-tile:hover { border-color: var(--color-accent); }
 
-/* Positioning context for the overlaid select control (frames-selection-bar.css). */
-.frame-tile-thumb-wrap { position: relative; }
+/* The whole card opens the drawer (#315): the thumbnail link is stretched over
+   the tile by its ::after, so the tile (not the thumb wrap) is the positioning
+   context, for the overlay and for the select control (frames-selection-bar.css).
+   Controls that keep their own action sit above the overlay (z-index 1). */
+.frame-tile .frame-thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.frame-tile .frame-thumb:focus-visible::after {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
 .frame-tile.soft-deleted {
   opacity: 0.5;
   border: 1px dashed var(--color-error);
@@ -71,6 +90,8 @@
 }
 
 .frame-tile-actions {
+  position: relative;
+  z-index: 1;
   display: flex;
   gap: var(--sp-1);
   padding: var(--sp-1) var(--sp-2) var(--sp-2);
@@ -362,3 +383,10 @@
 .drawer-selection-bridge-act {
   flex: none;
 }
+
+/* Import disclosure: suppress the native triangle on the <summary> that renders
+   as a button. list-style:none covers standard engines; ::-webkit-details-marker
+   covers older WebKit. (Moved from an inline <style> in frames_import_form.html
+   so the page needs no inline style block.) */
+.frames-import-disclosure > summary { list-style: none; }
+.frames-import-disclosure > summary::-webkit-details-marker { display: none; }

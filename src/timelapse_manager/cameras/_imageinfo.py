@@ -14,8 +14,9 @@ capture loop on an odd frame.
 
 from __future__ import annotations
 
+import re
 import struct
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 # JPEG Start-Of-Frame markers whose payload begins with precision then the
 # 16-bit height and width. Excludes 0xC4 (DHT), 0xC8 (JPG), 0xCC (DAC), which
@@ -42,6 +43,16 @@ _SOF_MARKERS = frozenset(
 _STANDALONE_MARKERS = frozenset({0xD8, 0xD9} | set(range(0xD0, 0xD8)))
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+class ImageTooLargeError(ValueError):
+    """An image header declares a pixel dimension beyond the allowed ceiling.
+
+    Raised by :func:`read_dimensions_bounded` so a rogue or malfunctioning camera
+    that reports an enormous width/height is refused *before* any decode allocates
+    a multi-gigabyte pixel buffer. A plain :class:`ValueError`, since the image
+    data itself is what is out of range.
+    """
 
 
 def detect_format(data: bytes) -> str | None:
@@ -115,11 +126,86 @@ def read_dimensions(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+# A JPEG must end with the End-Of-Image marker. Some encoders pad a few bytes
+# after it, so it is looked for within this many trailing bytes, not only at
+# the very end.
+_JPEG_EOI = b"\xff\xd9"
+JPEG_EOI_WINDOW = 16
+
+
+def has_jpeg_eoi(data: bytes) -> bool:
+    """Return whether a JPEG body carries its End-Of-Image marker (``FFD9``).
+
+    Looks within the last :data:`JPEG_EOI_WINDOW` bytes so trailing padding is
+    tolerated. A body cut off in transfer (a dropped connection, a short read)
+    has no EOI there. Never raises.
+    """
+    return _JPEG_EOI in data[-JPEG_EOI_WINDOW:]
+
+
+def frame_integrity_problem(
+    data: bytes, fmt: str | None, dimensions: tuple[int, int] | None
+) -> str | None:
+    """Return why a captured image is unusable, or ``None`` if it looks whole.
+
+    A frame is rejected when its dimensions could not be read, when either axis
+    is zero, or when a JPEG has no End-Of-Image marker (a truncated body). The
+    result is a short reason for an error message. Pure; never raises.
+    """
+    if dimensions is None:
+        return "no readable dimensions"
+    width, height = dimensions
+    if width <= 0 or height <= 0:
+        return f"zero dimension {width}x{height}"
+    if fmt == "jpeg" and not has_jpeg_eoi(data):
+        return "JPEG end-of-image marker missing"
+    return None
+
+
+def read_dimensions_bounded(
+    data: bytes, max_dimension_px: int
+) -> tuple[int, int] | None:
+    """Return ``(width, height)`` like :func:`read_dimensions`, but reject giants.
+
+    Reads the dimensions from the image header and, when either the width or the
+    height exceeds ``max_dimension_px``, raises :class:`ImageTooLargeError` instead
+    of returning them. This is the gate to call before a decode or thumbnail step:
+    the header is cheap to parse, so a dimension bomb is refused before any
+    full-resolution pixel buffer is allocated.
+
+    Unreadable or unrecognised input still yields ``None`` (the header could not be
+    parsed, so there is nothing to bound) -- only a header that positively declares
+    an over-ceiling dimension raises.
+    """
+    dimensions = read_dimensions(data)
+    if dimensions is None:
+        return None
+    width, height = dimensions
+    if width > max_dimension_px or height > max_dimension_px:
+        raise ImageTooLargeError(
+            f"image dimensions {width}x{height} exceed the {max_dimension_px}px ceiling"
+        )
+    return dimensions
+
+
 # TIFF/Exif tag numbers and field type used by the capture-timestamp reader.
 _TAG_DATETIME = 0x0132  # IFD0 DateTime (fallback)
 _TAG_EXIF_IFD_POINTER = 0x8769  # IFD0 -> offset of the Exif sub-IFD
 _TAG_DATETIME_ORIGINAL = 0x9003  # Exif sub-IFD DateTimeOriginal (preferred)
+_TAG_OFFSET_TIME = 0x9010  # Exif sub-IFD OffsetTime (zone of DateTime)
+_TAG_OFFSET_TIME_ORIGINAL = 0x9011  # Exif sub-IFD OffsetTimeOriginal
+_DATETIME_TAGS = (
+    _TAG_DATETIME,
+    _TAG_DATETIME_ORIGINAL,
+    _TAG_OFFSET_TIME,
+    _TAG_OFFSET_TIME_ORIGINAL,
+)
 _EXIF_DATETIME_FORMAT = "%Y:%m:%d %H:%M:%S"  # "YYYY:MM:DD HH:MM:SS"
+# Exif offset text: a sign, two-digit hours and minutes ("+02:00"). The range is
+# limited to the real-world offsets (-12:00 .. +14:00).
+_EXIF_OFFSET_PATTERN = re.compile(r"^([+-])(\d{2}):(\d{2})$")
+_MAX_OFFSET_MINUTES_EAST = 14 * 60
+_MAX_OFFSET_MINUTES_WEST = 12 * 60
 
 
 def _find_exif_segment(data: bytes) -> bytes | None:
@@ -186,17 +272,45 @@ def _read_ifd_datetime_tags(
         if tag == _TAG_EXIF_IFD_POINTER and field_type == 4:  # LONG
             (exif_ifd_offset,) = struct.unpack(byte_order + "I", value_field)
             continue
-        if tag in (_TAG_DATETIME, _TAG_DATETIME_ORIGINAL) and field_type == 2:  # ASCII
-            # ASCII values longer than 4 bytes are stored at an offset.
-            (value_offset,) = struct.unpack(byte_order + "I", value_field)
-            raw = tiff[value_offset : value_offset + count]
+        if tag in _DATETIME_TAGS and field_type == 2:  # ASCII
+            # ASCII values longer than 4 bytes are stored at an offset; shorter
+            # ones sit inline in the entry's value field.
+            if count > 4:
+                (value_offset,) = struct.unpack(byte_order + "I", value_field)
+                raw = tiff[value_offset : value_offset + count]
+            else:
+                raw = value_field[:count]
             text = raw.split(b"\x00", 1)[0].decode("ascii", "strict")
             found[tag] = text
     return found, exif_ifd_offset
 
 
+def _parse_exif_offset(text: str | None) -> timezone | None:
+    """Return the fixed zone for an Exif offset string such as ``"+02:00"``.
+
+    Anything else -- missing, blank (cameras write spaces when the zone is
+    unknown), malformed or out of the real-world range -- yields None, so the
+    caller treats the time as having no zone.
+    """
+    if text is None:
+        return None
+    match = _EXIF_OFFSET_PATTERN.match(text.strip())
+    if match is None:
+        return None
+    minutes = int(match.group(2)) * 60 + int(match.group(3))
+    if int(match.group(3)) > 59:
+        return None
+    if match.group(1) == "-":
+        if minutes > _MAX_OFFSET_MINUTES_WEST:
+            return None
+        minutes = -minutes
+    elif minutes > _MAX_OFFSET_MINUTES_EAST:
+        return None
+    return timezone(timedelta(minutes=minutes))
+
+
 def read_capture_timestamp(data: bytes) -> datetime | None:
-    """Return the JPEG Exif capture time as a naive datetime, or None.
+    """Return the JPEG Exif capture time, or None.
 
     Reads the embedded TIFF structure of the JPEG APP1/Exif segment without any
     image-library dependency, mirroring this module's hand-parsed,
@@ -204,11 +318,14 @@ def read_capture_timestamp(data: bytes) -> datetime | None:
     sub-IFD) is preferred; tag ``0x0132`` (``DateTime``, in IFD0) is the
     fallback. Both TIFF byte orders are handled.
 
-    The returned value is **naive** (no tzinfo): Exif stores a local wall-clock
-    time with no zone, and the column convention treats naive timestamps as UTC.
-    The value is therefore best-effort and is surfaced to the user as editable; a
-    missing or unreadable timestamp yields None so the caller can fall back to a
-    supplied time. Never raises -- any malformed input returns None.
+    Exif stores a local wall-clock time. When the image also carries a valid
+    UTC offset -- ``OffsetTimeOriginal`` (``0x9011``) for ``DateTimeOriginal``,
+    else ``OffsetTime`` (``0x9010``) -- the result is **timezone-aware** at that
+    fixed offset. Without one it is **naive** (no tzinfo): the caller decides
+    which zone the wall-clock time was in (the column convention treats a naive
+    value as UTC). A missing or unreadable timestamp yields None so the caller
+    can fall back to a supplied time. Never raises -- any malformed input
+    returns None.
     """
     try:
         if detect_format(data) != "jpeg":
@@ -231,14 +348,21 @@ def read_capture_timestamp(data: bytes) -> datetime | None:
         ifd0_tags, exif_ifd_offset = _read_ifd_datetime_tags(
             tiff, ifd0_offset, byte_order
         )
+        exif_tags: dict[int, str] = {}
         text: str | None = None
+        offset_text: str | None = None
         if exif_ifd_offset is not None:
             exif_tags, _ = _read_ifd_datetime_tags(tiff, exif_ifd_offset, byte_order)
             text = exif_tags.get(_TAG_DATETIME_ORIGINAL)
+            offset_text = exif_tags.get(_TAG_OFFSET_TIME_ORIGINAL)
         if text is None:
             text = ifd0_tags.get(_TAG_DATETIME)
         if text is None:
             return None
-        return datetime.strptime(text, _EXIF_DATETIME_FORMAT)
+        if offset_text is None:
+            offset_text = exif_tags.get(_TAG_OFFSET_TIME)
+        parsed = datetime.strptime(text, _EXIF_DATETIME_FORMAT)
+        zone = _parse_exif_offset(offset_text)
+        return parsed if zone is None else parsed.replace(tzinfo=zone)
     except (struct.error, ValueError, IndexError, UnicodeDecodeError):
         return None

@@ -24,14 +24,17 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from timelapse_manager.cameras.autoquery import QueryResult, query_camera
 from timelapse_manager.cameras.base import (
     GeoLocation,
+    GeolocationAccessDenied,
     ValidationFailure,
     ValidationResult,
 )
+from timelapse_manager.cameras.clients import allow_uncontained_double
 from timelapse_manager.cameras.probing import (
     Confidence,
     DetectionOutcome,
@@ -77,8 +80,8 @@ class TestHostnameFromParams:
     """The Axis Network.HostName param-group parser."""
 
     def test_extracts_hostname_with_root_prefix(self) -> None:
-        params = {"root.Network.HostName": "front-door-cam"}
-        assert hostname_from_params(params) == "front-door-cam"
+        params = {"root.Network.HostName": "porch-cam"}
+        assert hostname_from_params(params) == "porch-cam"
 
     def test_extracts_hostname_without_root_prefix(self) -> None:
         params = {"Network.HostName": "garage-cam"}
@@ -204,12 +207,16 @@ class TestQueryCameraProtocolOnly:
 
     async def test_best_effort_protocol_flags_masked_auth_rejection(self) -> None:
         # Wrong credentials must not be masked by an open connection-only port:
-        # rtsp responds, but vapix rejects the credentials -> auth_rejected True
+        # rtsp responds, but vapix rejected the credentials -> auth_rejected True
         # while the responding protocol is still offered (error_protocol stays None).
-        outcome = _outcome(recommended="rtsp", vapix=False, onvif=False, rtsp=True)
-        auth = ValidationResult(ok=False, reason=ValidationFailure.AUTH, message="401")
-        unreachable = ValidationResult(
-            ok=False, reason=ValidationFailure.UNREACHABLE, message="no route"
+        # The reason comes from the probe's own candidate: nothing re-probes.
+        outcome = DetectionOutcome(
+            candidates=[
+                _candidate("vapix", False, reason=ValidationFailure.AUTH),
+                _candidate("onvif", False, reason=ValidationFailure.UNREACHABLE),
+                _candidate("rtsp", True),
+            ],
+            recommended_primary="rtsp",
         )
         with (
             patch(
@@ -219,12 +226,6 @@ class TestQueryCameraProtocolOnly:
             patch(f"{_AUTOQUERY}.VapixAdapter") as vapix_cls,
             patch(f"{_AUTOQUERY}.OnvifAdapter") as onvif_cls,
         ):
-            vapix_cls.return_value.validate_connection = AsyncMock(return_value=auth)
-            vapix_cls.return_value.close = AsyncMock(return_value=None)
-            onvif_cls.return_value.validate_connection = AsyncMock(
-                return_value=unreachable
-            )
-            onvif_cls.return_value.close = AsyncMock(return_value=None)
             result = await query_camera(
                 address=_ADDRESS, credentials=None, http_client=MagicMock()
             )
@@ -234,6 +235,9 @@ class TestQueryCameraProtocolOnly:
         assert result.auth_rejected is True
         assert result.error_geo == "no_location"
         assert result.error_hostname == "no_hostname"
+        # No second round of logins against the camera (#69 CAM-P5).
+        vapix_cls.assert_not_called()
+        onvif_cls.assert_not_called()
 
 
 class TestQueryCameraNoMetadataPartial:
@@ -302,17 +306,46 @@ class TestQueryCameraNoMetadataPartial:
         assert result.discovered_hostname is None
         assert result.error_hostname == "no_hostname"
 
+    async def test_geo_access_denied_keeps_hostname(self) -> None:
+        """A refused geo read reports access_denied and never sinks the hostname."""
+        outcome = _outcome(recommended="vapix", vapix=True)
+        adapter = _mock_metadata_adapter(geo=None, hostname="driveway-1")
+        adapter.get_geolocation = AsyncMock(
+            side_effect=GeolocationAccessDenied("vapix", "Administrator", 401)
+        )
+        with (
+            patch(
+                f"{_AUTOQUERY}.detect_protocols",
+                new=AsyncMock(return_value=outcome),
+            ),
+            patch(f"{_AUTOQUERY}._build_metadata_adapter", return_value=adapter),
+        ):
+            result = await query_camera(
+                address=_ADDRESS, credentials=None, http_client=MagicMock()
+            )
+        assert result.error_geo == "access_denied"
+        assert result.geo_required_role == "Administrator"
+        assert result.fetched_lat is None
+        assert result.fetched_lon is None
+        assert result.discovered_hostname == "driveway-1"
+        assert result.error_hostname is None
+        adapter.close.assert_awaited_once()
+
 
 class TestQueryCameraNothingResponds:
     """No protocol responds: classify the failure, metadata unavailable."""
 
-    async def test_unreachable_classification(self) -> None:
-        outcome = _outcome(
-            recommended=None, vapix=False, onvif=False, rtsp=False, http=False
-        )
-        # Both classifier adapters report a plain unreachable.
-        unreachable = ValidationResult(
-            ok=False, reason=ValidationFailure.UNREACHABLE, message="no route"
+    @staticmethod
+    async def _query(**reasons: ValidationFailure | None) -> QueryResult:
+        """Query with nothing responding; each auth-capable probe's reason."""
+        outcome = DetectionOutcome(
+            candidates=[
+                _candidate("vapix", False, reason=reasons.get("vapix")),
+                _candidate("onvif", False, reason=reasons.get("onvif")),
+                _candidate("rtsp", False, reason=ValidationFailure.UNREACHABLE),
+                _candidate("http", False, reason=ValidationFailure.AUTH),
+            ],
+            recommended_primary=None,
         )
         with (
             patch(
@@ -322,13 +355,17 @@ class TestQueryCameraNothingResponds:
             patch(f"{_AUTOQUERY}.VapixAdapter") as vapix_cls,
             patch(f"{_AUTOQUERY}.OnvifAdapter") as onvif_cls,
         ):
-            for cls in (vapix_cls, onvif_cls):
-                instance = cls.return_value
-                instance.validate_connection = AsyncMock(return_value=unreachable)
-                instance.close = AsyncMock(return_value=None)
             result = await query_camera(
                 address=_ADDRESS, credentials=None, http_client=MagicMock()
             )
+        vapix_cls.assert_not_called()
+        onvif_cls.assert_not_called()
+        return result
+
+    async def test_unreachable_classification(self) -> None:
+        result = await self._query(
+            vapix=ValidationFailure.UNREACHABLE, onvif=ValidationFailure.UNREACHABLE
+        )
         assert result.ok_count == 0
         assert result.recommended_primary is None
         assert result.error_protocol == "unreachable"
@@ -338,53 +375,25 @@ class TestQueryCameraNothingResponds:
         assert result.fetched_lat is None
 
     async def test_auth_failed_classification(self) -> None:
-        outcome = _outcome(recommended=None, vapix=False, onvif=False)
-        auth = ValidationResult(ok=False, reason=ValidationFailure.AUTH, message="401")
-        unreachable = ValidationResult(
-            ok=False, reason=ValidationFailure.UNREACHABLE, message="no route"
+        # An AUTH on either truly-detected protocol wins over unreachable.
+        result = await self._query(
+            vapix=ValidationFailure.AUTH, onvif=ValidationFailure.UNREACHABLE
         )
-        with (
-            patch(
-                f"{_AUTOQUERY}.detect_protocols",
-                new=AsyncMock(return_value=outcome),
-            ),
-            patch(f"{_AUTOQUERY}.VapixAdapter") as vapix_cls,
-            patch(f"{_AUTOQUERY}.OnvifAdapter") as onvif_cls,
-        ):
-            # An AUTH on either truly-detected protocol wins over unreachable.
-            vapix_cls.return_value.validate_connection = AsyncMock(return_value=auth)
-            vapix_cls.return_value.close = AsyncMock(return_value=None)
-            onvif_cls.return_value.validate_connection = AsyncMock(
-                return_value=unreachable
-            )
-            onvif_cls.return_value.close = AsyncMock(return_value=None)
-            result = await query_camera(
-                address=_ADDRESS, credentials=None, http_client=MagicMock()
-            )
         assert result.error_protocol == "auth_failed"
         assert result.error_geo == "unreachable"
         assert result.error_hostname == "no_hostname"
 
     async def test_timeout_classification(self) -> None:
-        outcome = _outcome(recommended=None, vapix=False, onvif=False)
-        timeout = ValidationResult(
-            ok=False, reason=ValidationFailure.TIMEOUT, message="timed out"
+        result = await self._query(
+            vapix=ValidationFailure.TIMEOUT, onvif=ValidationFailure.TIMEOUT
         )
-        with (
-            patch(
-                f"{_AUTOQUERY}.detect_protocols",
-                new=AsyncMock(return_value=outcome),
-            ),
-            patch(f"{_AUTOQUERY}.VapixAdapter") as vapix_cls,
-            patch(f"{_AUTOQUERY}.OnvifAdapter") as onvif_cls,
-        ):
-            for cls in (vapix_cls, onvif_cls):
-                cls.return_value.validate_connection = AsyncMock(return_value=timeout)
-                cls.return_value.close = AsyncMock(return_value=None)
-            result = await query_camera(
-                address=_ADDRESS, credentials=None, http_client=MagicMock()
-            )
         assert result.error_protocol == "timeout"
+
+    async def test_a_best_effort_auth_failure_is_not_classified(self) -> None:
+        # Only the auth-capable probes classify; an HTTP 401 alone (the
+        # helper's http candidate) with no reason elsewhere reads unreachable.
+        result = await self._query()
+        assert result.error_protocol == "unreachable"
 
 
 class TestQueryCameraCredentialResolution:
@@ -435,7 +444,255 @@ class TestQueryCameraCredentialResolution:
             await query_camera(
                 address=_ADDRESS,
                 credentials=None,
-                http_client=MagicMock(),
+                http_client=allow_uncontained_double(MagicMock()),
                 default_credentials=("default", "dpw"),
             )
         assert probe.await_args.args[1] == ("default", "dpw")
+
+
+class TestQueryCameraLoginCount:
+    """A camera given wrong credentials sees one failed login per protocol.
+
+    #69 CAM-P5: the query used to re-run the VAPIX and ONVIF probes to recover
+    their failure reasons, and the HTTP probe sent the credentials to every
+    common snapshot path, so one "Query" cost an Axis camera up to eight failed
+    logins and brought its brute-force lockout closer. Now the reasons travel on
+    the candidates, ONVIF stops after its first failed call, and the HTTP paths
+    get no credentials once VAPIX has rejected them.
+    """
+
+    @staticmethod
+    def _protocol_of(request: httpx.Request) -> str:
+        path = request.url.path
+        if path.startswith("/onvif/"):
+            return "onvif"
+        if path.startswith("/axis-cgi/"):
+            return "vapix"
+        return "http"
+
+    async def test_a_rejecting_camera_gets_one_login_per_protocol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from timelapse_manager.cameras import http_jpeg, probing
+        from timelapse_manager.cameras.onvif import OnvifAdapter
+
+        # A unit test has no application context: skip the SSRF guards and the
+        # context-read body cap, and keep the RTSP probe off the network.
+        monkeypatch.setattr(http_jpeg, "_guard_snapshot_url", AsyncMock())
+        monkeypatch.setattr(http_jpeg, "_resolve_max_image_bytes", lambda: 1 << 20)
+        monkeypatch.setattr(OnvifAdapter, "_guard_soap_url", AsyncMock())
+        monkeypatch.setattr(
+            probing,
+            "_probe_rtsp",
+            AsyncMock(return_value=_candidate("rtsp", False)),
+        )
+
+        logins: dict[str, int] = {"vapix": 0, "onvif": 0, "http": 0}
+        requests: dict[str, int] = {"vapix": 0, "onvif": 0, "http": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            protocol = self._protocol_of(request)
+            requests[protocol] += 1
+            carries_login = "authorization" in request.headers or (
+                b"wrong-user" in request.content
+            )
+            if carries_login:
+                logins[protocol] += 1
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": 'Digest realm="axis", nonce="n1", qop="auth"'
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await query_camera(
+                address=_ADDRESS,
+                credentials={"username": "wrong-user", "password": "wrong-pass"},
+                http_client=client,
+                timeout=2.0,
+            )
+
+        assert result.ok_count == 0
+        assert result.error_protocol == "auth_failed"
+        assert logins == {"vapix": 1, "onvif": 1, "http": 0}
+        # Every HTTP path was still probed, anonymously.
+        assert requests["http"] == len(probing.HTTP_SNAPSHOT_PATHS)
+
+    async def test_http_paths_get_credentials_when_no_protocol_rejected_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain HTTP camera (no VAPIX, no ONVIF) still gets its login."""
+        from timelapse_manager.cameras import http_jpeg, probing
+        from timelapse_manager.cameras.onvif import OnvifAdapter
+
+        monkeypatch.setattr(http_jpeg, "_guard_snapshot_url", AsyncMock())
+        monkeypatch.setattr(http_jpeg, "_resolve_max_image_bytes", lambda: 1 << 20)
+        monkeypatch.setattr(OnvifAdapter, "_guard_soap_url", AsyncMock())
+        monkeypatch.setattr(
+            probing,
+            "_probe_rtsp",
+            AsyncMock(return_value=_candidate("rtsp", False)),
+        )
+        logins: list[str] = []
+        # Digest: a probe never sends Basic over plain HTTP (#69 CAM-S1, OD-3).
+        challenge = {"WWW-Authenticate": 'Digest realm="cam", nonce="n1", qop="auth"'}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            protocol = self._protocol_of(request)
+            if protocol != "http":
+                return httpx.Response(404)
+            if "authorization" in request.headers:
+                logins.append(request.url.path)
+            return httpx.Response(401, headers=challenge)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await query_camera(
+                address=_ADDRESS,
+                credentials={"username": "u", "password": "wrong"},
+                http_client=client,
+                timeout=2.0,
+            )
+
+        assert result.ok_count == 0
+        # One credentialed try on the first path; once rejected, no more.
+        assert logins == [probing.HTTP_SNAPSHOT_PATHS[0]]
+
+    async def test_basic_only_over_plain_http_sends_no_password_and_says_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#69 CAM-S1 (OD-3): a probe refuses Basic over http:// before sending."""
+        from timelapse_manager.cameras import http_jpeg, probing
+        from timelapse_manager.cameras.onvif import OnvifAdapter
+
+        monkeypatch.setattr(http_jpeg, "_guard_snapshot_url", AsyncMock())
+        monkeypatch.setattr(http_jpeg, "_resolve_max_image_bytes", lambda: 1 << 20)
+        monkeypatch.setattr(OnvifAdapter, "_guard_soap_url", AsyncMock())
+        monkeypatch.setattr(
+            probing,
+            "_probe_rtsp",
+            AsyncMock(return_value=_candidate("rtsp", False)),
+        )
+        authorizations: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "authorization" in request.headers:
+                authorizations.append(request.headers["authorization"])
+            if self._protocol_of(request) != "http":
+                return httpx.Response(404)
+            return httpx.Response(401, headers={"WWW-Authenticate": 'Basic realm="c"'})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await query_camera(
+                address=_ADDRESS,
+                credentials={"username": "u", "password": "secret"},
+                http_client=client,
+                timeout=2.0,
+            )
+
+        assert result.ok_count == 0
+        assert authorizations == []
+        http = next(c for c in result.candidates if c.protocol == "http")
+        assert "https://" in http.detail
+        assert "Basic" in http.detail
+
+
+class TestBasicOverHttpOptIn:
+    """#332: Query honours the form's Basic-over-HTTP opt-in like capture (OD-3)."""
+
+    async def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        address: str,
+        allow_basic_over_http: bool,
+        only: str = "http",
+    ) -> tuple[QueryResult, list[str]]:
+        from timelapse_manager.cameras import http_jpeg, probing
+        from timelapse_manager.cameras.onvif import OnvifAdapter
+
+        monkeypatch.setattr(http_jpeg, "_guard_snapshot_url", AsyncMock())
+        monkeypatch.setattr(http_jpeg, "_resolve_max_image_bytes", lambda: 1 << 20)
+        monkeypatch.setattr(OnvifAdapter, "_guard_soap_url", AsyncMock())
+        monkeypatch.setattr(probing, "frame_from_bytes", lambda _b: None)
+        monkeypatch.setattr(
+            probing,
+            "_probe_rtsp",
+            AsyncMock(return_value=_candidate("rtsp", False)),
+        )
+        sent: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            protocol = (
+                "vapix"
+                if path.startswith("/axis-cgi/")
+                else "onvif"
+                if path.startswith("/onvif/")
+                else "http"
+            )
+            if protocol != only:
+                return httpx.Response(404)
+            auth = request.headers.get("authorization")
+            if auth is not None:
+                sent.append(f"{request.url.scheme}:{auth.split()[0]}")
+                if auth.startswith("Basic ") and path == probing.HTTP_SNAPSHOT_PATHS[0]:
+                    return httpx.Response(200, content=b"jpegbytes")
+            return httpx.Response(401, headers={"WWW-Authenticate": 'Basic realm="c"'})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await query_camera(
+                address=address,
+                credentials={"username": "u", "password": "secret"},
+                http_client=client,
+                timeout=2.0,
+                allow_basic_over_http=allow_basic_over_http,
+            )
+        return result, sent
+
+    async def test_opt_in_sends_basic_to_a_plain_http_camera(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, sent = await self._run(
+            monkeypatch, address=f"http://{_ADDRESS}", allow_basic_over_http=True
+        )
+        assert sent == ["http:Basic"]
+        http = next(c for c in result.candidates if c.protocol == "http")
+        assert http.ok
+
+    async def test_without_opt_in_no_basic_is_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, sent = await self._run(
+            monkeypatch, address=f"http://{_ADDRESS}", allow_basic_over_http=False
+        )
+        assert sent == []
+        http = next(c for c in result.candidates if c.protocol == "http")
+        assert not http.ok
+        assert "Basic" in http.detail
+
+    async def test_opt_in_reaches_the_vapix_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, with_opt = await self._run(
+            monkeypatch,
+            address=f"http://{_ADDRESS}",
+            allow_basic_over_http=True,
+            only="vapix",
+        )
+        _, without = await self._run(
+            monkeypatch,
+            address=f"http://{_ADDRESS}",
+            allow_basic_over_http=False,
+            only="vapix",
+        )
+        assert "http:Basic" in with_opt
+        assert without == []
+
+    async def test_opt_in_never_downgrades_an_https_address(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, sent = await self._run(
+            monkeypatch, address=f"https://{_ADDRESS}", allow_basic_over_http=True
+        )
+        assert sent and all(s.startswith("https:") for s in sent)

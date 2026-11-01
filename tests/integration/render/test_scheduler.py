@@ -522,3 +522,38 @@ async def test_manual_render_enqueued_independently_of_scheduler(
         j = session.get(RenderJob, manual_job_id)
         assert j is not None
         assert j.status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Housekeeping: thumbnail cache (#67 R12)
+# ---------------------------------------------------------------------------
+
+
+async def test_housekeeping_removes_orphaned_thumbnail_dirs(
+    migrated_factory: sessionmaker,  # type: ignore[type-arg]
+    settings_no_autostart: Settings,
+) -> None:
+    import os
+    import time
+
+    from timelapse_manager.storage.paths import thumbnail_cache_dir
+    from timelapse_manager.storage.thumbnail_cache import TEMP_FILE_MAX_AGE_SECONDS
+
+    settings = settings_no_autostart
+    live_id = _seed_active_project(migrated_factory, settings, name="thumb-live")
+    live_dir = thumbnail_cache_dir(settings, live_id)
+    orphan_dir = thumbnail_cache_dir(settings, live_id + 500)
+    for cache_dir in (live_dir, orphan_dir):
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "1.jpg").write_bytes(b"THUMB")
+    stale = live_dir / "2.tmp-1-abcd.jpg"
+    stale.write_bytes(b"TH")
+    then = time.time() - TEMP_FILE_MAX_AGE_SECONDS - 60
+    os.utime(stale, (then, then))
+
+    queue = RenderQueue(settings, migrated_factory, encoder=FakeEncoder())
+    scheduler = RenderScheduler(settings, migrated_factory, queue)
+    await scheduler.run_housekeeping(force=True)
+
+    assert not orphan_dir.exists()
+    assert sorted(p.name for p in live_dir.iterdir()) == ["1.jpg"]

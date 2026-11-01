@@ -12,6 +12,7 @@ from timelapse_manager.capture.anchors import (
     EXACT_TIME_GRACE,
     Anchor,
     anchor_fire_instant,
+    clock_anchor_in_dst_gap,
     due_anchors,
     next_anchor_wake,
     next_solar_capture_instant,
@@ -19,6 +20,7 @@ from timelapse_manager.capture.anchors import (
 )
 
 _CHICAGO = ZoneInfo("America/Chicago")
+_NEW_YORK = ZoneInfo("America/New_York")
 _UTC = ZoneInfo("UTC")
 
 
@@ -366,3 +368,146 @@ def test_next_solar_capture_instant_for_sunrise_and_sunset() -> None:
         assert upcoming is not None
         assert upcoming > now
         assert next_solar_capture_instant(anchor, now, None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Daylight-saving spring-forward gap handling for clock anchors
+# ---------------------------------------------------------------------------
+#
+# America/New_York springs forward on 2026-03-08: at 02:00 EST (UTC-5) the
+# clocks jump to 03:00 EDT (UTC-4), so the wall-clock hour 02:00..02:59 does not
+# exist that day. The transition instant is 07:00 UTC == 03:00 EDT.
+
+_NY_SPRING_DATE = date(2026, 3, 8)
+_NY_SPRING_TRANSITION_UTC = datetime(2026, 3, 8, 7, 0, tzinfo=UTC)
+
+# America/New_York falls back on 2026-11-01: at 02:00 EDT the clocks return to
+# 01:00 EST, so the wall-clock hour 01:00..01:59 occurs twice (ambiguous, but it
+# *does* exist).
+_NY_FALL_DATE = date(2026, 11, 1)
+
+
+def test_clock_anchor_in_spring_forward_gap_shifts_forward() -> None:
+    # 02:30 does not exist on the spring-forward day; the fire instant is shifted
+    # forward to the first valid instant after the gap (03:00 EDT == 07:00 UTC),
+    # not to zoneinfo's incidental fold default.
+    anchor = Anchor(id="x", kind="clock", time="02:30", offset_minutes=0, enabled=True)
+    instant = anchor_fire_instant(anchor, _NY_SPRING_DATE, _NEW_YORK, None, None)
+    assert instant == _NY_SPRING_TRANSITION_UTC
+
+
+def test_clock_anchor_gap_with_offset_shifts_forward() -> None:
+    # 02:50 - 25m = 02:25, still inside the gap, so it too shifts to 03:00 EDT.
+    anchor = Anchor(
+        id="x", kind="clock", time="02:50", offset_minutes=-25, enabled=True
+    )
+    instant = anchor_fire_instant(anchor, _NY_SPRING_DATE, _NEW_YORK, None, None)
+    assert instant == _NY_SPRING_TRANSITION_UTC
+
+
+def test_clock_anchor_in_dst_gap_predicate() -> None:
+    in_gap = Anchor(id="g", kind="clock", time="02:30", offset_minutes=0, enabled=True)
+    normal = Anchor(id="n", kind="clock", time="06:30", offset_minutes=0, enabled=True)
+    solar = Anchor(id="s", kind="solar_noon", time=None, offset_minutes=0, enabled=True)
+    assert clock_anchor_in_dst_gap(in_gap, _NY_SPRING_DATE, _NEW_YORK) is True
+    assert clock_anchor_in_dst_gap(normal, _NY_SPRING_DATE, _NEW_YORK) is False
+    # A non-gap date never flags, even for the same wall-clock time.
+    assert clock_anchor_in_dst_gap(in_gap, date(2026, 6, 23), _NEW_YORK) is False
+    # Solar anchors are never clock-gap shifted.
+    assert clock_anchor_in_dst_gap(solar, _NY_SPRING_DATE, _NEW_YORK) is False
+
+
+def test_clock_anchor_outside_gap_is_unchanged() -> None:
+    # A normal time on the transition day is computed the ordinary way (06:30 EDT
+    # == 10:30 UTC) and is not flagged as a gap.
+    anchor = Anchor(id="x", kind="clock", time="06:30", offset_minutes=0, enabled=True)
+    instant = anchor_fire_instant(anchor, _NY_SPRING_DATE, _NEW_YORK, None, None)
+    assert instant == datetime(2026, 3, 8, 10, 30, tzinfo=UTC)
+    assert clock_anchor_in_dst_gap(anchor, _NY_SPRING_DATE, _NEW_YORK) is False
+
+
+def test_clock_anchor_fall_back_is_deterministic() -> None:
+    # 01:30 occurs twice on the fall-back day; it exists, so it is *not* a gap and
+    # resolves deterministically to the earlier (first) occurrence, 05:30 UTC
+    # (01:30 EDT, UTC-4) rather than 06:30 UTC (01:30 EST, UTC-5).
+    anchor = Anchor(id="x", kind="clock", time="01:30", offset_minutes=0, enabled=True)
+    assert clock_anchor_in_dst_gap(anchor, _NY_FALL_DATE, _NEW_YORK) is False
+    instant = anchor_fire_instant(anchor, _NY_FALL_DATE, _NEW_YORK, None, None)
+    assert instant == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# anchor_retry_delay (#69, CAM-R1)
+# ---------------------------------------------------------------------------
+
+
+class TestAnchorRetryDelay:
+    """The retry schedule for a failed anchor attempt, as a pure function."""
+
+    _FULL = timedelta(minutes=30)  # a failure right at the instant
+
+    def test_exact_sequence_then_final_at_attempt_seven(self) -> None:
+        from timelapse_manager.capture.anchors import anchor_retry_delay
+
+        delays = [anchor_retry_delay(n, self._FULL) for n in range(1, 8)]
+        assert delays == [
+            timedelta(seconds=15),
+            timedelta(seconds=30),
+            timedelta(seconds=60),
+            timedelta(seconds=120),
+            timedelta(seconds=240),
+            timedelta(seconds=480),
+            None,
+        ]
+
+    def test_seven_attempts_fit_in_the_grace_window(self) -> None:
+        from timelapse_manager.capture.anchors import (
+            ANCHOR_MAX_ATTEMPTS,
+            EXACT_TIME_GRACE,
+            anchor_retry_delay,
+        )
+
+        elapsed = timedelta(0)
+        attempts = 1
+        while (
+            delay := anchor_retry_delay(attempts, EXACT_TIME_GRACE - elapsed)
+        ) is not None:
+            elapsed += delay
+            attempts += 1
+        assert attempts == ANCHOR_MAX_ATTEMPTS == 7
+        assert elapsed == timedelta(seconds=945)  # about 16 minutes
+
+    @pytest.mark.parametrize(
+        ("attempts", "remaining", "expected"),
+        [
+            # 25 minutes after the instant: 5 minutes of grace left. Up to
+            # 4.5 minutes of delay still fits (30 s margin).
+            (1, timedelta(minutes=5), timedelta(seconds=15)),
+            (5, timedelta(minutes=5), timedelta(seconds=240)),
+            (6, timedelta(minutes=5), None),
+            # The margin is inclusive at the boundary.
+            (1, timedelta(seconds=45), timedelta(seconds=15)),
+            (1, timedelta(seconds=44), None),
+            # Grace already over.
+            (1, timedelta(0), None),
+            (1, timedelta(seconds=-60), None),
+        ],
+    )
+    def test_grace_cut_off(
+        self, attempts: int, remaining: timedelta, expected: timedelta | None
+    ) -> None:
+        from timelapse_manager.capture.anchors import anchor_retry_delay
+
+        assert anchor_retry_delay(attempts, remaining) == expected
+
+    def test_auth_failure_allows_two_attempts(self) -> None:
+        from timelapse_manager.capture.anchors import anchor_retry_delay
+
+        assert anchor_retry_delay(1, self._FULL, auth=True) == timedelta(seconds=15)
+        assert anchor_retry_delay(2, self._FULL, auth=True) is None
+        assert anchor_retry_delay(2, self._FULL) == timedelta(seconds=30)
+
+    def test_nonsense_attempt_count_is_final(self) -> None:
+        from timelapse_manager.capture.anchors import anchor_retry_delay
+
+        assert anchor_retry_delay(0, self._FULL) is None

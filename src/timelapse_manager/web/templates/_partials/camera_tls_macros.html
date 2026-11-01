@@ -1,0 +1,129 @@
+{#
+  Macros: camera_tls_macros.html — the camera form's certificate-pin section
+  (#69 CAM-S1, the pinning half).
+
+  Imported by camera_form.html (edit mode) and by camera_tls_section.html, the
+  fragment the pin routes swap back in. Defines only a macro, so importing it
+  emits nothing.
+
+  tls_section(camera, is_admin, cert, notice, error)
+    camera    — the camera view; ``tls_pinned_fingerprint`` is the SHA-256
+                fingerprint (colon form) the camera is pinned to, or none. The
+                certificate itself is never rendered back.
+    is_admin  — whether the viewer may fetch, pin and unpin (administrators only).
+    cert      — a fetched certificate awaiting confirmation (fingerprint,
+                subject, issuer, validity) or none.
+    notice / error — one fixed sentence each; nothing from the handshake or the
+                certificate is ever put in them.
+
+  No inline script or handler: the buttons are htmx attributes. Each sends only
+  the parameters named in ``hx-params``, so the surrounding edit form's fields
+  (the password among them) never travel with a pin request; the CSRF token goes
+  in the X-CSRF-Token header csrf.js sets on every htmx request.
+#}
+{% macro tls_section(camera, is_admin, cert=none, notice=none, error=none) %}
+  {% set uid = 'cam-' ~ camera.id %}
+  <div class="form-group" id="{{ uid }}-tls" aria-live="polite">
+    <div class="form-label" style="font-weight:600;margin-bottom:var(--sp-2);">
+      Certificate pin
+    </div>
+    {% if notice %}
+      <div class="alert success" role="status">{{ notice }}</div>
+    {% endif %}
+    {% if error %}
+      <div class="alert error" role="alert">{{ error }}</div>
+    {% endif %}
+    {% if camera.tls_pinned_fingerprint %}
+      <p style="margin:0 0 var(--sp-2);">
+        Pinned to SHA-256
+        <span class="mono" style="word-break:break-all;">
+          {{ camera.tls_pinned_fingerprint }}
+        </span>
+      </p>
+      <span class="form-hint">
+        This camera trusts that certificate and nothing else, whatever CA
+        bundle is configured, and is only reached over https://. If the camera
+        gets a new certificate, capture stops until you pin it again.
+      </span>
+      {% if is_admin %}
+        <div style="margin-top:var(--sp-2);">
+          <button type="button" class="btn btn-ghost"
+                  hx-post="/cameras/{{ camera.id }}/tls/unpin"
+                  hx-params="none"
+                  hx-target="#{{ uid }}-tls"
+                  hx-swap="outerHTML"
+                  hx-disabled-elt="this"
+                  hx-sync="this:drop">
+            Remove pin
+          </button>
+        </div>
+      {% endif %}
+    {% else %}
+      <span class="form-hint">
+        Not pinned: this camera's certificate is checked against the CA bundle.
+        Pin it only for a camera with a self-signed certificate that no CA
+        vouches for.
+      </span>
+    {% endif %}
+
+    {% if cert %}
+      <div class="card" style="margin-top:var(--sp-3);">
+        <div class="card-body">
+          <p style="margin:0 0 var(--sp-2);">
+            The camera presents this certificate. Compare the fingerprint with
+            the one the camera shows, and pin it only if they match.
+          </p>
+          <dl style="margin:0 0 var(--sp-3);">
+            <dt>SHA-256 fingerprint</dt>
+            <dd class="mono" style="word-break:break-all;">
+              {{ cert.display_fingerprint }}
+            </dd>
+            <dt>Subject</dt>
+            <dd class="mono" style="word-break:break-all;">{{ cert.subject | truncate(300) }}</dd>
+            <dt>Issuer</dt>
+            <dd class="mono" style="word-break:break-all;">
+              {{ cert.issuer | truncate(300) }}{% if cert.self_signed %} (self-signed){% endif %}
+            </dd>
+            <dt>Valid</dt>
+            <dd>
+              {{ cert.not_before.strftime('%Y-%m-%d') }} to
+              {{ cert.not_after.strftime('%Y-%m-%d') }} (UTC)
+            </dd>
+          </dl>
+          {% if not cert.valid_now %}
+            <div class="alert error" role="alert">
+              This certificate is expired or not yet valid. The camera would
+              refuse every connection, so it cannot be pinned. Renew the
+              camera's certificate first.
+            </div>
+          {% else %}
+          <button type="button" class="btn btn-primary"
+                  hx-post="/cameras/{{ camera.id }}/tls/pin"
+                  hx-vals='{"fingerprint": "{{ cert.display_fingerprint }}"}'
+                  hx-params="fingerprint"
+                  hx-target="#{{ uid }}-tls"
+                  hx-swap="outerHTML"
+                  hx-disabled-elt="this"
+                  hx-sync="this:drop">
+            Pin this certificate
+          </button>
+          {% endif %}
+        </div>
+      </div>
+    {% elif is_admin %}
+      <div style="margin-top:var(--sp-2);">
+        <button type="button" class="btn btn-ghost"
+                hx-post="/cameras/{{ camera.id }}/tls/fetch-certificate"
+                hx-params="none"
+                hx-request='{"timeout":20000}'
+                hx-target="#{{ uid }}-tls"
+                hx-swap="outerHTML"
+                hx-disabled-elt="this"
+                hx-sync="this:drop">
+          {{ 'Fetch the certificate again' if camera.tls_pinned_fingerprint
+             else 'Fetch the camera certificate' }}
+        </button>
+      </div>
+    {% endif %}
+  </div>
+{% endmacro %}

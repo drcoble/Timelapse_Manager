@@ -21,7 +21,19 @@ from timelapse_manager.security.ssrf import (
     assert_allowed_url,
     resolve_and_check,
     resolve_and_check_async,
+    resolve_and_check_pinned,
+    resolve_and_check_pinned_async,
 )
+
+
+def _fake_getaddrinfo(*addresses: str):
+    """Build a ``socket.getaddrinfo`` stand-in returning ``addresses`` in order."""
+
+    def _getaddrinfo(host: str, *args: object, **kwargs: object) -> list:
+        return [(None, None, None, "", (addr, 0)) for addr in addresses]
+
+    return _getaddrinfo
+
 
 # ---------------------------------------------------------------------------
 # Tier 1: always blocked regardless of any opt-in
@@ -193,10 +205,10 @@ class TestPrivateAddressOptIn:
             )
 
     def test_private_address_denied_when_not_in_opted_in_subnet(self) -> None:
-        """10.1.0.1 is RFC-1918 but not in the opted-in 192.168.0.0/16 subnet."""
+        """10.0.0.1 is RFC-1918 but not in the opted-in 192.168.0.0/16 subnet."""
         with pytest.raises(SsrfError, match="not within any admin-allowed subnet"):
             assert_address_allowed(
-                "10.1.0.1",
+                "10.0.0.1",
                 allow_private=True,
                 allowed_private_subnets=["192.168.0.0/16"],
             )
@@ -363,3 +375,64 @@ class TestAsyncResolutionOffLoadsBlockingDns:
         """A denied literal target still raises through the async wrapper."""
         with pytest.raises(SsrfError):
             await resolve_and_check_async("127.0.0.1")
+
+
+# ---------------------------------------------------------------------------
+# Connect-by-validated-IP: pin the connection target against DNS rebinding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.abuse
+class TestResolveAndCheckPinned:
+    def test_literal_public_ip_returned(self) -> None:
+        assert resolve_and_check_pinned("8.8.8.8") == "8.8.8.8"
+
+    def test_literal_loopback_denied(self) -> None:
+        with pytest.raises(SsrfError):
+            resolve_and_check_pinned("127.0.0.1")
+
+    def test_literal_private_returned_when_opted_in(self) -> None:
+        result = resolve_and_check_pinned(
+            "10.0.0.1", allow_private=True, allowed_private_subnets=["10.0.0.0/8"]
+        )
+        assert result == "10.0.0.1"
+
+    def test_ipv4_mapped_literal_normalised_to_v4(self) -> None:
+        """A returned IP is always a plain literal -- a mapped v6 collapses to v4."""
+        assert resolve_and_check_pinned("::ffff:8.8.8.8") == "8.8.8.8"
+
+    def test_hostname_returns_first_validated_ip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hostname pins to the first resolved address (resolver order kept)."""
+        monkeypatch.setattr(
+            "timelapse_manager.security.ssrf.socket.getaddrinfo",
+            _fake_getaddrinfo("8.8.8.8", "8.8.4.4"),
+        )
+        assert resolve_and_check_pinned("camera.example.test") == "8.8.8.8"
+
+    def test_hostname_rejected_if_any_resolved_address_denied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a name resolves to one public and one denied address, reject it --
+        the attacker cannot smuggle a private target alongside a public one."""
+        monkeypatch.setattr(
+            "timelapse_manager.security.ssrf.socket.getaddrinfo",
+            _fake_getaddrinfo("8.8.8.8", "127.0.0.1"),
+        )
+        with pytest.raises(SsrfError):
+            resolve_and_check_pinned("rebind.example.test")
+
+    async def test_async_variant_returns_validated_ip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "timelapse_manager.security.ssrf.socket.getaddrinfo",
+            _fake_getaddrinfo("8.8.8.8"),
+        )
+        result = await resolve_and_check_pinned_async("camera.example.test")
+        assert result == "8.8.8.8"
+
+    async def test_async_variant_propagates_deny(self) -> None:
+        with pytest.raises(SsrfError):
+            await resolve_and_check_pinned_async("127.0.0.1")

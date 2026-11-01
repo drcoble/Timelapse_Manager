@@ -14,6 +14,7 @@ output path stays confined within that root.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,10 @@ from ..encode import (
     compute_chapters,
     gather_frames,
 )
+from ..encode.overlay import DEFAULT_TIMESTAMP_FORMAT, validate_timestamp_format
 from ..storage import paths
+
+logger = logging.getLogger(__name__)
 
 # File extension per container, used to name the output file.
 _CONTAINER_EXTENSIONS: dict[str, str] = {
@@ -52,9 +56,11 @@ def project_render_root(settings: Settings, project: Project) -> Path:
 
     A ``renders`` sub-directory (the configured ``output_subdir``) of the
     project's frame directory's parent: frames and renders live as siblings under
-    the project's storage location. For a default-layout project that is
-    ``<frames_root>/<project_id>/<output_subdir>``; for a project with an explicit
-    storage path it is ``<storage_path parent>/<output_subdir>``.
+    the project's storage location. For a default-layout project the frame
+    directory is ``<frames_root>/<project_id>``, so this is
+    ``<frames_root>/<output_subdir>``, one directory shared by every default-layout
+    project (the render file name carries the job id); for a project with an
+    explicit storage path it is ``<storage_path parent>/<output_subdir>``.
     """
     frame_dir = paths.frame_dir(settings, project)
     return frame_dir.parent / settings.render.output_subdir
@@ -101,12 +107,53 @@ def _dimensions(raw: dict[str, Any]) -> tuple[int | None, int | None]:
     return _as_int(raw.get("width"), 1920), _as_int(raw.get("height"), 1080)
 
 
+# Projects already warned about an invalid stored timestamp format, so the warning
+# appears once per project per process instead of on every render (#140). Bounded
+# by the number of projects.
+_WARNED_BAD_TIMESTAMP_FORMAT: set[int] = set()
+
+
+def _timestamp_format(job: RenderJob, raw: dict[str, Any]) -> str:
+    """Return the job's timestamp format, or the default if the stored one is bad.
+
+    Every write path validates the format (#67 S4), but rows stored before that
+    check, or written straight to the database, may hold anything. Such a value
+    is replaced by the default for this render; the stored row is left as it is
+    (no migration). The WARNING naming the job and project is logged only when the
+    timestamp overlay is enabled (a disabled overlay never uses the format), and
+    at most once per project per process (#140).
+    """
+    stored = raw.get("timestamp_format") or DEFAULT_TIMESTAMP_FORMAT
+    try:
+        return validate_timestamp_format(stored)
+    except ValueError as exc:
+        if (
+            raw.get("timestamp_enabled", False)
+            and job.project_id not in _WARNED_BAD_TIMESTAMP_FORMAT
+        ):
+            _WARNED_BAD_TIMESTAMP_FORMAT.add(job.project_id)
+            logger.warning(
+                "render job %s (project %s): stored timestamp_format %r is invalid "
+                "(%s); rendering with the default %r",
+                job.id,
+                job.project_id,
+                stored,
+                exc,
+                DEFAULT_TIMESTAMP_FORMAT,
+            )
+        return DEFAULT_TIMESTAMP_FORMAT
+
+
 def _overlay_config(job: RenderJob) -> OverlayConfig:
-    """Translate the job's JSON overlay config into the encoder's value object."""
+    """Translate the job's JSON overlay config into the encoder's value object.
+
+    An invalid stored timestamp format falls back to the default
+    (:func:`_timestamp_format`).
+    """
     raw: dict[str, Any] = dict(job.overlay_config or {})
     return OverlayConfig(
         timestamp_enabled=bool(raw.get("timestamp_enabled", False)),
-        timestamp_format=str(raw.get("timestamp_format") or "%Y-%m-%d %H:%M:%S"),
+        timestamp_format=_timestamp_format(job, raw),
         timestamp_timezone=str(raw.get("timestamp_timezone") or "UTC"),
         text_enabled=bool(raw.get("text_enabled", False)),
         text_content=str(raw.get("text_content") or ""),

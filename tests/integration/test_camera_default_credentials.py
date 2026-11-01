@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from timelapse_manager.cameras.clients import allow_uncontained_double
 from timelapse_manager.cameras.registry import build_adapter, effective_credentials
 from timelapse_manager.db.models import Camera
 from timelapse_manager.db.session import session_scope
@@ -121,7 +122,9 @@ class TestBuildAdapterCarriesDefault:
             assert cam is not None
             default = resolve_default_credentials(session)
             session.expunge(cam)
-        adapter = build_adapter(cam, MagicMock(), default_credentials=default)
+        adapter = build_adapter(
+            cam, allow_uncontained_double(MagicMock()), default_credentials=default
+        )
         # The HTTP/JPEG adapter exposes the credentials it will use.
         return adapter._credentials  # type: ignore[attr-defined,no-any-return]
 

@@ -71,6 +71,9 @@ class FakeClock:
     def now(self) -> datetime:
         return self._now
 
+    def monotonic(self) -> float:
+        return self.now().timestamp()
+
     async def sleep(self, seconds: float) -> None:
         self._now += timedelta(seconds=max(0.0, seconds))
         self.cycle_count += 1

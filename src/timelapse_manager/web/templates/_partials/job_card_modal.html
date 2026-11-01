@@ -1,0 +1,29 @@
+{#
+  Partial: job_card_modal.html — the dialog the render and export cards load into.
+
+  Include once per page, OUTSIDE any polled list: the Renders page refreshes
+  #renders-list every 10 s, and a dialog inside it would be destroyed mid-read.
+
+  A row's "Render #N" / "Export #N" link carries data-modal-open="#job-card-modal"
+  (modal.js opens this dialog, traps focus, closes on Escape/backdrop and returns
+  focus to the row) and hx-get of the card fragment into #job-card-content.
+  #job-card-content is marked data-modal-content: modal.js puts the placeholder
+  below back each time the dialog opens or closes, so a previous card (or its
+  playing video) never lingers. A successful delete answers with an
+  HX-Trigger of "modal:close", which closes the dialog.
+#}
+<div class="modal-backdrop" data-modal-for="job-card-modal">
+  <div id="job-card-modal" class="discover-modal job-card-modal" role="dialog"
+       aria-modal="true" aria-hidden="true" aria-labelledby="job-card-title">
+    <div id="job-card-content" data-modal-content>
+      <header class="discover-modal-header">
+        <h2 class="card-title" id="job-card-title">Loading&hellip;</h2>
+        <button type="button" class="drawer-close" data-modal-close
+                aria-label="Close">&times;</button>
+      </header>
+      <div class="discover-modal-body">
+        <p class="form-hint">Loading details&hellip;</p>
+      </div>
+    </div>
+  </div>
+</div>

@@ -3,12 +3,12 @@
 A concrete channel (email, webhook, ...) implements :class:`NotificationChannel`
 and is injected into the dispatcher. The dispatcher treats every channel
 uniformly: it builds a :class:`NotificationMessage` from a logged event and calls
-:meth:`NotificationChannel.send`, wrapping the call in an outer
-``asyncio.wait_for`` timeout so a hanging channel cannot block a clean shutdown.
+:meth:`NotificationChannel.send`, running the call under an outer
+``asyncio.timeout`` so a hanging channel cannot block a clean shutdown.
 
 The timeout contract is load-bearing and split across two layers:
 
-* The **dispatcher** wraps each ``send`` in an outer ``asyncio.wait_for`` so a
+* The **dispatcher** runs each ``send`` under an outer ``asyncio.timeout`` so a
   channel that cooperatively awaits can be timed out and cancelled.
 * The **channel** MUST additionally set its own socket/HTTP-level timeout on any
   blocking transport it uses. A blocking synchronous send (for example
@@ -75,7 +75,7 @@ class NotificationChannel(abc.ABC):
 
     **Timeout contract (mandatory).** ``send`` MUST set an explicit socket/HTTP
     timeout on whatever transport it uses. The dispatcher additionally wraps each
-    ``send`` in an outer ``asyncio.wait_for`` so a cooperatively-awaiting channel
+    ``send`` under an outer ``asyncio.timeout`` so a cooperatively-awaiting channel
     can be cancelled on shutdown -- but a blocking synchronous transport (such as
     ``smtplib`` run in a thread) is *not* interruptible by that cancellation and
     is bounded only by the channel's own timeout. Omitting an internal timeout

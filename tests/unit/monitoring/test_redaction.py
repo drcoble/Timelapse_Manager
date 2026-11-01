@@ -19,6 +19,7 @@ import json
 import logging
 
 import httpx
+import pytest
 
 from timelapse_manager.logging import JsonFormatter, redact, redact_text
 
@@ -55,6 +56,76 @@ class TestRedactText:
         result = redact_text(text)
         assert ":p@" not in result
         assert ":b@" not in result
+
+
+class TestUserinfoRedactionFailsClosed:
+    """Plain text masks through the last ``@``; serialised text is bounded (#224)."""
+
+    @pytest.mark.parametrize(
+        "password",
+        [
+            'pa"ss',
+            "pa<ss",
+            "pa>ss",
+            "pass\\",
+            'a"b<c>d\\',
+            'a@b"c',
+            "p@ss",
+        ],
+    )
+    def test_plain_text_password_is_fully_masked(self, password: str) -> None:
+        result = redact_text(f"rtsp://user:{password}@host/stream")
+        assert result == "rtsp://***@host/stream"
+
+    def test_quote_after_an_earlier_at_is_masked_through_the_last_at(self) -> None:
+        assert redact_text('rtsp://user:a@b"c@host/') == "rtsp://***@host/"
+
+    def test_url_without_userinfo_is_unchanged(self) -> None:
+        for raw in (
+            "rtsp://192.0.2.10:554/stream",
+            '{"url":"rtsp://host/path","email":"a@b.example"}',
+            "https://hooks.example.com/notify?x=1",
+            "<a>rtsp://host</a><b>x@y</b>",
+        ):
+            assert redact_text(raw) == raw
+            assert redact_text(raw, serialized=True) == raw
+
+    def test_serialized_compact_json_neighbour_field_is_not_swallowed(self) -> None:
+        raw = '{"u":"rtsp://user:pw@host","e":"a@b.example"}'
+        result = redact_text(raw, serialized=True)
+        assert result == '{"u":"rtsp://***@host","e":"a@b.example"}'
+        assert json.loads(result)["e"] == "a@b.example"
+
+    def test_serialized_result_is_still_valid_json(self) -> None:
+        raw = json.dumps(
+            {"cam": "rtsp://admin:s3cr3t@192.0.2.10:554", "owner": "me@example.com"},
+            separators=(",", ":"),
+        )
+        assert json.loads(redact_text(raw, serialized=True)) == {
+            "cam": "rtsp://***@192.0.2.10:554",
+            "owner": "me@example.com",
+        }
+
+    def test_serialized_escaped_quote_in_the_password_is_masked_whole(self) -> None:
+        raw = json.dumps({"u": 'rtsp://user:p"ss@host'}, separators=(",", ":"))
+        assert '\\"' in raw
+        assert redact_text(raw, serialized=True) == '{"u":"rtsp://***@host"}'
+
+    def test_serialized_repr_is_bounded_by_whitespace(self) -> None:
+        raw = "{'u': 'rtsp://user:pw@host', 'e': 'a@b'}"
+        assert redact_text(raw, serialized=True) == (
+            "{'u': 'rtsp://***@host', 'e': 'a@b'}"
+        )
+
+    def test_structured_values_are_redacted_before_serialising(self) -> None:
+        """``redact`` works on the values, so the JSON boundary never arises."""
+        out = redact({"u": 'rtsp://user:pa"ss@host', "e": "a@b"})
+        assert out == {"u": "rtsp://***@host", "e": "a@b"}
+
+    def test_long_unmatched_input_stays_fast(self) -> None:
+        raw = "rtsp://" + "a" * 200_000
+        assert redact_text(raw) == raw
+        assert redact_text(raw, serialized=True) == raw
 
 
 class TestRedact:

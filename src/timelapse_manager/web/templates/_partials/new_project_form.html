@@ -82,7 +82,7 @@
               <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
                 <input type="radio" name="capture_mode" value="interval"
                        {% if not _is_solar_mode %}checked{% endif %}
-                       onchange="tlmCaptureModeChange(this);"
+                       data-action="capture-mode"
                        style="accent-color:var(--color-accent);margin-top:3px;">
                 <span>
                   <strong>Continuous (interval)</strong>
@@ -92,7 +92,7 @@
               <label style="display:flex;align-items:flex-start;gap:var(--sp-2);cursor:pointer;">
                 <input type="radio" name="capture_mode" value="solar"
                        {% if _is_solar_mode %}checked{% endif %}
-                       onchange="tlmCaptureModeChange(this);"
+                       data-action="capture-mode"
                        style="accent-color:var(--color-accent);margin-top:3px;">
                 <span>
                   <strong>Solar / scheduled times only</strong>
@@ -145,12 +145,6 @@
               <button type="button" class="chip" data-value="1" data-unit="hours">1h</button>
             </div>
             <span class="form-hint" id="interval-hint">How often to capture a frame. Minimum 1 second.</span>
-            {# Storage pre-flight — lazy estimate of growth vs free disk #}
-            <div id="preflight-container"
-                 hx-get="/projects/preflight"
-                 hx-trigger="change from:#capture_interval_value delay:300ms, change from:#capture_interval_unit"
-                 hx-include="#capture_interval_value, #capture_interval_unit"
-                 hx-swap="innerHTML"></div>
           </div>
 
           {# Capture schedule — window, days, timezone, presets. Only gates
@@ -162,6 +156,20 @@
           {# Exact-time captures — once-per-day single-shot anchors. In solar mode
              these ARE the capture times; in interval mode they are optional. #}
           {% include "_partials/_exact_time_fieldset.html" %}
+
+          {# Storage pre-flight — lazy estimate of growth vs free disk (#22). Kept
+             outside the interval-only fields so it shows in both capture modes.
+             Any change in the form re-estimates (change events bubble to the
+             form, so anchor rows added later are covered). The include lists
+             the fields the estimate reads -- mode, interval, camera, schedule,
+             anchor rows, campaign bounds -- and never the CSRF token, since this
+             is a GET. A disabled field (the interval in solar mode) is not sent. #}
+          <div id="preflight-container"
+               aria-live="polite"
+               hx-get="/projects/preflight"
+               hx-trigger="change from:closest form delay:300ms"
+               hx-include="[name^='capture_'], [name^='anchor_'], [name^='sun_offset_'], #camera_id, #start_date, #end_date"
+               hx-swap="innerHTML"></div>
 
           {# Campaign bounds (optional) — kept last because it is optional; most
              projects leave it open-ended. #}
@@ -206,50 +214,6 @@
           </div>
 
         </div>
-
-        {# Capture-mode toggle: show/hide interval + schedule-window fields vs the
-           solar/exact-time anchors, and disable the (required) interval input
-           when hidden so it neither validates nor submits in solar mode. #}
-        <script>
-        (function () {
-          function tlmCaptureModeSync() {
-            var checked = document.querySelector('input[name="capture_mode"]:checked');
-            var solar = !!(checked && checked.value === 'solar');
-            document.querySelectorAll('.interval-only-field').forEach(function (el) {
-              el.hidden = solar;
-            });
-            var intervalInput = document.getElementById('capture_interval_value');
-            if (intervalInput) { intervalInput.disabled = solar; }
-            var unit = document.getElementById('capture_interval_unit');
-            if (unit) { unit.disabled = solar; }
-          }
-          function tlmCaptureModeChange() {
-            tlmCaptureModeSync();
-            var checked = document.querySelector('input[name="capture_mode"]:checked');
-            if (checked && checked.value === 'solar') {
-              var rows = document.querySelectorAll('#exact-time-rows .exact-time-row');
-              if (rows.length === 0 && typeof window.tlmExactTimeAddRow === 'function') {
-                window.tlmExactTimeAddRow();
-                var added = document.querySelectorAll('#exact-time-rows .exact-time-row');
-                var newRow = added[added.length - 1];
-                var kind = newRow && newRow.querySelector('select[name="anchor_kind"]');
-                var solarOpt = kind && kind.querySelector('option[value="solar_noon"]');
-                if (kind && solarOpt && !solarOpt.disabled) {
-                  kind.value = 'solar_noon';
-                  if (typeof window.tlmExactTimeKindChange === 'function') {
-                    window.tlmExactTimeKindChange(kind);
-                  }
-                }
-              }
-            }
-          }
-          window.tlmCaptureModeChange = tlmCaptureModeChange;
-          if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', tlmCaptureModeSync);
-          }
-          tlmCaptureModeSync();
-        }());
-        </script>
       </form>
 
     </div>{# /card-body #}

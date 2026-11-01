@@ -52,3 +52,30 @@
 .camera-status-dot.online  { background: var(--color-running); box-shadow: 0 0 6px var(--color-running); }
 .camera-status-dot.offline { background: var(--color-error); }
 .camera-status-dot.unknown { background: var(--color-stopped); }
+
+/* Clickable camera row (#302): the whole row opens the camera (row-click.js);
+   the name is the focusable control. Operators only; a viewer's row is plain. */
+.data-table tbody tr.camera-row-clickable { cursor: pointer; }
+.data-table tbody tr.camera-row-clickable:focus-within td {
+  background: var(--color-surface-2);
+}
+.camera-open-link {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-weight: 500;
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+.camera-open-link:hover { text-decoration: underline; }
+.camera-open-link:focus-visible {
+  outline: 2px solid var(--color-accent, currentColor);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+/* Buttons and the actions menu keep the normal arrow/pointer of their own. */
+.camera-row-clickable .row-actions-menu { cursor: default; }

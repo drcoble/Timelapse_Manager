@@ -101,7 +101,9 @@ class TestBuildAdapterErrors:
     def teardown_method(self) -> None:
         import asyncio
 
-        asyncio.get_event_loop().run_until_complete(self._http_client.aclose())
+        # asyncio.run, not get_event_loop(): an earlier test on the same xdist
+        # worker may have closed or cleared the thread's loop (#189).
+        asyncio.run(self._http_client.aclose())
 
     def test_raises_when_protocol_is_none(self) -> None:
         cam = _make_camera(protocol=None)
@@ -141,7 +143,9 @@ class TestBuildAdapterSuccess:
     def teardown_method(self) -> None:
         import asyncio
 
-        asyncio.get_event_loop().run_until_complete(self._http_client.aclose())
+        # asyncio.run, not get_event_loop(): an earlier test on the same xdist
+        # worker may have closed or cleared the thread's loop (#189).
+        asyncio.run(self._http_client.aclose())
 
     def test_http_adapter_created_with_snapshot_uri(self) -> None:
         from timelapse_manager.cameras.http_jpeg import HttpJpegAdapter

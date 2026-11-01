@@ -2,12 +2,29 @@
   Partial: status_banner.html
   Context: error_count — int (recent error-or-above events; 0 = healthy)
            latest_error — _EventView | None (most recent error, if any)
+           ldap_plaintext_warning — bool (admins only: LDAP enabled with TLS mode
+                                    "none"; the route decides, the template only
+                                    renders)
 
   Loaded lazily into #status-banner via hx-get="/partials/status". The route is
   failure-isolated: on any query error it still renders with error_count=0, so
   this partial degrades to a healthy/empty banner rather than failing the page.
 #}
 <div id="status-banner">
+  {% if ldap_plaintext_warning %}
+  <div class="alert warning" role="alert" id="ldap-plaintext-banner">
+    <span class="alert-icon" aria-hidden="true">&#9888;</span>
+    <div class="alert-body">
+      <div class="alert-title">Directory sign-in is not encrypted</div>
+      <div class="alert-desc">
+        LDAP is enabled with TLS mode <span class="mono">none</span>, so the
+        service-account password and users' passwords cross the network in clear
+        text.
+        <a href="/settings#ldap" class="status-banner-link">Change the TLS mode</a>
+      </div>
+    </div>
+  </div>
+  {% endif %}
   {% if error_count and error_count > 0 %}
   <div class="status-banner status-banner-error" role="status" aria-live="polite">
     <span class="status-banner-icon" aria-hidden="true">&#9888;</span>
@@ -15,7 +32,7 @@
       {{ error_count }} recent error{% if error_count != 1 %}s{% endif %}.
       {% if latest_error %}
         Latest: {{ latest_error.message }}
-        {% if latest_error.timestamp %}<span class="status-banner-time">({{ latest_error.timestamp }})</span>{% endif %}
+        {% if latest_error.timestamp_raw %}<span class="status-banner-time">({{ latest_error.timestamp_raw | localdt }})</span>{% endif %}
       {% endif %}
     </span>
     <a href="/events?level=error" class="status-banner-link">View events</a>

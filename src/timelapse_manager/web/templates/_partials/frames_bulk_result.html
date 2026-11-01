@@ -28,9 +28,9 @@
      role="status" aria-live="polite" aria-label="Bulk action result"
      data-bulk-reload-window="{{ '1' if summary.reload_window else '0' }}">
   {% if summary.error %}
-    <span class="selection-bar-count">{{ summary.error }}</span>
+    <span class="selection-bar-count" data-bulk-result>{{ summary.error }}</span>
   {% else %}
-    <span class="selection-bar-count">
+    <span class="selection-bar-count" data-bulk-result>
       {{ summary.succeeded }} {{ verbed }}{% if summary.failed %} &middot;
       {{ summary.failed }} failed{% endif %}
     </span>

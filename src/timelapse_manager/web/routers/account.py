@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import (
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     Response,
 )
@@ -14,9 +15,11 @@ from fastapi.responses import (
 from ...security import (
     change_password,
     create_session,
-    get_session_row,
     verify_password,
 )
+from ...security.sessions import invalidate_request_session, resolve_request_session
+from ...security.throttle import password_change_key
+from ...services.errors import AppError
 from .. import dependencies as deps
 from ..dependencies import (
     CurrentUser,
@@ -26,6 +29,7 @@ from ..dependencies import (
     templates,
 )
 from ._shared import _audit, _settings
+from .auth import _login_throttle
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,22 @@ _PW_ERROR_POLICY = "policy"
 
 
 _VALID_THEMES = frozenset({"light", "dark", "system"})
+
+
+class TooManyPasswordAttemptsError(AppError):
+    """Too many wrong current passwords for one account in the window (#67 S23)."""
+
+    status = 429
+    code = "too_many_attempts"
+
+
+_TOO_MANY_PASSWORD_ATTEMPTS = (
+    "Too many incorrect current passwords. Wait a few minutes, then try again."
+)
+
+# ``source`` value the Preferences page sends to /account/timezone. Anything
+# else is treated as the browser auto-detect, which only fills an empty zone.
+_TZ_SOURCE_MANUAL = "manual"
 
 
 @router.get("/account/preferences", response_class=HTMLResponse)
@@ -81,21 +101,43 @@ def account_timezone(
 ) -> Response:
     """Persist the authenticated user's preferred display timezone.
 
-    Accepts any IANA timezone name; an unrecognisable name is silently
-    ignored so a misbehaving browser cannot corrupt the stored value.
-    Returns ``204 No Content`` — called via ``fetch()`` from the
-    auto-detection script in ``base.html``.
-    """
-    import zoneinfo
+    ``source`` says who is asking (#70 F-R4):
 
-    tz_name = form.get("timezone", "")
-    if tz_name:
-        try:
-            zoneinfo.ZoneInfo(tz_name)
-            user.viewer_timezone = tz_name
+    * ``manual`` -- the Preferences page. The submitted zone replaces the
+      stored one; a blank value clears it, so the browser's zone fills it again
+      on the next page load. An unknown zone is a 422 with a short ``detail``,
+      so the page can say why nothing was saved.
+    * ``auto`` (also any other or missing value) -- the browser-detection
+      script. It only fills an empty preference: a stored zone, whether chosen
+      by hand or detected earlier, wins over the browser's (owner decision D2),
+      so a laptop in another zone, or a stale tab, never overwrites it. An
+      unknown zone is ignored.
+
+    Returns ``204 No Content`` on success or when ignored -- the callers use
+    ``fetch()``.
+    """
+    tz_name = form.get("timezone", "").strip()
+    manual = form.get("source", "") == _TZ_SOURCE_MANUAL
+    if manual:
+        if not tz_name:
+            user.viewer_timezone = None
             db.flush()
-        except (zoneinfo.ZoneInfoNotFoundError, KeyError):
-            pass  # Invalid zone — leave stored value unchanged
+            return Response(status_code=204)
+        if not deps.is_valid_timezone(tz_name):
+            return JSONResponse(
+                {
+                    "detail": (
+                        "Unknown time zone. Use an IANA name such as Europe/London."
+                    )
+                },
+                status_code=422,
+            )
+        user.viewer_timezone = tz_name
+        db.flush()
+        return Response(status_code=204)
+    if user.viewer_timezone is None and deps.is_valid_timezone(tz_name):
+        user.viewer_timezone = tz_name
+        db.flush()
     return Response(status_code=204)
 
 
@@ -128,6 +170,12 @@ def account_password(
     (carrying the prior session's persistence) so the user is not signed out of
     the device they are using. Outcomes redirect back to the preferences page
     with a query-param signal; passwords are never logged.
+
+    Guessing the current password from a stolen session is throttled (#67
+    S23): each check is reserved in advance against ``account:<user id>``, and
+    once ``auth.throttle_max_failures`` wrong ones fall in the window the route
+    answers ``429`` without checking. A correct current password releases its
+    reservation. These attempts add nothing to the login's per-username delay.
     """
     settings = _settings()
 
@@ -139,8 +187,21 @@ def account_password(
     new_password = form.get("new_password", "")
     confirm_password = form.get("confirm_password", "")
 
+    # The reservation writes on its own connection. Commit first, so a session
+    # touch the auth dependency left pending here cannot hold SQLite's single
+    # write lock against it. The factory keeps loaded rows readable on commit.
+    db.commit()
+    throttle = _login_throttle()
+    reservation = throttle.try_reserve(
+        ip=password_change_key(int(user.id)), username=user.username, backoff=False
+    )
+    if reservation is None:
+        raise TooManyPasswordAttemptsError(_TOO_MANY_PASSWORD_ATTEMPTS)
     if not verify_password(current_password, user.password_hash, settings.auth):
+        # The reservation stays: it is this attempt's recorded failure.
         return _password_redirect(error=_PW_ERROR_CURRENT)
+    # Before any write on the request session, so it may use its own connection.
+    throttle.release(reservation, succeeded=True)
 
     if new_password != confirm_password:
         return _password_redirect(error=_PW_ERROR_MISMATCH)
@@ -150,13 +211,16 @@ def account_password(
 
     # Capture the current session's persistence before the change revokes it, so
     # the replacement session matches (a "remember me" session stays persistent).
-    raw_old = request.cookies.get(settings.session.cookie_name, "")
-    old_row = get_session_row(db, raw_old, settings=settings.session)
-    persistent = bool(old_row.persistent) if old_row is not None else False
+    # The request's single session resolution (#67 R3): the dependency already
+    # resolved it, so this adds no lookup.
+    resolved = resolve_request_session(request, db, settings=settings.session)
+    persistent = resolved.persistent if resolved is not None else False
 
     # Sets the new hash and revokes ALL of this user's sessions (including the
     # current one), so any previously stolen token dies on a credential change.
     change_password(db, user, new_password, settings=settings.auth)
+    # The resolution above describes a session that no longer exists.
+    invalidate_request_session(request)
 
     # Re-establish a session for the browser making the change so it is not
     # logged out; every other session stays revoked.

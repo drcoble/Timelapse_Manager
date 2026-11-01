@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,6 +37,16 @@ _level_enum = Enum(
     native_enum=False,
 )
 
+# The levels of an active alert (``monitoring.alerts.ALERT_LEVEL_THRESHOLD`` and
+# above), in severity order. ``ix_event_open_alerts`` is partial on exactly
+# these, so it holds only the open alerts. SQLite uses a partial index only when
+# the query repeats its WHERE terms, so the alert reads render this IN list as
+# literals in this order (``monitoring.alerts``); migration 033 freezes the text.
+OPEN_ALERT_INDEX_LEVELS: tuple[str, ...] = ("warning", "error", "critical")
+OPEN_ALERT_INDEX_WHERE = "alert_cleared_at IS NULL AND level IN ({})".format(
+    ", ".join(f"'{level}'" for level in OPEN_ALERT_INDEX_LEVELS)
+)
+
 
 class Event(Base):
     """A scoped log/audit event, optionally attributed to a user.
@@ -51,6 +62,17 @@ class Event(Base):
     __table_args__ = (
         Index("ix_event_scope_timestamp", "scope", "timestamp"),
         Index("ix_event_actor_user_id", "actor_user_id"),
+        # Active-alert count and page (``monitoring.alerts.get_active_alerts``).
+        # Partial on the open alerts only (migration 033); see
+        # ``OPEN_ALERT_INDEX_LEVELS``.
+        Index(
+            "ix_event_open_alerts",
+            "level",
+            "timestamp",
+            sqlite_where=text(OPEN_ALERT_INDEX_WHERE),
+        ),
+        # Per-entity reads and the resolve-signal auto-clear UPDATE (033).
+        Index("ix_event_scope_scope_id", "scope", "scope_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -69,8 +91,10 @@ class Event(Base):
     )
     # Active-alert lifecycle. An event is an "active alert" while its severity is
     # at or above the alert threshold AND ``alert_cleared_at`` is NULL. Clearing
-    # only sets these columns -- the event row itself is never deleted, so the
-    # operational log stays append-only and complete.
+    # only sets these columns; it never deletes the row. Rows are deleted only by
+    # the opt-in event retention (``monitoring.event_retention``, off by
+    # default), which never removes an uncleared alert or an audit/security
+    # event (see ``monitoring.event_retention``).
     #
     # ``alert_cleared_at`` -- when the alert left the active list (NULL = active).
     # ``alert_cleared_by`` -- the user who manually cleared it; NULL when the
