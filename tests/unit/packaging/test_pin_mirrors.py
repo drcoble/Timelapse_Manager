@@ -239,3 +239,34 @@ class TestLoadFfmpegPinMirrors:
         pin = load_ffmpeg_pin()
         assert isinstance(pin.url, str)
         assert pin.url == primary
+
+
+def test_real_pin_lists_the_public_dependency_release_first() -> None:
+    """BtbN prunes dated autobuilds; the public copy must be tried first."""
+    pin = json.loads(
+        (Path(__file__).resolve().parents[3] / "ffmpeg-pin.json").read_text()
+    )
+    filename = pin["url"].rsplit("/", 1)[-1]
+    expected = (
+        "https://github.com/drcoble/Timelapse_Manager/releases/download/"
+        f"ffmpeg-{pin['version']}-{pin['sha256'][:8]}/{filename}"
+    )
+    assert pin["mirror_urls"][0] == expected
+    assert pin["url"] in pin["mirror_urls"]
+
+
+def test_refresh_script_builds_the_same_public_mirror_url() -> None:
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[3] / "packaging" / "refresh-ffmpeg-pin.py"
+    spec = importlib.util.spec_from_file_location("refresh_ffmpeg_pin", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    url = module.public_mirror_url(
+        "n9.9.9", "abcdef0123456789", "ffmpeg-n9.9.9-x.tar.xz"
+    )
+    assert url == (
+        "https://github.com/drcoble/Timelapse_Manager/releases/download/"
+        "ffmpeg-n9.9.9-abcdef01/ffmpeg-n9.9.9-x.tar.xz"
+    )

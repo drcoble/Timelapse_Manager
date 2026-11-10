@@ -44,6 +44,15 @@ Read `ffmpeg-pin.json`:
 Note the `version` string (a git-describe tag such as `N-124941-g54749da98a`)
 and the tarball `url`.
 
+**Public copy of the pinned build.** BtbN prunes dated autobuilds, so the public
+repository keeps the exact pinned tarball on a dedicated GitHub release, tagged
+`ffmpeg-<version>-<first 8 characters of the sha256>` (for example
+`ffmpeg-n9.0.2-1cb0a72c`), marked pre-release and never latest. That URL is the
+first entry of `mirror_urls`, so source builds and CI keep working after the
+upstream URL disappears. After `refresh-ffmpeg-pin.py --apply` writes a new pin,
+publish the downloaded tarball (and its `.sha256`) on that release before the next
+build; the script prints the tag and asset name.
+
 The file may also carry an optional `mirror_urls` list: alternative locations
 for the same tarball, tried in order, each checked against the same `sha256`.
 The committed file lists the public BtbN URL first. A BtbN autobuild URL

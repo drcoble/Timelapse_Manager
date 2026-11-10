@@ -31,7 +31,10 @@ done
 for v in version deb rpm key_file pubkey_out; do
     [ -n "${!v}" ] || { echo "error: --${v//_/-} is required" >&2; exit 2; }
 done
-[ -f "$deb" ] && [ -f "$rpm" ] && [ -f "$key_file" ] || { echo "error: --deb, --rpm and --key-file must exist" >&2; exit 2; }
+if ! { [ -f "$deb" ] && [ -f "$rpm" ] && [ -f "$key_file" ]; }; then
+    echo "error: --deb, --rpm and --key-file must exist" >&2
+    exit 2
+fi
 : "${EL9_IMAGE:?EL9_IMAGE is not set}"
 
 full="$(python3 "${HERE}/../pkgversion.py" "$version")"

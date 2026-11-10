@@ -25,7 +25,12 @@
 #      `sha256sum --check SHA256SUMS`; any mismatch or missing file stops here.
 #   2. Scan the extracted tarball, the .deb/.rpm file lists and contents, the CT
 #      template's file list, the SBOMs and the release notes for private details
-#      (the public-tree guard's deny-list). Any finding stops here.
+#      (the public-tree guard's deny-list). Any finding stops here. The Python
+#      code inside the PyInstaller archive is compressed on disk, so the guard
+#      decodes it and scans our own modules with the whole list; the raw bytes
+#      of other binaries and bundled libraries get only the list's binary-safe
+#      (long identifier) patterns, and PEM and base64 bodies in text files are
+#      skipped.
 #   3. Create the GitHub Release as a draft with the notes as its body, upload the
 #      assets with SHA256SUMS last, then publish it (which starts the
 #      verify-only workflow).
@@ -314,7 +319,10 @@ print(json.dumps({"tag_name": tag, "name": tag, "body": text, "draft": True,
                   "prerelease": prerelease == "true"}))
 PY
 )"
-created="$(printf '%s' "${body}" | gh_curl -X POST --data @- "https://api.github.com/repos/${GITHUB_REPO}/releases")"
+# gh_curl passes the auth header on stdin (--config -), so request bodies must come
+# from a file: a body piped to --data @- would be shadowed and sent empty (#367).
+printf '%s' "${body}" > "${work}/release.json"
+created="$(gh_curl -X POST --data-binary "@${work}/release.json" "https://api.github.com/repos/${GITHUB_REPO}/releases")"
 release_id="$(printf '%s' "${created}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 [ -n "${release_id}" ] || die "could not read the new release id"
 

@@ -30,11 +30,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install FFmpeg
-        # Tests and the encoder path expect FFmpeg to be available.
+      - name: Install the pinned FFmpeg
+        # Test against the FFmpeg build the packages ship (ffmpeg-pin.json), not the
+        # distribution's: an older FFmpeg (Ubuntu's 6.1) behaves differently, e.g. it
+        # sends RTSP credentials across a cross-origin redirect.
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes ffmpeg
+          set -euo pipefail
+          sha="$(python3 -c 'import json; print(json.load(open("ffmpeg-pin.json"))["sha256"])')"
+          stage="$(mktemp -d)"
+          ok=0
+          for url in $(python3 -c 'import json; p=json.load(open("ffmpeg-pin.json")); print(" ".join(dict.fromkeys([p["url"], *p.get("mirror_urls", [])])))'); do
+            if curl --fail --silent --show-error --location --output "${stage}/ffmpeg.tar.xz" "${url}" \
+              && echo "${sha}  ${stage}/ffmpeg.tar.xz" | sha256sum --check -; then ok=1; break; fi
+          done
+          [ "${ok}" = 1 ] || { echo "error: no FFmpeg source in ffmpeg-pin.json matched its sha256" >&2; exit 1; }
+          tar -C "${stage}" -xf "${stage}/ffmpeg.tar.xz"
+          sudo install -m 0755 "$(find "${stage}" -type f -name ffmpeg | head -1)" /usr/local/bin/ffmpeg
+          sudo install -m 0755 "$(find "${stage}" -type f -name ffprobe | head -1)" /usr/local/bin/ffprobe
+          rm -rf "${stage}"
+          ffmpeg -hide_banner -version | head -1
 
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
@@ -84,12 +98,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install FFmpeg
-        # The app lifespan calls resolve_ffmpeg_binary at startup; FFmpeg must
-        # be on PATH for the E2E server subprocess to boot successfully.
+      - name: Install the pinned FFmpeg
+        # Test against the FFmpeg build the packages ship (ffmpeg-pin.json), not the
+        # distribution's: an older FFmpeg (Ubuntu's 6.1) behaves differently, e.g. it
+        # sends RTSP credentials across a cross-origin redirect.
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes ffmpeg
+          set -euo pipefail
+          sha="$(python3 -c 'import json; print(json.load(open("ffmpeg-pin.json"))["sha256"])')"
+          stage="$(mktemp -d)"
+          ok=0
+          for url in $(python3 -c 'import json; p=json.load(open("ffmpeg-pin.json")); print(" ".join(dict.fromkeys([p["url"], *p.get("mirror_urls", [])])))'); do
+            if curl --fail --silent --show-error --location --output "${stage}/ffmpeg.tar.xz" "${url}" \
+              && echo "${sha}  ${stage}/ffmpeg.tar.xz" | sha256sum --check -; then ok=1; break; fi
+          done
+          [ "${ok}" = 1 ] || { echo "error: no FFmpeg source in ffmpeg-pin.json matched its sha256" >&2; exit 1; }
+          tar -C "${stage}" -xf "${stage}/ffmpeg.tar.xz"
+          sudo install -m 0755 "$(find "${stage}" -type f -name ffmpeg | head -1)" /usr/local/bin/ffmpeg
+          sudo install -m 0755 "$(find "${stage}" -type f -name ffprobe | head -1)" /usr/local/bin/ffprobe
+          rm -rf "${stage}"
+          ffmpeg -hide_banner -version | head -1
 
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2

@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.test_public_tree import carchive_bytes, pyz_bytes
+
 _ROOT = Path(__file__).resolve().parents[3]
 _EXPORT = _ROOT / "dev" / "export-public.sh"
 _PUBLISH = _ROOT / "dev" / "publish-github-release.sh"
@@ -32,7 +34,11 @@ pytestmark = pytest.mark.skipif(
 _PRIVATE_HOST = "secretcorp.example"
 _LIST_DIR = Path(tempfile.mkdtemp(prefix="tlm-guard-list-"))
 _LIST = _LIST_DIR / "deny.txt"
-_LIST.write_text("deny\tcorp name\tsecretcorp\n", encoding="utf-8")
+_LIST.write_text(
+    "deny-bin\tcorp name\tsecretcorp\n"
+    "deny\ttest net\t(?<![\\d.])198\\.18\\.\\d{1,3}\\.\\d{1,3}\n",
+    encoding="utf-8",
+)
 # Stand-in for gitleaks, so the export tests do not depend on the real tool.
 _GITLEAKS_OK = _LIST_DIR / "gitleaks-ok"
 _GITLEAKS_OK.write_text(
@@ -602,6 +608,89 @@ class TestPublishDryRun:
         assert result.returncode == 2
         assert "conf.txt:1:" in result.stdout
 
+    @staticmethod
+    def _bundle_assets(tmp_path: Path, members: dict[str, bytes]) -> Path:
+        assets = _make_assets(tmp_path / "assets")
+        _targz(
+            assets / f"timelapse-manager-{_VERSION}-linux-amd64.tar.gz",
+            {f"timelapse-manager-x/{k}": v for k, v in members.items()},
+        )
+        _resum(assets)
+        return assets
+
+    @staticmethod
+    def _exe(own: bytes, third_party: bytes = b"\xe3 nothing") -> bytes:
+        modules = {"timelapse_manager.mod": own, "somelib.mod": third_party}
+        return carchive_bytes(
+            [("PYZ.pyz", b"z", pyz_bytes(modules))], lead=b"\x7fELF\0\0"
+        )
+
+    def test_a_private_name_in_the_compressed_pyinstaller_code_is_a_finding(
+        self, tmp_path: Path, no_network: tuple[Path, Path]
+    ) -> None:
+        exe = self._exe(f"\xe3 host {_PRIVATE_HOST} 198.18.4.5".encode())
+        assert _PRIVATE_HOST.encode() not in exe  # a raw byte scan cannot see it
+        assets = self._bundle_assets(tmp_path, {"timelapse-manager": exe})
+        result = self._dry(tmp_path, assets, no_network)
+        assert result.returncode == 2
+        assert "timelapse-manager!PYZ.pyz/timelapse_manager.mod: [corp name]" in (
+            result.stdout
+        )
+        assert "[test net]" in result.stdout
+
+    def test_short_patterns_stay_off_third_party_binaries_and_libraries(
+        self, tmp_path: Path, no_network: tuple[Path, Path]
+    ) -> None:
+        exe = self._exe(b"\xe3 fine", third_party=b"\xe3 version 198.18.4.5")
+        assets = self._bundle_assets(
+            tmp_path,
+            {
+                "timelapse-manager": exe,
+                "tzdata/Sydney": b"TZif2\0\0 198.18.4.5 \0",
+                "lib/native.so": b"\x7fELF\0 198.18.9.9 \0",
+            },
+        )
+        result = self._dry(tmp_path, assets, no_network)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "scans clean" in result.stdout
+
+    def test_a_short_pattern_in_our_own_binary_file_is_a_finding(
+        self, tmp_path: Path, no_network: tuple[Path, Path]
+    ) -> None:
+        blob = b"\x7fELF\0 198.18.4.5 \0"
+        assets = self._bundle_assets(
+            tmp_path,
+            {
+                "_internal/timelapse_manager/data.bin": blob,
+                "_internal/tzdata/zone": blob,
+            },
+        )
+        result = self._dry(tmp_path, assets, no_network)
+        assert result.returncode == 2
+        assert "timelapse_manager/data.bin: [test net] at byte" in result.stdout
+        assert "tzdata" not in result.stdout
+
+    def test_a_long_identifier_in_a_third_party_binary_is_a_finding(
+        self, tmp_path: Path, no_network: tuple[Path, Path]
+    ) -> None:
+        blob = b"\x7fELF\0 " + _PRIVATE_HOST.encode() + b" \0"
+        assets = self._bundle_assets(tmp_path, {"lib/native.so": blob})
+        result = self._dry(tmp_path, assets, no_network)
+        assert result.returncode == 2
+        assert "lib/native.so: [corp name] at byte" in result.stdout
+
+    def test_a_pem_body_is_not_a_finding(
+        self, tmp_path: Path, no_network: tuple[Path, Path]
+    ) -> None:
+        pem = (
+            b"-----BEGIN CERTIFICATE-----\n"
+            b"xx198.18.4.5xxAAAAAAAAAAAAAAAAAAAA\n"
+            b"-----END CERTIFICATE-----\n"
+        )
+        assets = self._bundle_assets(tmp_path, {"certifi/cacert.pem": pem})
+        result = self._dry(tmp_path, assets, no_network)
+        assert result.returncode == 0, result.stdout + result.stderr
+
     def test_a_private_name_in_the_ct_template_stops_everything(
         self, tmp_path: Path, no_network: tuple[Path, Path]
     ) -> None:
@@ -843,3 +932,15 @@ def test_scripts_are_executable_strict_and_parse(script: Path) -> None:
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -euo pipefail" in text
     assert subprocess.run(["bash", "-n", str(script)], check=False).returncode == 0
+
+
+def test_no_gh_curl_call_reads_its_body_from_stdin() -> None:
+    """gh_curl feeds the auth header to curl on stdin, so a body on stdin is lost."""
+    script = (
+        Path(__file__).resolve().parents[3] / "dev" / "publish-github-release.sh"
+    ).read_text(encoding="utf-8")
+    code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
+    for line in code:
+        if "gh_curl" in line:
+            assert "@-" not in line, line
+            assert "| gh_curl" not in line.replace("|  gh_curl", "| gh_curl"), line

@@ -133,9 +133,14 @@ def test_no_private_registry_default(path: Path) -> None:
 
 
 class TestFfmpegPin:
-    def test_the_committed_pin_lists_only_the_public_build(self) -> None:
+    def test_the_committed_pin_lists_only_public_builds(self) -> None:
         pin = json.loads((_ROOT / "ffmpeg-pin.json").read_text(encoding="utf-8"))
-        assert pin["mirror_urls"][0] == pin["url"]
+        # The public dependency release comes first (BtbN prunes dated
+        # autobuilds); the upstream URL stays as a fallback. No private mirror.
+        assert pin["mirror_urls"][0].startswith(
+            "https://github.com/drcoble/Timelapse_Manager/releases/download/ffmpeg-"
+        )
+        assert pin["url"] in pin["mirror_urls"]
         assert pin["url"].startswith("https://github.com/BtbN/FFmpeg-Builds/releases/")
         assert all(u.startswith("https://github.com/") for u in pin["mirror_urls"])
 

@@ -46,6 +46,13 @@ The extracted directory contains the `timelapse-manager` executable and all
 runtime support files. The bundle is self-contained and relocatable — it does
 not require any system Python or system FFmpeg.
 
+> **Keep the bundled FFmpeg.** The bundle (and the `.deb`, `.rpm`, image and CT
+> template) ship the FFmpeg build pinned in `ffmpeg-pin.json`. If you point
+> `render.ffmpeg_binary` at a system FFmpeg instead, use a current release: older
+> builds behave differently. For example, Ubuntu 24.04's FFmpeg 6.1 sends the
+> camera's RTSP login to a different host after an RTSP redirect, while the pinned
+> build does not (`tests/integration/test_rtsp_redirect_credentials.py`).
+
 > **Note:** the `packaging/install.sh` installer and systemd unit template are
 > part of the source repository (`packaging/`), not bundled inside the tarball
 > itself. The systemd installation path below assumes you have cloned the

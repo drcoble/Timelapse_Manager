@@ -8,6 +8,7 @@
     "ffprobe": "ffmpeg-n9.0.2-33-g4cf298e66a-linux64-gpl-9.0/bin/ffprobe"
   },
   "mirror_urls": [
+    "https://github.com/drcoble/Timelapse_Manager/releases/download/ffmpeg-n9.0.2-1cb0a72c/ffmpeg-n9.0.2-33-g4cf298e66a-linux64-gpl-9.0.tar.xz",
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-22-13-06/ffmpeg-n9.0.2-33-g4cf298e66a-linux64-gpl-9.0.tar.xz"
   ]
 }

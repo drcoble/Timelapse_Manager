@@ -67,9 +67,7 @@ from typing import Any
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_RELEASES_URL = (
-    "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases"
-)
+GITHUB_RELEASES_URL = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases"
 
 # Matches static (non-shared) GPL linux64 builds with a stable version tag.
 # BtbN naming formats:
@@ -77,14 +75,28 @@ GITHUB_RELEASES_URL = (
 #   legacy:              ffmpeg-n<VER>-latest-linux64-gpl[-<BRANCH>].tar.xz
 # Excludes: -shared builds, -lgpl, master/capital-N builds, win64, macOS.
 _ASSET_RE = re.compile(
-    r"^ffmpeg-n(\d+(?:\.\d+)+)"              # version prefix (lowercase n + digits)
-    r"-(?:latest|\d+-g[0-9a-f]+)"            # separator: -latest  OR  -<N>-g<hash>
-    r"-linux64-gpl"                          # build target (static, not shared)
-    r"(?:-\d+(?:\.\d+)+)?"                  # optional branch suffix (e.g. -8.1)
-    r"\.tar\.xz$"                            # extension
+    r"^ffmpeg-n(\d+(?:\.\d+)+)"  # version prefix (lowercase n + digits)
+    r"-(?:latest|\d+-g[0-9a-f]+)"  # separator: -latest  OR  -<N>-g<hash>
+    r"-linux64-gpl"  # build target (static, not shared)
+    r"(?:-\d+(?:\.\d+)+)?"  # optional branch suffix (e.g. -8.1)
+    r"\.tar\.xz$"  # extension
 )
 
 LICENSE = "GPL-3.0"
+
+# Public copy of each pinned build. BtbN prunes dated autobuilds, so the public
+# repository keeps the exact tarball on a dedicated GitHub release, tagged
+# ffmpeg-<version>-<first 8 of sha256>, and lists it first in mirror_urls.
+PUBLIC_MIRROR_REPO = "drcoble/Timelapse_Manager"
+
+
+def public_mirror_url(version: str, sha256: str, filename: str) -> str:
+    """URL of the pinned tarball on the public repository's dependency release."""
+    return (
+        f"https://github.com/{PUBLIC_MIRROR_REPO}/releases/download/"
+        f"ffmpeg-{version}-{sha256[:8]}/{filename}"
+    )
+
 
 # Exit code signalling "update available" (distinct from 1=error, 0=up-to-date)
 EXIT_UPDATE_AVAILABLE = 10
@@ -294,7 +306,7 @@ def _resolve_latest_stable(github_token: str | None) -> dict[str, Any]:
             digest = asset.get("digest", "")
             digest_sha256: str | None = None
             if digest.startswith("sha256:"):
-                digest_sha256 = digest[len("sha256:"):]
+                digest_sha256 = digest[len("sha256:") :]
             # browser_download_url from an autobuild-* release contains the specific
             # datestamp tag, making it an immutable reference.
             candidates.append(
@@ -513,8 +525,7 @@ def mode_apply(
         and resolved_sha256_from_github is not None
     ):
         _info(
-            f"Pin is already up to date (version={resolved_version}).  "
-            "Nothing to do."
+            f"Pin is already up to date (version={resolved_version}).  Nothing to do."
         )
         sys.exit(0)
 
@@ -585,12 +596,21 @@ def mode_apply(
             "ffprobe": f"{topdir}/bin/ffprobe",
         },
         # Only public URLs are committed; the private mirror is injected at
-        # build time (see --mirror-url).
+        # build time (see --mirror-url). The public dependency release comes
+        # first because BtbN prunes dated autobuilds.
         "mirror_urls": [
+            public_mirror_url(resolved_version, computed_sha256, filename),
             upstream_url,
         ],
     }
     _write_pin(new_pin)
+    _info(
+        "Publish the tarball on the public dependency release before the next "
+        "build:\n"
+        f"      tag ffmpeg-{resolved_version}-{computed_sha256[:8]} "
+        f"on {PUBLIC_MIRROR_REPO},\n"
+        f"      asset {filename} (see docs/ffmpeg-refresh.md)."
+    )
     _info(
         f"ffmpeg-pin.json updated: version={resolved_version} "
         f"sha256={computed_sha256} mirror={mirror_url}"

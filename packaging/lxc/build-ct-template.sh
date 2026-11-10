@@ -38,7 +38,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$deb" ] && [ -f "$deb" ] || { echo "error: --deb must name an existing file" >&2; exit 2; }
+if ! { [ -n "$deb" ] && [ -f "$deb" ]; }; then
+    echo "error: --deb must name an existing file" >&2
+    exit 2
+fi
 [ -n "$version" ] || { echo "error: --version is required" >&2; exit 2; }
 case "$version" in
     *[!0-9A-Za-z.+_-]*) echo "error: unsafe --version: $version" >&2; exit 2 ;;
